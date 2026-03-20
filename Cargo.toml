@@ -1,0 +1,15 @@
+[package]
+name = "t0-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "T0 — RDNA3 裸金属 GPU 内核编译器 & KFD 运行时"
+license = "MIT OR Apache-2.0"
+
+[workspace]  # Keep as standalone crate
+
+[features]
+default = []
+rocm = []  # Enable KFD runtime (requires /dev/kfd)
+
+[dependencies]
+# No external dependencies — pure Rust
