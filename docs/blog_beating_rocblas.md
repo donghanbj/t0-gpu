@@ -112,6 +112,21 @@ Honestly, I'm not 100% sure. My best theories:
 2. **Dispatch overhead**: rocBLAS goes through the HIP runtime, which adds overhead. My AQL queue writes are direct to hardware.
 3. **Swizzled grid mapping**: I swap TGID.x and TGID.y to iterate M-dimension first, keeping the X matrix hot in L2 cache. This specifically helps rectangular matrices where rocBLAS might not have the best mapping.
 
+## Honest Assessment: Real Training Workloads
+
+Before you get too excited, some context. In actual neural network training (say, a transformer with dim=1024, hidden=4096, batch=2, seq=128):
+
+| Operation | Matrix Size (M×K×N) | T0 vs rocBLAS |
+|-----------|---------------------|---------------|
+| QKV projection | 256×1024×1024 | ~40% |
+| **FFN gate/up** | **256×1024×4096** | **74%** |
+| FFN down | 256×4096×1024 | ~74% |
+| Backward dW | 1024×256×4096 | ~142% 🏆 |
+
+The sizes where T0 wins (1024³, 2048³, 1024×1024×4096) correspond to **weight gradient (dW) computation** and **large-batch scenarios**. The most frequent forward-pass GEMMs use M=128-256 (batch × seq_len), where rocBLAS still leads by 2-3×.
+
+**This means**: T0 is competitive for **backward weight gradients** (which dominate training time in large models), but still needs work on **small-M forward GEMMs**. The next optimization target is a specialized small-M tile (16×64 or 32×64) with aggressive split-K to fill CUs.
+
 ## What I Learned
 
 - **GPU programming is 90% memory access patterns**. The compute units are fast enough; the bottleneck is almost always feeding them data.
