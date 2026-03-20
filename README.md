@@ -287,3 +287,18 @@ at your option.
 | ISA 目标 / ISA Target | `amdgcn-amd-amdhsa--gfx1100` |
 | VRAM | 24 GB GDDR6 |
 | 峰值算力 / Peak Compute | 123 TFLOPS (bf16 WMMA) |
+
+---
+
+## 支持与赞助 / Support & Sponsor
+
+T0-GPU 是我在失业期间独立开发的个人开源项目。如果你觉得这个项目不仅硬核，而且对你的研究或工作有启发，欢迎通过以下方式提供支持，这将极大帮助我继续推进后续的优化（比如前向 GEMM 的极致调优）。
+
+T0-GPU is an independent open-source project developed entirely during my unemployment. If you find this bare-metal approach inspiring or helpful to your own work, consider supporting its ongoing development. Your support will help me survive and keep pushing the limits of hardware performance.
+
+**🪙 Crypto (Preferred for international sponsors):**
+- **ETH / ERC20**: `(coming soon)`
+- **USDT (TRC20)**: `(coming soon)`
+
+**☕️ 微信 / 支付宝 (For supporters in mainland China):**
+如果你在国内，更习惯使用微信或支付宝，请查看 [**DONATE.md**](./DONATE.md) 获取赞助二维码。
