@@ -259,6 +259,16 @@ bf16 WMMA GEMM benchmark on RX 7900 XTX. T0 parameterized generator vs rocBLAS:
 cargo run --example bench_gemm_sweep --features rocm --release
 ```
 
+## 路线图 / Roadmap
+
+| 优先级 | 功能 / Feature | 说明 / Description |
+|--------|---------------|-------------------|
+| 🔴 | **小 M GEMM 优化** / Small-M GEMM | 16×64 / 32×64 tile + 激进 Split-K，优化训练前向传播（M=128-256） |
+| 🟡 | **Async GPU Dispatch** | `GpuFuture` + `submit_async()` — 用 Rust Future trait 包装 KFD signal，支持 `await` 编排依赖（参考 [VectorWare async/await on GPU](https://www.vectorware.com/blog/async-await-on-gpu/)） |
+| 🟡 | **更多 elementwise 内核** | fused SiLU, RoPE, fused cross-entropy |
+| 🟢 | **多 GPU / Multi-GPU** | 多队列调度、PCIe P2P 传输 |
+| 🟢 | **RDNA4 支持** | GFX12 ISA 适配 |
+
 ## 许可证 / License
 
 Licensed under either of:
