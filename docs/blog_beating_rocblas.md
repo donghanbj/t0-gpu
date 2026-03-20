@@ -21,13 +21,25 @@ The code is open source: [**github.com/GeisYaO/t0-gpu**](https://github.com/Geis
 
 ## Why Would Anyone Do This?
 
-I'm building a custom neural network training system for my research. The standard path would be: install ROCm (2+ GB), use HIP, call rocBLAS, done. But I ran into three problems:
+Not because I wanted to build a GPU compiler. Because **I had no other choice**.
 
-1. **Dispatch latency**: HIP's kernel launch takes ~20μs synchronous. When you're launching hundreds of tiny kernels per training step, that overhead adds up to seconds.
-2. **Dependency hell**: ROCm versions break constantly. My Ubuntu 24.04 setup needed specific ROCm 7.x builds, and the driver/runtime version matrix was a nightmare.
-3. **Black box**: When my GPU hangs (which happens a lot in bare-metal development), HIP gives you nothing. With KFD, I can at least see the AQL queue state.
+I was training a custom attention mechanism on an RX 7900 XTX. The plan was simple: PyTorch + ROCm. Then reality hit:
 
-So I decided: what if I just... talk to the GPU directly?
+1. **PyTorch doesn't support FlashAttention-2 on GFX1100**. RDNA3 is a consumer architecture. Official FA-2 only supports CDNA (MI250/MI300). My GPU was excluded.
+
+2. **Tried CubeCL (Rust GPU compute library)**. Found a bf16 bug that broke everything. I tried to fix CubeCL upstream — the rabbit hole was too deep.
+
+3. **Wrote my own HIP FlashAttention-2**. It worked, but performance was disappointing. HIP runtime overhead was particularly painful on small matrices.
+
+4. **Started hand-writing GFX1100 assembly**. If every framework was broken, I'd talk to the hardware directly. I verified each instruction encoding with `llvm-mc`, writing WMMA GEMM kernels one instruction at a time.
+
+5. **HIP dispatch was also a problem**. hipLaunchKernel has 20μs sync latency. My training loop launched hundreds of small kernels per step — all wasted on dispatch overhead. So I **wrote my own KFD runtime**: direct AQL queue packet writes through `/dev/kfd`.
+
+6. **Hand-writing kernels was unsustainable**. One GEMM kernel = 300 lines of assembly. Changing a tile size meant copy-pasting the entire file. So I built a **parameterized code generator** — one `generate()` function covering all variants.
+
+Looking back, this path is absurd: **from `import torch` to hand-written GPU ISA**. But each step was forced — not because I wanted to skip frameworks, but because the frameworks didn't work on RDNA3.
+
+The result is T0: a pure-Rust GPU kernel compiler + bare-metal runtime.
 
 ## The Stack
 
