@@ -953,6 +953,364 @@ pub fn matmul_lds_db(sched: &dyn Schedule) -> T0Kernel {
 }
 
 // ============================================================================
+// matmul_lds_db_bf16out: Same as matmul_lds_db but stores Y as bf16
+// ============================================================================
+
+/// Y[i,j] (bf16) = X @ W^T — LDS double-buffered, bf16 output.
+///
+/// Identical K-loop to matmul_lds_db, but the store phase converts f32 → bf16
+/// and writes with global_store_b16, halving store bandwidth.
+///
+/// Kernargs: [X_ptr:u64, WT_ptr:u64, Y_ptr:u64, K:u32, N:u32]
+/// Grid: [tiles_N × 64, tiles_M, 1]
+pub fn matmul_lds_db_bf16out(sched: &dyn Schedule) -> T0Kernel {
+    let mut k = T0Kernel::new("t0_matmul_lds_db_bf16out");
+    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
+    let tile_k = sched.gemm_tile_k();
+    let n_tiles = sched.gemm_n_wmma_tiles();
+
+    const LDS_X: u32 = 1024;
+    const LDS_WT: u32 = 2048;
+    const LDS_BUF: u32 = LDS_X + LDS_WT;
+    k.set_lds_size(LDS_BUF * 2);
+
+    // ── Args ──
+    let x_ptr = k.arg_ptr("X");
+    let wt_ptr = k.arg_ptr("WT");
+    let y_ptr = k.arg_ptr("Y");
+    let k_dim = k.arg_u32("K");
+    let n_dim = k.arg_u32("N");
+    k.emit_arg_loads();
+
+    // ── TGIDs ──
+    let tile_col_s = k.alloc_sreg();
+    let tile_row_s = k.alloc_sreg();
+    k.capture_tgid_x(tile_col_s);
+    k.capture_tgid_y(tile_row_s);
+
+    // ── Thread decomposition ──
+    let tid = VReg(0);
+    let lane_id = k.alloc_vreg();
+    k.v_and_b32_imm(lane_id, tid, 31);
+    let wave_id = k.alloc_vreg();
+    k.v_lshrrev_b32(wave_id, 5, tid);
+    let wave_id_s = k.alloc_sreg();
+    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
+    let lane_row = k.alloc_vreg();
+    k.v_and_b32_imm(lane_row, lane_id, 15);
+
+    // ── Accumulators ──
+    let acc: Vec<VReg> = (0..n_tiles)
+        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .collect();
+    for a in &acc {
+        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
+    }
+
+    // ── s_tmp1 = tile_row*32 + wave_id*16 (for store phase) ──
+    let s_tmp1 = k.alloc_sreg();
+    let s_tmp2 = k.alloc_sreg();
+    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
+    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
+    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
+
+    let base_n_s = k.alloc_sreg();
+    k.s_lshl_b32(base_n_s, tile_col_s, 6);
+
+    // ══════════════════════════════════════════════════════════════════
+    // COOPERATIVE LOAD ADDRESSES (same as matmul_lds_db)
+    // ══════════════════════════════════════════════════════════════════
+
+    let k_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
+
+    let x_coop_row = k.alloc_vreg();
+    k.v_lshrrev_b32(x_coop_row, 1, tid);
+    let x_coop_half = k.alloc_vreg();
+    k.v_and_b32_imm(x_coop_half, tid, 1);
+
+    let x_abs_row = k.alloc_vreg();
+    let s_base_row = k.alloc_sreg();
+    k.s_lshl_b32(s_base_row, tile_row_s, 5);
+    k.v_mov_from_sgpr(x_abs_row, s_base_row);
+    k.v_add_u32(x_abs_row, x_abs_row, x_coop_row);
+
+    let x_row_byte = k.alloc_vreg();
+    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
+    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
+
+    let x_half_off = k.alloc_vreg();
+    k.v_lshlrev_b32(x_half_off, 4, x_coop_half);
+
+    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
+    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
+    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
+    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
+    k.v_add_u32(x_gmem_base, x_gmem_base, x_half_off);
+
+    let x_lds_off = k.alloc_vreg();
+    k.v_lshlrev_b32(x_lds_off, 4, tid);
+
+    let wt_abs_row = k.alloc_vreg();
+    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
+    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
+
+    let wt_row_byte = k.alloc_vreg();
+    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
+    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
+
+    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
+    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
+    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
+    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
+
+    let wt_lds_off = k.alloc_vreg();
+    k.v_lshlrev_b32(wt_lds_off, 5, tid);
+    k.push(Op::VAddU32 {
+        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
+        src1: Operand::InlineInt(LDS_X as i32),
+    });
+
+    let x_lds_read = k.alloc_vreg();
+    let s_wave_off = k.alloc_sreg();
+    k.s_lshl_b32(s_wave_off, wave_id_s, 9);
+    k.v_lshlrev_b32(x_lds_read, 5, lane_row);
+    let tmp_wave = k.alloc_vreg();
+    k.v_mov_from_sgpr(tmp_wave, s_wave_off);
+    k.v_add_u32(x_lds_read, x_lds_read, tmp_wave);
+
+    let wt_lds_read_base = k.alloc_vreg();
+    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
+
+    let gmem_x = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
+
+    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
+    let wt_frags: Vec<VReg> = (0..n_tiles)
+        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .collect();
+
+    let k_byte_off = k.alloc_vreg();
+    k.v_mov_imm(k_byte_off, 0);
+    let k_iter_s = k.alloc_sreg();
+    k.s_mov_imm(k_iter_s, 0);
+    let k_step = (tile_k * 2) as i32;
+
+    // ── Macros (same as matmul_lds_db) ──
+    macro_rules! coop_gmem_load {
+        ($kernel:expr, $koff:expr) => {{
+            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
+            $kernel.v_mov(xa, x_gmem_base);
+            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
+            $kernel.v_add_co(xa, xa, $koff);
+            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
+            $kernel.global_load(gmem_x, xa, Width::B128, 0);
+
+            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
+            $kernel.v_mov(wa, wt_gmem_base);
+            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
+            $kernel.v_add_co(wa, wa, $koff);
+            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
+            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
+            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
+        }};
+    }
+    macro_rules! coop_lds_store {
+        ($kernel:expr, $buf_off:expr) => {{
+            let x_a = $kernel.alloc_vreg();
+            $kernel.v_add_u32(x_a, x_lds_off, $buf_off);
+            $kernel.ds_store_b128(x_a, gmem_x, 0);
+
+            let w_a = $kernel.alloc_vreg();
+            $kernel.v_add_u32(w_a, wt_lds_off, $buf_off);
+            $kernel.ds_store_b128(w_a, gmem_wt0, 0);
+            $kernel.ds_store_b128(w_a, gmem_wt1, 16);
+        }};
+    }
+    macro_rules! lds_read_frags {
+        ($kernel:expr, $buf_off:expr) => {{
+            let xr = $kernel.alloc_vreg();
+            $kernel.v_add_u32(xr, x_lds_read, $buf_off);
+            $kernel.ds_load_b128(x_frag, xr, 0);
+            $kernel.ds_load_b128(VReg(x_frag.0 + 4), xr, 16);
+
+            for t in 0..n_tiles {
+                let wr = $kernel.alloc_vreg();
+                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
+                let off_base: u16 = (LDS_X + (t as u32) * 16 * 32) as u16;
+                $kernel.ds_load_b128(wt_frags[t], wr, off_base);
+                $kernel.ds_load_b128(VReg(wt_frags[t].0 + 4), wr, off_base + 16);
+            }
+        }};
+    }
+
+    let buf0_off = k.alloc_vreg();
+    k.v_mov_imm(buf0_off, 0);
+    let buf1_off = k.alloc_vreg();
+    k.v_mov_imm(buf1_off, LDS_BUF as i32);
+
+    // ══════════════════════════════════════════════════════════════════
+    // PROLOGUE + K-LOOP (identical to matmul_lds_db)
+    // ══════════════════════════════════════════════════════════════════
+    coop_gmem_load!(k, k_byte_off);
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf0_off);
+    k.wait_lgkmcnt(0);
+
+    k.push(Op::VAddU32 {
+        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
+        src1: Operand::InlineInt(k_step),
+    });
+    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
+
+    let loop_label = k.make_label("k_lds_loop");
+    k.label(&loop_label);
+
+    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
+    let epilog_a = k.make_label("lds_epilog_a");
+    k.branch_scc1(&epilog_a);
+
+    // Phase A
+    k.s_barrier();
+    lds_read_frags!(k, buf0_off);
+    coop_gmem_load!(k, k_byte_off);
+    k.wait_lgkmcnt(0);
+    for t in 0..n_tiles {
+        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
+    }
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf1_off);
+
+    k.push(Op::VAddU32 {
+        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
+        src1: Operand::InlineInt(k_step),
+    });
+    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
+
+    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
+    let epilog_b = k.make_label("lds_epilog_b");
+    k.branch_scc1(&epilog_b);
+
+    // Phase B
+    k.wait_lgkmcnt(0);
+    k.s_barrier();
+    lds_read_frags!(k, buf1_off);
+    coop_gmem_load!(k, k_byte_off);
+    k.wait_lgkmcnt(0);
+    for t in 0..n_tiles {
+        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
+    }
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf0_off);
+
+    k.push(Op::VAddU32 {
+        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
+        src1: Operand::InlineInt(k_step),
+    });
+    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
+    k.wait_lgkmcnt(0);
+    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
+    k.branch_scc1(&loop_label);
+
+    // Epilogue A
+    k.label(&epilog_a);
+    k.s_barrier();
+    lds_read_frags!(k, buf0_off);
+    k.wait_lgkmcnt(0);
+    for t in 0..n_tiles {
+        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
+    }
+    let store_label = k.make_label("lds_store");
+    k.s_mov_imm(k_iter_s, 0);
+    k.s_cmp_eq_u32_imm(k_iter_s, 0);
+    k.branch_scc1(&store_label);
+
+    // Epilogue B
+    k.label(&epilog_b);
+    k.wait_lgkmcnt(0);
+    k.s_barrier();
+    lds_read_frags!(k, buf1_off);
+    k.wait_lgkmcnt(0);
+    for t in 0..n_tiles {
+        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // STORE PHASE — bf16 output (half the bandwidth of f32)
+    //
+    // For each acc[t] (8 f32 values across rows), we:
+    //   1. Pack adjacent row pairs with cvt_pk_bf16_f32
+    //   2. Store packed bf16x2 with global_store_b32
+    //   This gives 4 stores per tile instead of 8 = 16 total instead of 32
+    //
+    // Row stride for bf16: 2*N bytes per row, 4*N bytes per 2 rows
+    // ══════════════════════════════════════════════════════════════════
+    k.label(&store_label);
+
+    let lane_half = k.alloc_vreg();
+    k.v_lshrrev_b32(lane_half, 4, lane_id);
+    let base_row_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(base_row_v, s_tmp1);
+    k.v_add_u32(base_row_v, base_row_v, lane_half);
+
+    let n_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
+
+    // Row offset in bytes for bf16: base_row * N * 2
+    let row_bytes = k.alloc_vreg();
+    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
+    k.v_lshlrev_b32(row_bytes, 1, row_bytes); // ×2 for bf16
+
+    // Stride per 2 rows in bytes for bf16: 2 * N * 2 = N * 4
+    let row_stride_2 = k.alloc_vreg();
+    k.v_lshlrev_b32(row_stride_2, 2, n_vreg); // N*4
+
+    let col_base = k.alloc_vreg();
+    k.v_mov_from_sgpr(col_base, base_n_s);
+    k.v_add_u32(col_base, col_base, lane_row);
+    let col_bytes = k.alloc_vreg();
+    k.v_lshlrev_b32(col_bytes, 1, col_base); // col * 2 for bf16
+
+    // Pack and store: 8 f32 → 4 bf16x2 pairs, 4 stores per tile
+    for t in 0..n_tiles {
+        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
+        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
+        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
+        k.v_add_co(y_addr, y_addr, row_bytes);
+        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+        k.v_add_u32(y_addr, y_addr, col_bytes);
+        if t > 0 {
+            k.push(Op::VAddU32 {
+                dst: y_addr, src0: Operand::VReg(y_addr),
+                src1: Operand::InlineInt((t * 32) as i32), // 16 cols * 2 bytes
+            });
+        }
+
+        // Pack pairs: acc[t].0+0,1 → packed, acc[t].0+2,3 → packed, etc.
+        for pair in 0..4u32 {
+            let packed = k.alloc_vreg();
+            k.cvt_pk_bf16_f32(
+                packed,
+                VReg(acc[t].0 + pair * 2),      // even row
+                VReg(acc[t].0 + pair * 2 + 1),  // odd row
+            );
+            k.global_store(y_addr, packed, Width::B32, 0);
+            if pair < 3 {
+                k.v_add_co(y_addr, y_addr, row_stride_2);
+                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+            }
+        }
+    }
+
+    k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
+
 // matmul_direct: Zero-LDS GEMM (ported from handwritten 113 TFLOPS kernel)
 // ============================================================================
 
@@ -1902,60 +2260,62 @@ pub fn matmul_64x64_lds_db(sched: &dyn Schedule) -> T0Kernel {
     let buf1_off = k.alloc_vreg();
     k.v_mov_imm(buf1_off, LDS_BUF as i32);
 
-    // ── Macros ──
+    // ── Pre-allocated temp VGPRs (reused across all macro invocations) ──
+    let tmp_xa = k.alloc_vreg_array(2, Alignment::Align2);  // GMEM X addr
+    let tmp_wa = k.alloc_vreg_array(2, Alignment::Align2);  // GMEM WT addr
+    let tmp_lds_x = k.alloc_vreg();                          // LDS X store addr
+    let tmp_lds_w = k.alloc_vreg();                          // LDS WT store addr
+    let tmp_xr0 = k.alloc_vreg();                            // LDS X read addr 0
+    let tmp_xr1 = k.alloc_vreg();                            // LDS X read addr 1
+    let tmp_wr = k.alloc_vreg();                              // LDS WT read addr
+
+    // ── Macros (now reuse pre-allocated temps) ──
     macro_rules! coop_gmem_load {
         ($kernel:expr, $koff:expr) => {{
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x0, xa, Width::B128, 0);
-            $kernel.global_load(gmem_x1, xa, Width::B128, 16);
+            $kernel.v_mov(tmp_xa, x_gmem_base);
+            $kernel.v_mov(VReg(tmp_xa.0 + 1), VReg(x_gmem_base.0 + 1));
+            $kernel.v_add_co(tmp_xa, tmp_xa, $koff);
+            $kernel.v_add_co_ci(VReg(tmp_xa.0 + 1), VReg(tmp_xa.0 + 1));
+            $kernel.global_load(gmem_x0, tmp_xa, Width::B128, 0);
+            $kernel.global_load(gmem_x1, tmp_xa, Width::B128, 16);
 
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
+            $kernel.v_mov(tmp_wa, wt_gmem_base);
+            $kernel.v_mov(VReg(tmp_wa.0 + 1), VReg(wt_gmem_base.0 + 1));
+            $kernel.v_add_co(tmp_wa, tmp_wa, $koff);
+            $kernel.v_add_co_ci(VReg(tmp_wa.0 + 1), VReg(tmp_wa.0 + 1));
+            $kernel.global_load(gmem_wt0, tmp_wa, Width::B128, 0);
+            $kernel.global_load(gmem_wt1, tmp_wa, Width::B128, 16);
         }};
     }
 
     macro_rules! coop_lds_store {
         ($kernel:expr, $buf_off:expr) => {{
-            let xa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xa, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(xa, gmem_x0, 0);
-            $kernel.ds_store_b128(xa, gmem_x1, 16);
+            $kernel.v_add_u32(tmp_lds_x, x_lds_off, $buf_off);
+            $kernel.ds_store_b128(tmp_lds_x, gmem_x0, 0);
+            $kernel.ds_store_b128(tmp_lds_x, gmem_x1, 16);
 
-            let wa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(wa, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(wa, gmem_wt0, 0);
-            $kernel.ds_store_b128(wa, gmem_wt1, 16);
+            $kernel.v_add_u32(tmp_lds_w, wt_lds_off, $buf_off);
+            $kernel.ds_store_b128(tmp_lds_w, gmem_wt0, 0);
+            $kernel.ds_store_b128(tmp_lds_w, gmem_wt1, 16);
         }};
     }
 
     macro_rules! lds_read_and_wmma {
         ($kernel:expr, $buf_off:expr) => {{
             // X frag[0]
-            let xr0 = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr0, x_lds_read0, $buf_off);
-            $kernel.ds_load_b128(x_frag0, xr0, 0);
-            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), xr0, 16);
+            $kernel.v_add_u32(tmp_xr0, x_lds_read0, $buf_off);
+            $kernel.ds_load_b128(x_frag0, tmp_xr0, 0);
+            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), tmp_xr0, 16);
             // X frag[1]
-            let xr1 = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr1, x_lds_read1, $buf_off);
-            $kernel.ds_load_b128(x_frag1, xr1, 0);
-            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), xr1, 16);
+            $kernel.v_add_u32(tmp_xr1, x_lds_read1, $buf_off);
+            $kernel.ds_load_b128(x_frag1, tmp_xr1, 0);
+            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), tmp_xr1, 16);
             // WT frags
             for c in 0..n_col_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
+                $kernel.v_add_u32(tmp_wr, wt_lds_read_base, $buf_off);
                 let off: u16 = (LDS_X + (c as u32) * 512) as u16;
-                $kernel.ds_load_b128(wt_frags[c], wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), wr, off + 16);
+                $kernel.ds_load_b128(wt_frags[c], tmp_wr, off);
+                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_wr, off + 16);
             }
             $kernel.wait_lgkmcnt(0);
             // WMMA: 2 row blocks × 4 col blocks
@@ -2038,6 +2398,402 @@ pub fn matmul_64x64_lds_db(sched: &dyn Schedule) -> T0Kernel {
     k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
     let row_stride = k.alloc_vreg();
     k.v_lshlrev_b32(row_stride, 3, n_vreg);  // N * 8
+
+    let col_base_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(col_base_v, base_n_s);
+    k.v_add_u32(col_base_v, col_base_v, lane_row);
+    let col_bytes = k.alloc_vreg();
+    k.v_lshlrev_b32(col_bytes, 2, col_base_v);
+
+    for r in 0..n_row_blocks {
+        let rb_s = if r == 0 { s_row_base0 } else { s_row_base1 };
+        let base_row_v = k.alloc_vreg();
+        k.v_mov_from_sgpr(base_row_v, rb_s);
+        k.v_add_u32(base_row_v, base_row_v, lane_half);
+
+        let row_bytes = k.alloc_vreg();
+        k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
+        k.v_lshlrev_b32(row_bytes, 2, row_bytes);
+
+        for c in 0..n_col_tiles {
+            let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
+            k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
+            k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
+            k.v_add_co(y_addr, y_addr, row_bytes);
+            k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+            k.v_add_u32(y_addr, y_addr, col_bytes);
+            if c > 0 {
+                k.push(Op::VAddU32 {
+                    dst: y_addr, src0: Operand::VReg(y_addr),
+                    src1: Operand::InlineInt((c * 64) as i32),
+                });
+            }
+            let a_idx = r * n_col_tiles + c;
+            for vk in 0..8u32 {
+                k.global_store(y_addr, VReg(acc[a_idx].0 + vk), Width::B32, 0);
+                if vk < 7 {
+                    k.v_add_co(y_addr, y_addr, row_stride);
+                    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+                }
+            }
+        }
+    }
+
+    k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
+// ============================================================================
+// matmul_64x64_k32: 64×64 tile with K_tile=32 for 16 WMMAs per loop body
+// ============================================================================
+
+/// 64×64 tile GEMM with K_tile=32, LDS cooperative load + double buffering.
+///
+/// Each K-loop iteration loads 32 K-columns and does 2 rounds of WMMA (K=0..15, K=16..31).
+/// This gives 16 WMMAs per loop body, halving loop overhead vs K_tile=16.
+///
+/// LDS layout (16384B = 2 × 8192B):
+///   X:  64 rows × 32 cols × 2B = 4096B   (row stride = 64B)
+///   WT: 64 rows × 32 cols × 2B = 4096B   (row stride = 64B)
+///
+/// Grid: [ceil(N/64)*64, ceil(M/64), 1]
+/// Kernargs: same 32-byte layout as matmul().
+pub fn matmul_64x64_k32(sched: &dyn Schedule) -> T0Kernel {
+    let mut k = T0Kernel::new("t0_matmul_64x64_k32");
+    let n_col_tiles: usize = 4;     // 64/16
+    let n_row_blocks: usize = 2;    // 32/16 per wave
+
+    const K_TILE: u32 = 32;
+    const LDS_X: u32 = 4096;    // 64 × 32 × 2
+    const LDS_WT: u32 = 4096;   // 64 × 32 × 2
+    const LDS_BUF: u32 = LDS_X + LDS_WT;  // 8192
+    k.set_lds_size(LDS_BUF * 2);            // 16384
+
+    // ── Args ──
+    let x_ptr = k.arg_ptr("X");
+    let wt_ptr = k.arg_ptr("WT");
+    let y_ptr = k.arg_ptr("Y");
+    let k_dim = k.arg_u32("K");
+    let n_dim = k.arg_u32("N");
+    k.emit_arg_loads();
+
+    // ── TGIDs ──
+    let tile_col_s = k.alloc_sreg();
+    let tile_row_s = k.alloc_sreg();
+    k.capture_tgid_x(tile_col_s);
+    k.capture_tgid_y(tile_row_s);
+
+    let tid = VReg(0);
+    let lane_id = k.alloc_vreg();
+    k.v_and_b32_imm(lane_id, tid, 31);
+    let wave_id = k.alloc_vreg();
+    k.v_lshrrev_b32(wave_id, 5, tid);
+    let wave_id_s = k.alloc_sreg();
+    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
+    let lane_row = k.alloc_vreg();
+    k.v_and_b32_imm(lane_row, lane_id, 15);
+
+    // ── Accumulators: 2 row blocks × 4 col blocks = 8 per wave ──
+    let mut acc = Vec::new();
+    for _r in 0..n_row_blocks {
+        for _c in 0..n_col_tiles {
+            acc.push(k.alloc_vreg_array(8, Alignment::Align8));
+        }
+    }
+    for a in &acc {
+        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
+    }
+
+    // ── Store phase constants ──
+    let s_row_base0 = k.alloc_sreg();
+    let s_row_base1 = k.alloc_sreg();
+    k.s_lshl_b32(s_row_base0, tile_row_s, 6);
+    let s_tmp = k.alloc_sreg();
+    k.s_lshl_b32(s_tmp, wave_id_s, 5);
+    k.push(Op::SAddU32 { dst: s_row_base0, src0: s_row_base0, src1: SOperand::SReg(s_tmp) });
+    k.push(Op::SAddU32 { dst: s_row_base1, src0: s_row_base0, src1: SOperand::InlineInt(16) });
+
+    let base_n_s = k.alloc_sreg();
+    k.s_lshl_b32(base_n_s, tile_col_s, 6);
+
+    // ══════════════════════════════════════════════════════════════════
+    // COOPERATIVE LOAD ADDRESSES (K=32: each thread loads 64B per matrix)
+    // ══════════════════════════════════════════════════════════════════
+
+    let k_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
+
+    // ── X: thread t loads row t: 4× b128 = 64B ──
+    let x_abs_row = k.alloc_vreg();
+    let s_xbase = k.alloc_sreg();
+    k.s_lshl_b32(s_xbase, tile_row_s, 6);
+    k.v_mov_from_sgpr(x_abs_row, s_xbase);
+    k.v_add_u32(x_abs_row, x_abs_row, tid);
+
+    let x_row_byte = k.alloc_vreg();
+    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
+    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
+
+    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
+    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
+    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
+    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
+
+    // X LDS store addr = t * 64 (row stride for K=32)
+    let x_lds_off = k.alloc_vreg();
+    k.v_lshlrev_b32(x_lds_off, 6, tid);  // t * 64
+
+    // ── WT: thread t loads row t: 4× b128 = 64B ──
+    let wt_abs_row = k.alloc_vreg();
+    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
+    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
+
+    let wt_row_byte = k.alloc_vreg();
+    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
+    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
+
+    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
+    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
+    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
+    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
+
+    // WT LDS store addr = LDS_X + t * 64
+    let wt_lds_off = k.alloc_vreg();
+    k.v_lshlrev_b32(wt_lds_off, 6, tid);  // t * 64
+    k.push(Op::VAddU32 {
+        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
+        src1: Operand::InlineInt(LDS_X as i32),
+    });
+
+    // ── LDS read addresses ──
+    // Row stride in LDS = 64B (K=32)
+    // X frag[0]: (wave_id*32 + lane_row) * 64 = wave_id*2048 + lane_row*64
+    // X frag[1]: (wave_id*32 + 16 + lane_row) * 64 = wave_id*2048 + 1024 + lane_row*64
+    let lane_row_x64 = k.alloc_vreg();
+    k.v_lshlrev_b32(lane_row_x64, 6, lane_row);  // lane_row * 64
+
+    let s_wave_x_off = k.alloc_sreg();
+    k.s_lshl_b32(s_wave_x_off, wave_id_s, 11);  // wave_id * 2048
+
+    let x_lds_read0 = k.alloc_vreg();
+    k.v_mov_from_sgpr(x_lds_read0, s_wave_x_off);
+    k.v_add_u32(x_lds_read0, x_lds_read0, lane_row_x64);
+
+    let x_lds_read1 = k.alloc_vreg();
+    k.v_mov_from_sgpr(x_lds_read1, s_wave_x_off);
+    k.v_add_u32(x_lds_read1, x_lds_read1, lane_row_x64);
+    k.push(Op::VAddU32 {
+        dst: x_lds_read1, src0: Operand::VReg(x_lds_read1),
+        src1: Operand::InlineInt(1024),  // 16 rows * 64B
+    });
+
+    // WT: lane_row * 64 (tile offset as immediate)
+    let wt_lds_read_base = k.alloc_vreg();
+    k.v_lshlrev_b32(wt_lds_read_base, 6, lane_row);  // lane_row * 64
+
+    // ── Temp VGPRs for GMEM (4× b128 each for X and WT) ──
+    let gmem_x0 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_x1 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_x2 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_x3 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt2 = k.alloc_vreg_array(4, Alignment::Align4);
+    let gmem_wt3 = k.alloc_vreg_array(4, Alignment::Align4);
+
+    // ── WMMA fragment registers ──
+    let x_frag0 = k.alloc_vreg_array(8, Alignment::Align8);
+    let x_frag1 = k.alloc_vreg_array(8, Alignment::Align8);
+    let wt_frags: Vec<VReg> = (0..n_col_tiles)
+        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
+        .collect();
+
+    // ── K-loop state ──
+    let k_byte_off = k.alloc_vreg();
+    k.v_mov_imm(k_byte_off, 0);
+    let k_iter_s = k.alloc_sreg();
+    k.s_mov_imm(k_iter_s, 0);
+    let k_step = (K_TILE * 2) as i32;  // 64 bytes
+
+    let buf0_off = k.alloc_vreg();
+    k.v_mov_imm(buf0_off, 0);
+    let buf1_off = k.alloc_vreg();
+    k.v_mov_imm(buf1_off, LDS_BUF as i32);
+
+    // ── Macros ──
+    macro_rules! coop_gmem_load {
+        ($kernel:expr, $koff:expr) => {{
+            // X: 4× b128 = 64B per thread (32 bf16 columns)
+            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
+            $kernel.v_mov(xa, x_gmem_base);
+            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
+            $kernel.v_add_co(xa, xa, $koff);
+            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
+            $kernel.global_load(gmem_x0, xa, Width::B128, 0);
+            $kernel.global_load(gmem_x1, xa, Width::B128, 16);
+            $kernel.global_load(gmem_x2, xa, Width::B128, 32);
+            $kernel.global_load(gmem_x3, xa, Width::B128, 48);
+
+            // WT: 4× b128 = 64B per thread
+            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
+            $kernel.v_mov(wa, wt_gmem_base);
+            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
+            $kernel.v_add_co(wa, wa, $koff);
+            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
+            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
+            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
+            $kernel.global_load(gmem_wt2, wa, Width::B128, 32);
+            $kernel.global_load(gmem_wt3, wa, Width::B128, 48);
+        }};
+    }
+
+    macro_rules! coop_lds_store {
+        ($kernel:expr, $buf_off:expr) => {{
+            // X → LDS: 4× ds_store_b128 at row stride 64
+            let xa = $kernel.alloc_vreg();
+            $kernel.v_add_u32(xa, x_lds_off, $buf_off);
+            $kernel.ds_store_b128(xa, gmem_x0, 0);
+            $kernel.ds_store_b128(xa, gmem_x1, 16);
+            $kernel.ds_store_b128(xa, gmem_x2, 32);
+            $kernel.ds_store_b128(xa, gmem_x3, 48);
+
+            // WT → LDS
+            let wa = $kernel.alloc_vreg();
+            $kernel.v_add_u32(wa, wt_lds_off, $buf_off);
+            $kernel.ds_store_b128(wa, gmem_wt0, 0);
+            $kernel.ds_store_b128(wa, gmem_wt1, 16);
+            $kernel.ds_store_b128(wa, gmem_wt2, 32);
+            $kernel.ds_store_b128(wa, gmem_wt3, 48);
+        }};
+    }
+
+    // Read fragments and do 2 rounds of WMMA (K=0..15 and K=16..31)
+    macro_rules! lds_read_and_wmma_k32 {
+        ($kernel:expr, $buf_off:expr) => {{
+            // === Round 1: K=0..15 (offset 0 from each row) ===
+            // X frag[0] at row offset 0, K offset 0
+            let xr0 = $kernel.alloc_vreg();
+            $kernel.v_add_u32(xr0, x_lds_read0, $buf_off);
+            $kernel.ds_load_b128(x_frag0, xr0, 0);
+            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), xr0, 16);
+            // X frag[1] at row offset 1024
+            let xr1 = $kernel.alloc_vreg();
+            $kernel.v_add_u32(xr1, x_lds_read1, $buf_off);
+            $kernel.ds_load_b128(x_frag1, xr1, 0);
+            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), xr1, 16);
+            // WT frags for K=0..15
+            for c in 0..n_col_tiles {
+                let wr = $kernel.alloc_vreg();
+                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
+                let off: u16 = (LDS_X + (c as u32) * 16 * 64) as u16;  // 16 rows × 64B stride
+                $kernel.ds_load_b128(wt_frags[c], wr, off);
+                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), wr, off + 16);
+            }
+            $kernel.wait_lgkmcnt(0);
+            // WMMA round 1
+            for c in 0..n_col_tiles {
+                $kernel.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frag0, wt_frags[c], acc[0 * n_col_tiles + c]);
+            }
+            for c in 0..n_col_tiles {
+                $kernel.wmma_bf16_f32(acc[1 * n_col_tiles + c], x_frag1, wt_frags[c], acc[1 * n_col_tiles + c]);
+            }
+
+            // === Round 2: K=16..31 (offset 32 from each row) ===
+            $kernel.ds_load_b128(x_frag0, xr0, 32);
+            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), xr0, 48);
+            $kernel.ds_load_b128(x_frag1, xr1, 32);
+            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), xr1, 48);
+            for c in 0..n_col_tiles {
+                let wr = $kernel.alloc_vreg();
+                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
+                let off: u16 = (LDS_X + (c as u32) * 16 * 64 + 32) as u16; // +32 for K=16..31
+                $kernel.ds_load_b128(wt_frags[c], wr, off);
+                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), wr, off + 16);
+            }
+            $kernel.wait_lgkmcnt(0);
+            // WMMA round 2
+            for c in 0..n_col_tiles {
+                $kernel.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frag0, wt_frags[c], acc[0 * n_col_tiles + c]);
+            }
+            for c in 0..n_col_tiles {
+                $kernel.wmma_bf16_f32(acc[1 * n_col_tiles + c], x_frag1, wt_frags[c], acc[1 * n_col_tiles + c]);
+            }
+        }};
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // PROLOGUE
+    // ══════════════════════════════════════════════════════════════════
+    coop_gmem_load!(k, k_byte_off);
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf0_off);
+    k.wait_lgkmcnt(0);
+    k.s_barrier();
+    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
+    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
+
+    // ══════════════════════════════════════════════════════════════════
+    // MAIN LOOP
+    // ══════════════════════════════════════════════════════════════════
+    let loop_label = k.make_label("k64k32_loop");
+    k.label(&loop_label);
+    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
+    let epilog_a = k.make_label("k64k32_ea");
+    k.branch_scc1(&epilog_a);
+
+    // Phase A: prefetch→buf1, compute buf0 (16 WMMAs)
+    coop_gmem_load!(k, k_byte_off);
+    lds_read_and_wmma_k32!(k, buf0_off);
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf1_off);
+    k.wait_lgkmcnt(0);
+    k.s_barrier();
+    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
+    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
+
+    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
+    let epilog_b = k.make_label("k64k32_eb");
+    k.branch_scc1(&epilog_b);
+
+    // Phase B: prefetch→buf0, compute buf1 (16 WMMAs)
+    coop_gmem_load!(k, k_byte_off);
+    lds_read_and_wmma_k32!(k, buf1_off);
+    k.wait_vmcnt(0);
+    coop_lds_store!(k, buf0_off);
+    k.wait_lgkmcnt(0);
+    k.s_barrier();
+    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
+    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
+    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
+    k.branch_scc1(&loop_label);
+
+    // ══════════════════════════════════════════════════════════════════
+    // EPILOGUES
+    // ══════════════════════════════════════════════════════════════════
+    k.label(&epilog_a);
+    lds_read_and_wmma_k32!(k, buf0_off);
+    let store_label = k.make_label("k64k32_store");
+    k.s_mov_imm(k_iter_s, 0);
+    k.s_cmp_eq_u32_imm(k_iter_s, 0);
+    k.branch_scc1(&store_label);
+
+    k.label(&epilog_b);
+    lds_read_and_wmma_k32!(k, buf1_off);
+
+    // ══════════════════════════════════════════════════════════════════
+    // STORE PHASE: same as matmul_64x64_lds_db
+    // ══════════════════════════════════════════════════════════════════
+    k.label(&store_label);
+
+    let lane_half = k.alloc_vreg();
+    k.v_lshrrev_b32(lane_half, 4, lane_id);
+    let n_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
+    let row_stride = k.alloc_vreg();
+    k.v_lshlrev_b32(row_stride, 3, n_vreg);
 
     let col_base_v = k.alloc_vreg();
     k.v_mov_from_sgpr(col_base_v, base_n_s);

@@ -25,8 +25,10 @@ pub mod asm_emitter;
 pub mod compile;
 pub mod schedule;
 pub mod math;
+pub mod gemm_gen;
 // gpu_tests omitted in open-source build
 
 pub use ir::*;
 pub use compile::T0Kernel;
 pub use schedule::{Schedule, GFX1100Schedule};
+pub use gemm_gen::{GemmConfig, auto_select, compute_grid_auto, build_kernargs};
