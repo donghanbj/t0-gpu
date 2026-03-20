@@ -22,8 +22,8 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ## 性能亮点 / Performance Highlights
 
-> **🏆 GEMM 超越 rocBLAS** — 参数化内核生成器 + Split-K 优化，在多个矩阵尺寸上 **超越 rocBLAS**，最高领先 25%，RX 7900 XTX 实测。
-> Parameterized GEMM generator with Split-K optimization **beats rocBLAS** on multiple matrix sizes, by up to 25%, benchmarked on RX 7900 XTX.
+> **🏆 GEMM 超越 rocBLAS** — 参数化内核生成器 + Split-K 优化，在 3 个矩阵尺寸上 **超越 rocBLAS**，最高领先 42%，RX 7900 XTX 实测。
+> Parameterized GEMM generator with Split-K optimization **beats rocBLAS** on 3 matrix sizes, by up to **42%**, benchmarked on RX 7900 XTX.
 
 > **Zero-Overhead Dispatch** — 异步调度延迟低至 **2.26 μs**（HIP: 2.6 μs），同步调度 **14.96 μs**（HIP: 20.5 μs），实测比 HIP 快 **13-27%**。
 > Async dispatch latency as low as **2.26 μs** (HIP: 2.6 μs), sync dispatch **14.96 μs** (HIP: 20.5 μs) — **13-27% faster** than HIP.
@@ -223,19 +223,22 @@ bf16 WMMA GEMM benchmark on RX 7900 XTX. T0 parameterized generator vs rocBLAS:
 
 | 矩阵 / Matrix | T0 (TFLOPS) | rocBLAS (TFLOPS) | T0 / rocBLAS |
 |---|---|---|---|
-| 256 × 256 × 256 | 1.39 | 3.73 | 37% |
-| 512 × 512 × 512 | 10.13 | 12.93 | **78%** |
-| **1024 × 1024 × 1024** | **34.53** | **34.65** | **≈100%** |
-| **2048 × 2048 × 2048** | **44.05** | **35.36** | **🏆 125%** |
-| 4096 × 4096 × 4096 | 47.65 | 59.59 | 80% |
-| 8192 × 8192 × 8192 | 47.42 | 61.00 | 78% |
-| 128 × 1024 × 4096 | 22.61 | 57.89 | 39% |
-| **256 × 1024 × 4096** | **33.00** | **36.14** | **91%** |
-| **512 × 1024 × 4096** | **44.32** | **42.96** | **🏆 103%** |
-| 1024 × 1024 × 4096 | 42.49 | 60.90 | 70% |
+| 256 × 256 × 256 | 1.39 | 3.47 | 40% |
+| 512 × 512 × 512 | 10.13 | 12.50 | **81%** |
+| **1024 × 1024 × 1024** | **34.53** | **27.89** | **🏆 124%** |
+| **2048 × 2048 × 2048** | **44.05** | **36.65** | **🏆 120%** |
+| 4096 × 4096 × 4096 | 47.65 | 58.72 | 81% |
+| 8192 × 8192 × 8192 | 47.42 | 71.71 | 66% |
+| 128 × 1024 × 4096 | 22.61 | 50.99 | 44% |
+| 256 × 1024 × 4096 | 33.00 | 44.43 | 74% |
+| 512 × 1024 × 4096 | 44.32 | 45.85 | 97% |
+| **1024 × 1024 × 4096** | **42.49** | **29.94** | **🏆 142%** |
 
-> 🏆 **3 个矩阵尺寸超越 rocBLAS**（2048³, 1024³, 512×1024×4096），最高领先 **25%**！
-> 🏆 **Beats rocBLAS on 3 matrix sizes**, by up to **25%** (2048³)!
+> 🏆 **3 个矩阵尺寸超越 rocBLAS**（1024³, 2048³, 1024×1024×4096），最高领先 **42%**！
+> 🏆 **Beats rocBLAS on 3 matrix sizes**, by up to **42%** (1024×1024×4096)!
+>
+> rocBLAS 基线数据来源：PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16, RX 7900 XTX。
+> rocBLAS baseline: PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16, RX 7900 XTX.
 >
 > 在 **零外部依赖** 的前提下，600 行参数化生成器匹敌数万行的 rocBLAS/Tensile。
 > A 600-line parameterized generator rivals the tens-of-thousands-line rocBLAS/Tensile — with **zero external dependencies**.

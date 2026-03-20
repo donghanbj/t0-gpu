@@ -6,14 +6,14 @@
 
 ## TL;DR
 
-I wrote a parameterized GEMM kernel generator in **600 lines of Rust** that beats AMD's official rocBLAS library on **3 out of 10 matrix sizes** — by up to **25%**. It runs on bare metal through the Linux KFD driver, with **zero external dependencies**. No HIP. No ROCm runtime. Just `/dev/kfd` and a dream.
+I wrote a parameterized GEMM kernel generator in **600 lines of Rust** that beats AMD's official rocBLAS library on **3 out of 10 matrix sizes** — by up to **42%**. It runs on bare metal through the Linux KFD driver, with **zero external dependencies**. No HIP. No ROCm runtime. Just `/dev/kfd` and a dream.
 
 | Matrix | My Code | rocBLAS | Mine / rocBLAS |
 |--------|---------|---------|----------------|
-| 1024³ | 34.5 TFLOPS | 34.7 TFLOPS | **≈100%** |
-| **2048³** | **44.1 TFLOPS** | **35.4 TFLOPS** | **🏆 125%** |
-| **512×1024×4096** | **44.3 TFLOPS** | **43.0 TFLOPS** | **🏆 103%** |
-| 1024×1024×4096 | 42.5 TFLOPS | 60.9 TFLOPS | 70% |
+| **1024³** | **34.5 TFLOPS** | **27.9 TFLOPS** | **🏆 124%** |
+| **2048³** | **44.1 TFLOPS** | **36.7 TFLOPS** | **🏆 120%** |
+| 512×1024×4096 | 44.3 TFLOPS | 45.9 TFLOPS | 97% |
+| **1024×1024×4096** | **42.5 TFLOPS** | **29.9 TFLOPS** | **🏆 142%** |
 
 The code is open source: [**github.com/GeisYaO/t0-gpu**](https://github.com/GeisYaO/t0-gpu)
 
