@@ -186,7 +186,7 @@ fn main() -> Result<(), String> {
         eprintln!("\n══ Optimal Kernel Selection ══");
         eprintln!("{:>18} | {:>20} | {:>8} | vs rocBLAS", "Matrix", "Best Kernel", "TFLOPS");
         eprintln!("{}", "-".repeat(65));
-        let rocblas: Vec<f64> = vec![3.73, 12.93, 34.65, 35.36, 59.59, 61.0, 57.89, 36.15, 42.97, 24.07];
+        let rocblas: Vec<f64> = vec![3.73, 12.93, 34.65, 35.36, 59.59, 61.0, 57.89, 36.15, 42.97, 60.9];
         for (si, &(m, k, n)) in sizes.iter().enumerate() {
             let mut best_tf = 0.0f64;
             let mut best_name = String::new();
