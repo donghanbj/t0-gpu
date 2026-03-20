@@ -48,10 +48,30 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ### 环境要求 / Requirements
 
-- **GPU**: AMD RDNA3 (RX 7900 XTX / 7900 XT 等)
-- **OS**: Linux (Ubuntu 22.04+ 推荐)
-- **驱动 / Driver**: amdgpu KFD (`/dev/kfd` + `/dev/dri/renderD128`)
+- **GPU**: AMD RDNA3 (RX 7900 XTX / 7900 XT / 7800 XT 等)
+- **OS**: Linux, 内核 5.15+（Ubuntu 22.04+ / Fedora 36+ 推荐）/ Linux kernel 5.15+
+- **驱动 / Driver**: amdgpu KFD（内核模块自带，无需额外安装）/ Built-in kernel module
 - **工具链 / Toolchain**: Rust 1.70+, LLVM 17+ (`llvm-mc`, `ld.lld`)
+
+#### 验证环境 / Verify Setup
+
+```bash
+# 检查 KFD 设备节点是否存在
+# Check KFD device node exists
+ls -la /dev/kfd /dev/dri/renderD128
+
+# 检查当前用户是否有权限
+# Check current user has permission
+groups | grep -E "video|render"
+# 如果没有，将用户添加到 video 和 render 组：
+# If not, add user to video and render groups:
+# sudo usermod -aG video,render $USER && newgrp video
+
+# 验证 LLVM 工具链
+# Verify LLVM toolchain
+llvm-mc --version    # 需要 17+
+ld.lld --version     # 需要与 llvm-mc 同版本
+```
 
 ### 编译 / Build
 
