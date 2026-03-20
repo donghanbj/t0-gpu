@@ -27,7 +27,7 @@ I was training a custom attention mechanism on an RX 7900 XTX. The plan was simp
 
 At that point, I had three options: **A)** Fall back to wgpu + standard attention with chunking — safe, but wgpu doesn't support bf16 WMMA, giving up 90% of the hardware's compute power. **B)** Fix CubeCL to support FA-2 — but GFX1100 had no working FA-2 pathway at all; no framework fix could solve that. **C)** Wait for upstream updates — could take a year or more (in fact, FA-2 still doesn't support RDNA3 today).
 
-**I chose a fourth option that didn't exist: build everything from scratch, starting at the ISA level.** Even my AI coding assistant told me "this path is extremely difficult and unrealistic." Statistically, that was rational advice — one person building a GPU compiler + runtime is team-level work in industry. But I'd already hit dead ends on all three "realistic" paths.
+**I chose a fourth option that didn't exist: build everything from scratch, starting at the ISA level.** 
 
 So here's what happened:
 
