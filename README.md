@@ -153,18 +153,33 @@ T0 是一个多层 GPU 内核编译器框架：
 
 T0 is a multi-layer GPU kernel compiler framework:
 
-```
-数学表达式 / Math Expression
-       ↓
-   T0-high (数学层 / Math layer)     ← math.rs
-       ↓
-   T0-mid  (调度层 / Scheduling)     ← schedule.rs + gemm_gen.rs
-       ↓
-   T0-low  (代码生成 / Codegen)      ← compile.rs + asm_emitter.rs
-       ↓
-   LLVM-MC (汇编 / Assembly)
-       ↓
-   AMD HSA ELF (可加载二进制 / Loadable binary)
+```mermaid
+flowchart TD
+    subgraph "User API"
+        A["auto_select(M, K, N)"] --> B["GemmConfig"]
+        B --> C["generate(&cfg)"]
+    end
+
+    subgraph "T0 Compiler"
+        C --> D["T0-high: Math IR\n(math.rs / gemm_gen.rs)"]
+        D --> E["T0-mid: Scheduling\n(schedule.rs)"]
+        E --> F["T0-low: Codegen\n(compile.rs + asm_emitter.rs)"]
+    end
+
+    subgraph "Backend"
+        F --> G["LLVM-MC\n(llvm-mc gfx1100)"]
+        G --> H["AMD HSA ELF\n(rdna3_code_object.rs)"]
+    end
+
+    subgraph "KFD Runtime"
+        H --> I["GpuKernel::load()"]
+        I --> J["AQL Queue Submit\n(2.26 μs async)"]
+        J --> K["🚀 RX 7900 XTX\n96 CU / 123 TFLOPS"]
+    end
+
+    style A fill:#4CAF50,color:#fff
+    style K fill:#FF5722,color:#fff
+    style H fill:#2196F3,color:#fff
 ```
 
 ### 内置内核 / Built-in Kernels
