@@ -23,21 +23,25 @@ The code is open source: [**github.com/GeisYaO/t0-gpu**](https://github.com/Geis
 
 Not because I wanted to build a GPU compiler. Because **I had no other choice**.
 
-I was training a custom attention mechanism on an RX 7900 XTX. The plan was simple: PyTorch + ROCm. Then reality hit:
+I was training a custom attention mechanism on an RX 7900 XTX. The plan was simple: PyTorch + ROCm. Then I fell into one pit after another:
 
 1. **PyTorch doesn't support FlashAttention-2 on GFX1100**. RDNA3 is a consumer architecture. Official FA-2 only supports CDNA (MI250/MI300). My GPU was excluded.
 
-2. **Tried CubeCL (Rust GPU compute library)**. Found a bf16 bug that broke everything. I tried to fix CubeCL upstream — the rabbit hole was too deep.
+2. **Tried Burn framework + CubeCL (Rust GPU compute library)**. CubeCL's bf16 support was broken — it panicked on a chain of `unwrap()` calls. I submitted a PR to fix the uniformity analysis panic. Fixed one `unwrap()`, ran it again — *another* `unwrap()` panic on the very next line. Chased it further, found HIP memory management was also broken, submitted another PR for the allocator + GC. **Fixing someone else's framework was harder than writing my own.**
 
-3. **Wrote my own HIP FlashAttention-2**. It worked, but performance was disappointing. HIP runtime overhead was particularly painful on small matrices.
+3. **Wrote my own HIP FlashAttention-2**. Spent weeks hand-writing a 12,536-byte backward kernel — 168 VGPRs, 56KB LDS, 8 waves, 9 compute steps. It worked, but profiling revealed **WMMA utilization was only 2%**. 70% of the time was spent waiting on memory — because Occupancy was 1 (56KB LDS consumed the 64KB limit), the GPU had no other workgroups to switch to. Every `wait` instruction was a hard stall.
 
-4. **Started hand-writing GFX1100 assembly**. If every framework was broken, I'd talk to the hardware directly. I verified each instruction encoding with `llvm-mc`, writing WMMA GEMM kernels one instruction at a time.
+4. **Strategic pivot: abandon FA-2, embrace pure GEMM**. If FlashAttention's fused kernel was fundamentally inefficient on RDNA3, why not go back to basics — decompose attention into multiple high-efficiency GEMM calls? This became OCPA (Orthogonal Chunked Pure-matrix Attention).
 
-5. **HIP dispatch was also a problem**. hipLaunchKernel has 20μs sync latency. My training loop launched hundreds of small kernels per step — all wasted on dispatch overhead. So I **wrote my own KFD runtime**: direct AQL queue packet writes through `/dev/kfd`.
+5. **Started hand-writing GFX1100 assembly**. If every framework was broken, I'd talk to the hardware directly. I verified each instruction encoding with `llvm-mc`, writing WMMA GEMM kernels one instruction at a time. Just the bf16 butterfly transpose had 4 ISA encoding bugs (`v_perm_b32` literal marker, cross-VGPR routing, XOR distance, selector byte order).
 
-6. **Hand-writing kernels was unsustainable**. One GEMM kernel = 300 lines of assembly. Changing a tile size meant copy-pasting the entire file. So I built a **parameterized code generator** — one `generate()` function covering all variants.
+6. **HIP dispatch was also a problem**. hipLaunchKernel has 20μs sync latency. My training loop launched hundreds of small kernels per step — all wasted on dispatch overhead. So I **wrote my own KFD runtime**: direct AQL queue packet writes through `/dev/kfd`. Not easy either — even the AQL doorbell semantics were wrong (should write `write_ptr - 1`, not `write_ptr`). I only got it right by reading tinygrad's source code.
 
-Looking back, this path is absurd: **from `import torch` to hand-written GPU ISA**. But each step was forced — not because I wanted to skip frameworks, but because the frameworks didn't work on RDNA3.
+7. **Hand-writing kernels was unsustainable**. One GEMM kernel = 300 lines of assembly. Changing a tile size meant copy-pasting the entire file. So I built a **parameterized code generator** — one `generate()` function covering all variants.
+
+Looking back, this path is absurd: **from `import torch` to hand-written GPU ISA, through Burn framework, CubeCL's chain-of-unwrap panics, a 12KB FA-2 kernel with 2% WMMA utilization, and KFD doorbell semantics bugs...**
+
+But each step was forced — not because I wanted to skip frameworks, but because the frameworks didn't work on RDNA3. **When the entire ecosystem tells you "please wait for the next version" and you can't afford to wait, the only option is to build it yourself.**
 
 The result is T0: a pure-Rust GPU kernel compiler + bare-metal runtime.
 

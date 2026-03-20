@@ -25,21 +25,25 @@ rocBLAS 基线数据来源：PyTorch 2.9.1+rocm6.4，`torch.mm()` bf16，RX 7900
 
 不是因为我想做一个 GPU 编译器。是因为**我被逼到了这一步**。
 
-我在 RX 7900 XTX 上做自定义注意力机制的训练。最初的路线很正常——用 PyTorch + ROCm。然后我发现：
+我在 RX 7900 XTX 上做自定义注意力机制的训练。最初的路线很正常——用 PyTorch + ROCm。然后掉进了一个又一个坑：
 
 1. **PyTorch 不支持 GFX1100 使用 FlashAttention-2**。RDNA3 是消费级架构，官方 FA-2 只支持 CDNA（MI250/MI300）。我的 GPU 被排除在外。
 
-2. **转向 CubeCL（Rust GPU 计算库）**。发现 bf16 有 bug，不能使用。我去修 CubeCL 的代码，发现这个坑太深了。
+2. **转向 Burn 框架 + CubeCL（Rust GPU 计算库）**。发现 CubeCL 的 bf16 支持有 bug，panic 在一连串的 `unwrap()` 上。我去修 CubeCL，提交了 uniformity analysis panic fix 的 PR。结果修完第一个 `unwrap()`，运行到下一行又是一个 `unwrap()` panic。一路追下去，发现 HIP 内存管理也有问题，又提交了 HIP allocator + GC 的 PR。**修别人的框架比自己写还累。**
 
-3. **自己写 HIP 版 FlashAttention-2**。能跑了，但性能达不到预期。HIP 运行时的开销在小矩阵上特别明显。
+3. **自己写 HIP 版 FlashAttention-2**。花了几周手写了 12,536 bytes 的 backward kernel——168 个 VGPR、56KB LDS、8 个 wave、9 个计算步骤。能跑了，但分析后发现 **WMMA 利用率只有 2%**。70% 的时间花在等内存——因为 Occupancy 只有 1（LDS 56KB 吃满了 64KB 上限），GPU 没有其他工作组可以切换，每个 `wait` 都是硬停顿。
 
-4. **开始手写 GFX1100 汇编**。既然框架都靠不住，那我直接跟硬件对话。用 `llvm-mc` 验证每条指令编码，一条一条地写 WMMA GEMM 内核。
+4. **战略转型：放弃 FA-2，拥抱纯 GEMM**。既然 FlashAttention 的 fused kernel 在 RDNA3 上效率极低，那不如回到基础——把注意力拆成多个高效的 GEMM 调用。这就是后来 OCPA（正交分块纯矩阵注意力）的起点。
 
-5. **HIP 调度也有问题**。hipLaunchKernel 同步延迟 20μs，我的训练循环每步几百个小内核，全部浪费在调度上。于是**自己写了 KFD 运行时**——直接通过 `/dev/kfd` 往 AQL 队列写 dispatch packet。
+5. **开始手写 GFX1100 汇编**。既然框架都靠不住，那我直接跟硬件对话。用 `llvm-mc` 验证每条指令编码，一条一条地写 WMMA GEMM 内核。光是一个 bf16 butterfly 转置就修了 4 个 ISA 编码 bug（`v_perm_b32` 的 literal marker、cross-VGPR routing、XOR distance、selector byte order）。
 
-6. **手写算子太痛苦**。一个 GEMM 内核 300 行汇编，改一个 tile 尺寸要复制粘贴整个文件。于是写了**参数化代码生成器**——一个 `generate()` 函数覆盖所有变体。
+6. **HIP 调度也有问题**。hipLaunchKernel 同步延迟 20μs，我的训练循环每步几百个小内核，全部浪费在调度上。于是**自己写了 KFD 运行时**——直接通过 `/dev/kfd` 往 AQL 队列写 dispatch packet。这一步也不轻松：连 AQL doorbell 的语义都搞错了（应该写 `write_ptr - 1` 而不是 `write_ptr`），还是参考了 tinygrad 的源码才修对的。
 
-回头看，这条路线荒谬得不可思议：**从 `import torch` 到手写 GPU ISA 汇编**。但每一步都是被逼的——不是我想跳过框架，是框架在 RDNA3 上跑不通。
+7. **手写算子太痛苦**。一个 GEMM 内核 300 行汇编，改一个 tile 尺寸要复制粘贴整个文件。于是写了**参数化代码生成器**——一个 `generate()` 函数覆盖所有变体。
+
+回头看，这条路线荒谬得不可思议：**从 `import torch` 到手写 GPU ISA 汇编，中间经历了 Burn 框架、CubeCL 的 unwrap 连环 panic、12KB 的 FA-2 内核只有 2% WMMA 利用率、KFD doorbell 语义 bug...**
+
+但每一步都是被逼的——不是我想跳过框架，是框架在 RDNA3 上跑不通。**当整个生态告诉你"请等下一个版本"，而你等不起的时候，唯一的选择就是自己动手。**
 
 最终的产物就是 T0：一个纯 Rust 的 GPU 内核编译器 + 裸金属运行时。
 
