@@ -16,40 +16,46 @@ fn main() -> Result<(), String> {
 
     // Define configs to sweep
     let configs = vec![
-        // ── Small-M tiles (NEW) ──
+        // ── 16×64 k16 (padded) + split-K ──
         GemmConfig::tile_16x64_k16(),
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_16x64_k16() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_16x64_k16() },
         GemmConfig { split_k: Some(8), ..GemmConfig::tile_16x64_k16() },
+        GemmConfig { split_k: Some(16), ..GemmConfig::tile_16x64_k16() },
+        // ── 32×64 k16 (padded) + split-K ──
         GemmConfig::tile_32x64_k16(),
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k16() },
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x64_k16() },
+        GemmConfig { split_k: Some(8), ..GemmConfig::tile_32x64_k16() },
+        GemmConfig { split_k: Some(16), ..GemmConfig::tile_32x64_k16() },
+        // ── 32×64 k32 + split-K ──
         GemmConfig::tile_32x64_k32(),
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k32() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x64_k32() },
-        GemmConfig { split_k: Some(8), ..GemmConfig::tile_32x64_k32() },
-        GemmConfig::tile_32x128_k16(),
-        GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x128_k16() },
-        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() },
-        // ── Standard tiles ──
+        // ── 64×64 k16 (padded, best for large) + split-K ──
         GemmConfig::tile_64x64_k16(),
-        GemmConfig::tile_64x64_k32(),
-        GemmConfig::tile_128x64_k32(),
-        // ── Split-K variants ──
-        GemmConfig { split_k: Some(2), ..GemmConfig::tile_64x64_k32() },
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_64x64_k16() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() },
-        GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() },
         GemmConfig { split_k: Some(8), ..GemmConfig::tile_64x64_k16() },
-        // 128×64 + split-K
+        GemmConfig { split_k: Some(16), ..GemmConfig::tile_64x64_k16() },
+        // ── 32×128 k16 (padded) ──
+        GemmConfig::tile_32x128_k16(),
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() },
+        // ── 128×64 k32 ──
+        GemmConfig::tile_128x64_k32(),
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() },
     ];
 
-    // Matrix sizes to test
+    // Matrix sizes: focus on small + representative large
     let sizes: Vec<(u32, u32, u32)> = vec![
+        (64, 64, 64),
+        (128, 128, 128),
         (256, 256, 256),
+        (384, 384, 384),
         (512, 512, 512),
         (1024, 1024, 1024),
         (2048, 2048, 2048),
         (4096, 4096, 4096),
-        (8192, 8192, 8192),
         (128, 1024, 4096),
         (256, 1024, 4096),
         (512, 1024, 4096),

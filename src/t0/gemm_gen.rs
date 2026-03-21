@@ -343,7 +343,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
 
     // Extract tile_col and split_k_id from TGID.y using compile-time shift
     let split_k = cfg.split_k.unwrap_or(1);
-    let split_k_shift: u8 = match split_k { 1 => 0, 2 => 1, 4 => 2, 8 => 3, _ => panic!("unsupported split_k") };
+    let split_k_shift: u8 = match split_k { 1 => 0, 2 => 1, 4 => 2, 8 => 3, 16 => 4, _ => panic!("unsupported split_k") };
 
     let tile_col_s = k.alloc_sreg();
     let split_k_id_s = k.alloc_sreg();
