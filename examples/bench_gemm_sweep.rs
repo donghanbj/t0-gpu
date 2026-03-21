@@ -16,14 +16,24 @@ fn main() -> Result<(), String> {
 
     // Define configs to sweep
     let configs = vec![
-        // Small tiles
+        // ── Small-M tiles (NEW) ──
+        GemmConfig::tile_16x64_k16(),
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_16x64_k16() },
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_16x64_k16() },
+        GemmConfig { split_k: Some(8), ..GemmConfig::tile_16x64_k16() },
         GemmConfig::tile_32x64_k16(),
-        // Large tiles (no split)
+        GemmConfig::tile_32x64_k32(),
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k32() },
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x64_k32() },
+        GemmConfig { split_k: Some(8), ..GemmConfig::tile_32x64_k32() },
+        GemmConfig::tile_32x128_k16(),
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x128_k16() },
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() },
+        // ── Standard tiles ──
         GemmConfig::tile_64x64_k16(),
         GemmConfig::tile_64x64_k32(),
-        // 128×64: better compute/WT ratio for large matrices
         GemmConfig::tile_128x64_k32(),
-        // Split-K variants
+        // ── Split-K variants ──
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_64x64_k32() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() },

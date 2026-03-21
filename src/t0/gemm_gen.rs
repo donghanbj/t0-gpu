@@ -196,41 +196,27 @@ pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (
 pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
     let mn = (m as u64) * (n as u64);
 
-    // Small M with large K/N: use smaller tile_m for more M-tiles → more WGs
-    if m <= 64 && k >= 512 {
-        // Tiny M: 16×64 tile, each WG = 1 wave (32 threads)
-        // M=64 → 4 M-tiles × (N/64) N-tiles → plenty of WGs without split-K
-        let tiles = (m / 16) as u64 * (n / 64) as u64;
-        if tiles < 96 {
-            GemmConfig { split_k: Some(4), ..GemmConfig::tile_16x64_k16() }
-        } else {
-            GemmConfig::tile_16x64_k16()
-        }
-    } else if m <= 256 && k >= 1024 {
-        // Small M: 32×64 tile with k32 for deeper unroll
-        // M=128 → 4 M-tiles, M=256 → 8 M-tiles
-        let tiles = (m / 32) as u64 * (n / 64) as u64;
-        if tiles >= 96 {
-            // Enough WGs to fill CUs without split-K
-            GemmConfig::tile_32x64_k32()
-        } else {
-            // Need split-K to fill CUs
-            GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k32() }
-        }
+    // Empirical results from exhaustive sweep on RX 7900 XTX:
+    // Small M (≤512) with large K: 64×64_k16_sk8 wins consistently
+    // despite atomic overhead — split-K reduces per-WG memory load
+    if m <= 512 && k >= 1024 && n >= 1024 {
+        GemmConfig { split_k: Some(8), ..GemmConfig::tile_64x64_k16() }
     } else if mn <= 512 * 512 {
-        // Tiny square: need more WGs to fill 96 CUs
+        // Tiny square: split_k=4 k32
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() }
     } else if mn <= 1024 * 1024 {
-        // Medium: balanced config
+        // Medium: 64×64 k16 (no split)
         GemmConfig::tile_64x64_k16()
     } else if mn <= 2048 * 2048 {
-        // Large-medium: k32 with split2
-        GemmConfig { split_k: Some(2), ..GemmConfig::tile_64x64_k32() }
+        // Large-medium: k32 split4
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() }
+    } else if mn >= 4096 * 4096 {
+        // Very large: 32×128_k16_sk4 — new champion from sweep
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() }
     } else if k >= 4096 && m >= 512 {
-        // Rectangular large M, big K: split_k=4 k16
+        // Rectangular large M, big K
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() }
     } else {
-        // Very large: 128×64 k32 for best compute density
         GemmConfig::tile_128x64_k32()
     }
 }
@@ -305,9 +291,10 @@ mod auto_select_tests {
         let c = auto_select(8192, 8192, 8192);
         assert!(c.split_k.is_some(), "large should use split-K");
 
-        // Rectangular small M → 32×64 k32 (enough tiles for CU fill)
+        // Rectangular small M → 64×64_k16_sk8
         let c = auto_select(128, 4096, 4096);
-        assert_eq!(c.tile_m, 32);
+        assert_eq!(c.split_k, Some(8));
+        assert_eq!(c.tile_m, 64);
     }
 }
 
