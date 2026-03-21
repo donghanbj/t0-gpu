@@ -580,18 +580,25 @@ impl KfdDevice {
         // Allocate EOP buffer (uncached GTT)
         let eop_buffer = self.alloc_uncached(4096)?;
 
-        // Allocate CWSR buffer — MUST match kernel's exact computed sizes!
-        // Kernel formula (kfd_queue.c kfd_queue_ctx_save_restore_size):
-        //   cu_num = 96, wave_num = 3072 (cu_num * 32 for gfxv >= 100100)
-        //   ctl_stack = ALIGN(40 + 3072*12 + 8, 4096) = 40960
-        //   wg_data = ALIGN(96 * (0x60000+0x4000+0x10000+0x1000), 4096) = 46006272
-        //   cwsr_size = 40960 + 46006272 = 46047232
-        //   debug_memory = ALIGN(3072 * 32, 64) = 98304
-        //   total_alloc = ALIGN(cwsr_size + debug_memory, 4096) = 46145536
-        let ctl_stack_size: u32 = 40960;           // 0xA000
-        let cwsr_size: u32 = 46047232;             // 0x2BEA000 — ctx_save_restore_size
-        let total_cwsr_alloc: usize = 46145536;    // 0x2C02000 — buffer alloc (incl debug)
-        let cwsr_buffer = self.alloc_uncached(total_cwsr_alloc)?;
+        // CWSR (Context Wave Save Restore) buffer — EXPERIMENTAL!
+        // The hardcoded sizes below are specific to 96 CU (RX 7900 XTX).
+        // On other GPUs this will cause CREATE_QUEUE to fail with EINVAL.
+        // Disabled by default; enable with KFD_CWSR=1 environment variable.
+        let cwsr_enabled = std::env::var("KFD_CWSR").map(|v| v == "1").unwrap_or(false);
+        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if cwsr_enabled {
+            // Kernel formula (kfd_queue.c kfd_queue_ctx_save_restore_size):
+            //   cu_num = 96, wave_num = 3072 (cu_num * 32 for gfxv >= 100100)
+            //   ctl_stack = ALIGN(40 + 3072*12 + 8, 4096) = 40960
+            //   wg_data = ALIGN(96 * (0x60000+0x4000+0x10000+0x1000), 4096) = 46006272
+            //   cwsr_size = 40960 + 46006272 = 46047232
+            //   debug_memory = ALIGN(3072 * 32, 64) = 98304
+            //   total_alloc = ALIGN(cwsr_size + debug_memory, 4096) = 46145536
+            let total_cwsr_alloc: usize = 46145536;    // 0x2C02000 — buffer alloc (incl debug)
+            let buf = self.alloc_uncached(total_cwsr_alloc)?;
+            (Some(buf), 46047232u32, 40960u32)
+        } else {
+            (None, 0u32, 0u32)
+        };
 
         let mut args = KfdCreateQueueArgs {
             ring_base_address: ring_buffer.va_addr,
@@ -606,7 +613,7 @@ impl KfdDevice {
             queue_id: 0,       // returned by kernel
             eop_buffer_address: eop_buffer.va_addr,
             eop_buffer_size: eop_buffer.size as u64,
-            ctx_save_restore_address: cwsr_buffer.va_addr,
+            ctx_save_restore_address: cwsr_buffer.as_ref().map(|b| b.va_addr).unwrap_or(0),
             ctx_save_restore_size: cwsr_size,
             ctl_stack_size,
             sdma_engine_id: 0,
@@ -696,14 +703,16 @@ impl KfdDevice {
         let eop_buffer = self.alloc_uncached(4096)?;
         unsafe { std::ptr::write_bytes(eop_buffer.host_ptr, 0, eop_buffer.size); }
 
-        // CWSR (Context Wave Save Restore) buffer — REQUIRED by KFD!
-        // Use exact same hardcoded values as working AQL create_queue():
-        let ctl_stack_size: u32 = 40960;           // 0xA000
-        let cwsr_size: u32 = 46047232;             // 0x2BEA000
-        let total_cwsr_alloc: usize = 46145536;    // 0x2C02000 (incl debug memory)
-
-        let cwsr_buffer = self.alloc_uncached(total_cwsr_alloc)?;
-        unsafe { std::ptr::write_bytes(cwsr_buffer.host_ptr, 0, cwsr_buffer.size); }
+        // CWSR — same optional pattern as AQL queue
+        let cwsr_enabled = std::env::var("KFD_CWSR").map(|v| v == "1").unwrap_or(false);
+        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if cwsr_enabled {
+            let total_cwsr_alloc: usize = 46145536;
+            let buf = self.alloc_uncached(total_cwsr_alloc)?;
+            unsafe { std::ptr::write_bytes(buf.host_ptr, 0, buf.size); }
+            (Some(buf), 46047232u32, 40960u32)
+        } else {
+            (None, 0u32, 0u32)
+        };
 
         let mut args = KfdCreateQueueArgs {
             ring_base_address: ring_buffer.va_addr,
@@ -718,7 +727,7 @@ impl KfdDevice {
             queue_id: 0,
             eop_buffer_address: eop_buffer.va_addr,
             eop_buffer_size: eop_buffer.size as u64,
-            ctx_save_restore_address: cwsr_buffer.va_addr,
+            ctx_save_restore_address: cwsr_buffer.as_ref().map(|b| b.va_addr).unwrap_or(0),
             ctx_save_restore_size: cwsr_size,
             ctl_stack_size,
             sdma_engine_id: 0,
@@ -958,7 +967,7 @@ pub struct AqlQueue {
     // Keep these alive (RAII)
     pub _wr_ptrs: GpuBuffer,
     pub _eop_buffer: GpuBuffer,
-    pub _cwsr_buffer: GpuBuffer,
+    pub _cwsr_buffer: Option<GpuBuffer>,
     pub device: Arc<KfdDevice>,
 }
 
@@ -2078,7 +2087,7 @@ pub struct Pm4Queue {
     doorbell_mmap_base: *mut u8,
     pub _wr_ptrs: GpuBuffer,
     pub _eop_buffer: GpuBuffer,
-    pub _cwsr_buffer: GpuBuffer,
+    pub _cwsr_buffer: Option<GpuBuffer>,
     pub device: Arc<KfdDevice>,
 }
 
