@@ -580,12 +580,11 @@ impl KfdDevice {
         // Allocate EOP buffer (uncached GTT)
         let eop_buffer = self.alloc_uncached(4096)?;
 
-        // CWSR (Context Wave Save Restore) buffer — EXPERIMENTAL!
+        // CWSR (Context Wave Save Restore) buffer
         // The hardcoded sizes below are specific to 96 CU (RX 7900 XTX).
-        // On other GPUs this will cause CREATE_QUEUE to fail with EINVAL.
-        // Disabled by default; enable with KFD_CWSR=1 environment variable.
-        let cwsr_enabled = std::env::var("KFD_CWSR").map(|v| v == "1").unwrap_or(false);
-        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if cwsr_enabled {
+        // On other GPUs, set KFD_NO_CWSR=1 to skip CWSR allocation.
+        let cwsr_disabled = std::env::var("KFD_NO_CWSR").map(|v| v == "1").unwrap_or(false);
+        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if !cwsr_disabled {
             // Kernel formula (kfd_queue.c kfd_queue_ctx_save_restore_size):
             //   cu_num = 96, wave_num = 3072 (cu_num * 32 for gfxv >= 100100)
             //   ctl_stack = ALIGN(40 + 3072*12 + 8, 4096) = 40960
@@ -703,9 +702,9 @@ impl KfdDevice {
         let eop_buffer = self.alloc_uncached(4096)?;
         unsafe { std::ptr::write_bytes(eop_buffer.host_ptr, 0, eop_buffer.size); }
 
-        // CWSR — same optional pattern as AQL queue
-        let cwsr_enabled = std::env::var("KFD_CWSR").map(|v| v == "1").unwrap_or(false);
-        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if cwsr_enabled {
+        // CWSR — same pattern as AQL queue
+        let cwsr_disabled = std::env::var("KFD_NO_CWSR").map(|v| v == "1").unwrap_or(false);
+        let (cwsr_buffer, cwsr_size, ctl_stack_size) = if !cwsr_disabled {
             let total_cwsr_alloc: usize = 46145536;
             let buf = self.alloc_uncached(total_cwsr_alloc)?;
             unsafe { std::ptr::write_bytes(buf.host_ptr, 0, buf.size); }
