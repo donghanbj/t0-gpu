@@ -41,6 +41,10 @@ pub struct GemmConfig {
 }
 
 impl GemmConfig {
+    /// 16×64, K=16, LDS double-buffered (small-M: 1 wave, max M-parallelism)
+    pub fn tile_16x64_k16() -> Self {
+        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None }
+    }
     /// 32×64, K=16, no LDS (equivalent to `matmul`)
     pub fn tile_32x64_direct() -> Self {
         Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None }
@@ -48,6 +52,14 @@ impl GemmConfig {
     /// 32×64, K=16, LDS double-buffered (equivalent to `matmul_lds_db`)
     pub fn tile_32x64_k16() -> Self {
         Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None }
+    }
+    /// 32×64, K=32, LDS double-buffered (small-M optimized with deeper K unroll)
+    pub fn tile_32x64_k32() -> Self {
+        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None }
+    }
+    /// 32×128, K=16, LDS double-buffered (small-M: wide N for more compute per WG)
+    pub fn tile_32x128_k16() -> Self {
+        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None }
     }
     /// 64×64, K=16, LDS double-buffered (equivalent to `matmul_64x64_lds_db`)
     pub fn tile_64x64_k16() -> Self {
@@ -57,15 +69,15 @@ impl GemmConfig {
     pub fn tile_64x64_k32() -> Self {
         Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None }
     }
-    /// 128×64, K=16, LDS double-buffered (NEW: higher compute density)
+    /// 128×64, K=16, LDS double-buffered (higher compute density)
     pub fn tile_128x64_k16() -> Self {
         Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None }
     }
-    /// 64×128, K=16, LDS double-buffered (NEW: wider N tiles)
+    /// 64×128, K=16, LDS double-buffered (wider N tiles)
     pub fn tile_64x128_k16() -> Self {
         Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None }
     }
-    /// 128×64, K=32 (NEW: max compute density)
+    /// 128×64, K=32 (max compute density)
     pub fn tile_128x64_k32() -> Self {
         Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None }
     }
@@ -126,7 +138,10 @@ impl GemmConfig {
 /// Predefined sweep search space — configurations to benchmark
 pub fn sweep_configs() -> Vec<GemmConfig> {
     vec![
+        GemmConfig::tile_16x64_k16(),
         GemmConfig::tile_32x64_k16(),
+        GemmConfig::tile_32x64_k32(),
+        GemmConfig::tile_32x128_k16(),
         GemmConfig::tile_64x64_k16(),
         GemmConfig::tile_64x64_k32(),
         GemmConfig::tile_128x64_k16(),
@@ -180,13 +195,30 @@ pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (
 /// - Rectangular (small M, big K): split_k=8 k16
 pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
     let mn = (m as u64) * (n as u64);
-    let is_rect_small_m = m <= 256 && k >= 1024;
 
-    if is_rect_small_m {
-        // Small M with large K: maximize parallelism
-        GemmConfig { split_k: Some(8), ..GemmConfig::tile_64x64_k16() }
+    // Small M with large K/N: use smaller tile_m for more M-tiles → more WGs
+    if m <= 64 && k >= 512 {
+        // Tiny M: 16×64 tile, each WG = 1 wave (32 threads)
+        // M=64 → 4 M-tiles × (N/64) N-tiles → plenty of WGs without split-K
+        let tiles = (m / 16) as u64 * (n / 64) as u64;
+        if tiles < 96 {
+            GemmConfig { split_k: Some(4), ..GemmConfig::tile_16x64_k16() }
+        } else {
+            GemmConfig::tile_16x64_k16()
+        }
+    } else if m <= 256 && k >= 1024 {
+        // Small M: 32×64 tile with k32 for deeper unroll
+        // M=128 → 4 M-tiles, M=256 → 8 M-tiles
+        let tiles = (m / 32) as u64 * (n / 64) as u64;
+        if tiles >= 96 {
+            // Enough WGs to fill CUs without split-K
+            GemmConfig::tile_32x64_k32()
+        } else {
+            // Need split-K to fill CUs
+            GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k32() }
+        }
     } else if mn <= 512 * 512 {
-        // Tiny: need more WGs to fill 96 CUs
+        // Tiny square: need more WGs to fill 96 CUs
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() }
     } else if mn <= 1024 * 1024 {
         // Medium: balanced config
@@ -206,10 +238,15 @@ pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
 /// Standard set of pre-selected configs covering all common use cases.
 pub fn standard_configs() -> Vec<GemmConfig> {
     vec![
+        GemmConfig::tile_16x64_k16(),
         GemmConfig::tile_32x64_k16(),
+        GemmConfig::tile_32x64_k32(),
+        GemmConfig::tile_32x128_k16(),
         GemmConfig::tile_64x64_k16(),
         GemmConfig::tile_64x64_k32(),
         GemmConfig::tile_128x64_k32(),
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_32x64_k32() },
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_16x64_k16() },
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_64x64_k32() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() },
         GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k32() },
@@ -268,9 +305,9 @@ mod auto_select_tests {
         let c = auto_select(8192, 8192, 8192);
         assert!(c.split_k.is_some(), "large should use split-K");
 
-        // Rectangular small M → split_k=8
+        // Rectangular small M → 32×64 k32 (enough tiles for CU fill)
         let c = auto_select(128, 4096, 4096);
-        assert_eq!(c.split_k, Some(8));
+        assert_eq!(c.tile_m, 32);
     }
 }
 
@@ -385,7 +422,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     // ── Store phase constants ──
     // s_row_base[r] for each row block
     let tile_m_shift = match cfg.tile_m {
-        32 => 5, 64 => 6, 128 => 7, _ => panic!("unsupported tile_m"),
+        16 => 4, 32 => 5, 64 => 6, 128 => 7, _ => panic!("unsupported tile_m"),
     };
     let rpw_shift = match rows_per_wave {
         16 => 4, 32 => 5, 64 => 6, _ => panic!("unsupported rows_per_wave"),
