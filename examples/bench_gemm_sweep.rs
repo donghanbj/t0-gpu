@@ -202,7 +202,14 @@ fn main() -> Result<(), String> {
         eprintln!("\n══ Optimal Kernel Selection ══");
         eprintln!("{:>18} | {:>20} | {:>8} | vs rocBLAS", "Matrix", "Best Kernel", "TFLOPS");
         eprintln!("{}", "-".repeat(65));
-        let rocblas: Vec<f64> = vec![3.47, 12.50, 27.89, 36.65, 58.72, 71.71, 50.99, 44.43, 45.85, 29.94];
+        // rocBLAS reference values (measured on RX 7900 XTX, ROCm 7.1.1)
+        let rocblas_ref: Vec<((u32,u32,u32), f64)> = vec![
+            ((256,256,256), 3.47), ((512,512,512), 12.50),
+            ((1024,1024,1024), 27.89), ((2048,2048,2048), 36.65),
+            ((4096,4096,4096), 58.72), ((8192,8192,8192), 71.71),
+            ((128,1024,4096), 50.99), ((256,1024,4096), 44.43),
+            ((512,1024,4096), 45.85), ((1024,1024,4096), 29.94),
+        ];
         for (si, &(m, k, n)) in sizes.iter().enumerate() {
             let mut best_tf = 0.0f64;
             let mut best_name = String::new();
@@ -212,7 +219,8 @@ fn main() -> Result<(), String> {
                     best_name = cfg.name().replace("t0_gemm_", "");
                 }
             }
-            let rb = if si < rocblas.len() { rocblas[si] } else { 0.0 };
+            let rb = rocblas_ref.iter().find(|((rm,rk,rn),_)| *rm==m && *rk==k && *rn==n)
+                .map(|(_,v)| *v).unwrap_or(0.0);
             let pct = if rb > 0.0 { best_tf / rb * 100.0 } else { 0.0 };
             let marker = if pct > 100.0 { "🏆" } else { "  " };
             eprintln!("{:>6}×{:<6}×{:<4} | {:>20} | {:>6.2} TF | {:>5.1}% {}", m, k, n, best_name, best_tf, pct, marker);
