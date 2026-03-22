@@ -34,6 +34,7 @@ pub struct T0Kernel {
     next_sreg: u32,
     kernarg_size: u32,
     lds_size: u32,
+    wgp_mode: bool,
     label_counter: u32,
 }
 
@@ -52,6 +53,7 @@ impl T0Kernel {
             next_sreg: 0,
             kernarg_size: 0,
             lds_size: 0,
+            wgp_mode: false,
             label_counter: 0,
         }
     }
@@ -159,6 +161,11 @@ impl T0Kernel {
     /// Set LDS size in bytes.
     pub fn set_lds_size(&mut self, size: u32) {
         self.lds_size = size;
+    }
+
+    /// Enable WGP (Workgroup Processor) mode: WG spans 2 CUs = 128KB LDS + 4 SIMDs.
+    pub fn set_wgp_mode(&mut self, enable: bool) {
+        self.wgp_mode = enable;
     }
 
     /// Generate a unique label name.
@@ -729,6 +736,7 @@ impl T0Kernel {
             target,
             self.kernarg_size,
             self.lds_size,
+            self.wgp_mode,
         );
         Ok(emitter.finish())
     }

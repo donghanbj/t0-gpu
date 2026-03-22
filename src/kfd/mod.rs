@@ -1367,6 +1367,18 @@ impl AqlQueue {
         self.wait_read_ptr(target)
     }
 
+    /// Wait for all pending dispatches + memory fence.
+    /// This is the SAFE way to synchronize before dropping GPU buffers.
+    /// Ensures all GPU stores (including L2 writeback) are complete.
+    pub fn synchronize(&self) -> Result<(), String> {
+        self.wait_idle()?;
+        // Memory fence to ensure CPU sees GPU writes
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        // Small sleep to allow L2 cache writeback to complete
+        std::thread::sleep(std::time::Duration::from_micros(10));
+        Ok(())
+    }
+
     /// Wait for completion signal (poll amd_signal_t.value at offset 8)
     fn wait_signal(&self, signal: &GpuBuffer) -> Result<(), String> {
         let timeout_ns: u64 = 60_000_000_000; // 60 seconds (large GEMMs can be slow on first dispatch)
@@ -1386,7 +1398,7 @@ impl AqlQueue {
 
     /// Fallback: wait by polling read pointer
     fn wait_read_ptr(&self, target: u64) -> Result<(), String> {
-        let timeout_ns: u64 = 120_000_000_000;  // 120s: allow slow first-time dispatches
+        let timeout_ns: u64 = 10_000_000_000;  // 10s: shorter timeout for faster hang detection
         let start = std::time::Instant::now();
         let mut last_log_s = 0u64;
         loop {
@@ -1397,7 +1409,7 @@ impl AqlQueue {
             let elapsed = start.elapsed();
             let elapsed_s = elapsed.as_secs();
             // Progress log every 3s so we can see if GPU is making progress
-            if elapsed_s >= last_log_s + 3 {
+            if elapsed_s >= last_log_s + 1 {
                 last_log_s = elapsed_s;
                 let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
                 eprintln!(
@@ -1409,7 +1421,7 @@ impl AqlQueue {
             if elapsed.as_nanos() as u64 > timeout_ns {
                 let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
                 eprintln!(
-                    "[KFD] wait_read_ptr TIMEOUT (15s): GPU hung!\n\
+                    "[KFD] wait_read_ptr TIMEOUT (10s): GPU hung!\n\
                      read={}, target={}, write={}, pending={}\n\
                      Forcing process exit to prevent system reboot.",
                     read_idx, target, write_idx, write_idx.wrapping_sub(read_idx)

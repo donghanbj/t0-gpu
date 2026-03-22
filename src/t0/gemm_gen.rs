@@ -39,60 +39,75 @@ pub struct GemmConfig {
     /// Split-K factor (None or Some(1) = no split, Some(2/4/8) = split K dimension)
     pub split_k: Option<u32>,
     /// LDS row padding in bytes (eliminates bank conflicts).
-    /// Recommended: 16 bytes for tile_k=16, 0 for tile_k=32.
     pub lds_pad: u32,
+    /// Number of column passes (host-level dispatch hint, not used in kernel gen).
+    pub n_col_passes: u32,
+    /// Grid axis swap: true=TGID.x→N, TGID.y→M (L2 friendly for square);
+    /// false=TGID.x→M, TGID.y→N (better for rectangular M<N).
+    pub swap_grid: bool,
+    /// WGP mode: workgroup spans 2 CUs = 128KB LDS + 4 SIMDs + doubled VGPR pool.
+    pub wgp_mode: bool,
 }
 
 impl GemmConfig {
     /// 16×64, K=16, LDS double-buffered (small-M: 1 wave, max M-parallelism)
     pub fn tile_16x64_k16() -> Self {
-        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 32×64, K=16, no LDS (equivalent to `matmul`)
     pub fn tile_32x64_direct() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0 }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 32×64, K=16, LDS double-buffered (equivalent to `matmul_lds_db`)
     pub fn tile_32x64_k16() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 32×64, K=32, LDS double-buffered (small-M optimized with deeper K unroll)
     pub fn tile_32x64_k32() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 32×128, K=16, LDS double-buffered (small-M: wide N for more compute per WG)
     pub fn tile_32x128_k16() -> Self {
-        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 64×64, K=16, LDS double-buffered (equivalent to `matmul_64x64_lds_db`)
     pub fn tile_64x64_k16() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 64×64, K=32, LDS double-buffered (equivalent to `matmul_64x64_k32`)
     pub fn tile_64x64_k32() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 128×64, K=16, LDS double-buffered (higher compute density)
     pub fn tile_128x64_k16() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 64×128, K=16, LDS double-buffered (wider N tiles)
     pub fn tile_64x128_k16() -> Self {
-        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 128×64, K=32 (max compute density)
     pub fn tile_128x64_k32() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 128×128, K=16, LDS double-buffered (highest AI = 64 FLOP/byte)
     /// Acc VGPRs: 4 row_blocks × 8 col_tiles × 8 = 256 — BUT each wave only uses
     /// n_row_blocks(2) × n_col_tiles(8) × 8 = 128 VGPRs. Tight but feasible.
     pub fn tile_128x128_k16() -> Self {
-        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
     }
     /// 64×64, K=64, LDS double-buffered (4× fewer loop iterations)
     pub fn tile_64x64_k64() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+    }
+    /// 128×128 via 2×(128×64) column passes. Effective AI=64.
+    /// X data reused from L2 cache on second pass.
+    pub fn tile_128x128_2pass() -> Self {
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false }
+    }
+    /// 64×128 via 2×(64×64) column passes. Effective AI=43.
+    pub fn tile_64x128_2pass() -> Self {
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false }
     }
 
     /// Number of WMMA column tiles = tile_n / 16
@@ -144,7 +159,12 @@ impl GemmConfig {
             Some(sk) if sk > 1 => format!("_sk{}", sk),
             _ => String::new(),
         };
-        format!("t0_gemm_{}x{}_k{}{}{}", self.tile_m, self.tile_n, self.tile_k, lds_tag, sk_tag)
+        let pass_tag = if self.n_col_passes > 1 {
+            format!("_{}p", self.n_col_passes)
+        } else { String::new() };
+        let grid_tag = if !self.swap_grid { "_mg" } else { "" }; // mg = M-on-grid-X
+        let wgp_tag = if self.wgp_mode { "_wgp" } else { "" };
+        format!("t0_gemm_{}x{}_k{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, lds_tag, sk_tag, pass_tag, grid_tag, wgp_tag)
     }
 }
 
@@ -180,20 +200,39 @@ pub fn generate(cfg: &GemmConfig) -> T0Kernel {
 }
 
 /// Returns (grid_x, grid_y) for a given (M, N) based on this config.
+/// Panics if M/N are not divisible by tile dimensions.
 pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
+    let effective_n = cfg.tile_n * cfg.n_col_passes;
+    assert!(m % cfg.tile_m == 0,
+        "M={} not divisible by tile_m={}", m, cfg.tile_m);
+    assert!(n % effective_n == 0,
+        "N={} not divisible by effective_n={} (tile_n={} × n_col_passes={})",
+        n, effective_n, cfg.tile_n, cfg.n_col_passes);
     let tiles_m = m / cfg.tile_m;
-    let tiles_n = n / cfg.tile_n;
-    // L2 tiling: Grid.x = N-tiles (fast), Grid.y = M-tiles (slow)
-    // Consecutive WGs share X rows in L2 cache
-    (tiles_n * cfg.wg_size, tiles_m)
+    let tiles_n = n / effective_n;
+    if cfg.swap_grid {
+        (tiles_n * cfg.wg_size, tiles_m)
+    } else {
+        (tiles_m * cfg.wg_size, tiles_n)
+    }
 }
 
-/// Grid with split-K: Y dimension = tiles_n * split_k
+/// Grid with split-K. Panics on invalid dimensions.
 pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (u32, u32) {
+    let effective_n = cfg.tile_n * cfg.n_col_passes;
+    assert!(m % cfg.tile_m == 0,
+        "M={} not divisible by tile_m={}", m, cfg.tile_m);
+    assert!(n % effective_n == 0,
+        "N={} not divisible by effective_n={}", n, effective_n);
+    assert!(split_k > 0 && split_k.is_power_of_two(),
+        "split_k={} must be power of 2", split_k);
     let tiles_m = m / cfg.tile_m;
-    let tiles_n = n / cfg.tile_n;
-    // L2 tiling: N-tiles on X, M-tiles × split_k on Y
-    (tiles_n * cfg.wg_size, tiles_m * split_k)
+    let tiles_n = n / effective_n;
+    if cfg.swap_grid {
+        (tiles_n * cfg.wg_size, tiles_m * split_k)
+    } else {
+        (tiles_m * cfg.wg_size, tiles_n * split_k)
+    }
 }
 
 // ============================================================================
@@ -210,24 +249,50 @@ pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (
 pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
     let mn = (m as u64) * (n as u64);
 
-    // Post GMEM-fix sweep results (2026-03-21):
-    // k16 tiles (no padding): strong at 1024², large rectangular
-    // k32 tiles: strong at 2048²+, medium square
-    if m <= 512 && k >= 1024 && n >= 1024 {
-        // Small M with large K/N: sk8 for maximum parallelism
-        GemmConfig { split_k: Some(8), ..GemmConfig::tile_64x64_k16() }
+    // Optimal configs from benchmark sweep (2026-03-21, post-WGP optimization).
+    // Helper: clamp split-K so K is divisible by (tile_k * sk).
+    let clamp_sk = |tile_k: u32, desired_sk: u32| -> Option<u32> {
+        let max_sk = k / tile_k;  // maximum splits before k_chunk < tile_k
+        let mut sk = desired_sk.min(max_sk);
+        // Round down to nearest power of 2
+        while sk > 1 && k % (tile_k * sk) != 0 {
+            sk /= 2;
+        }
+        if sk > 1 { Some(sk) } else { None }
+    };
+
+    // Choose tile_m: must divide M. Prefer 128, fallback to 64.
+    let use_128m = m % 128 == 0 && m >= 128;
+    let use_64m  = m % 64 == 0;
+
+    if m <= 256 && k >= 512 && n >= 1024 && use_128m {
+        // Thin: small M, large K×N → M-on-X + WGP, sk=4
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: clamp_sk(16, 4),
+            ..GemmConfig::tile_128x64_k16() }
+    } else if m <= 512 && k >= 512 && n >= 1024 && use_128m {
+        // Medium-thin → M-on-X + WGP, sk=8
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: clamp_sk(16, 8),
+            ..GemmConfig::tile_128x64_k16() }
     } else if mn <= 512 * 512 {
-        // Small square: 128×64_k32_sk2 (more CU fill)
-        GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() }
-    } else if mn <= 1024 * 1024 {
-        // Medium: 64×64 k16 no-split (36.58 TF at 1024²)
-        GemmConfig::tile_64x64_k16()
-    } else if mn <= 2048 * 2048 {
-        // Large-medium: 128×64_k32_sk2 (43.29 TF at 2048²)
-        GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() }
+        // Small square → 64×64, clamp sk
+        GemmConfig { swap_grid: false, split_k: clamp_sk(16, 8),
+            ..GemmConfig::tile_64x64_k16() }
+    } else if mn <= 1024 * 1024 && use_128m {
+        // Medium square → WGP, sk=2
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: clamp_sk(16, 2),
+            ..GemmConfig::tile_128x64_k16() }
+    } else if use_128m {
+        // Large/very large → WGP, sk=8
+        GemmConfig { wgp_mode: true, split_k: clamp_sk(16, 8),
+            ..GemmConfig::tile_128x64_k16() }
+    } else if use_64m {
+        // M not divisible by 128 → use 64×64 with WGP + split-K
+        GemmConfig { wgp_mode: true, split_k: clamp_sk(16, 4),
+            ..GemmConfig::tile_64x64_k16() }
     } else {
-        // Very large: 32×128_k16_sk4 (50.80 TF at 4096²)
-        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() }
+        // Fallback: 32×64 (tile_m=32 divides most sizes)
+        GemmConfig { split_k: clamp_sk(16, 4),
+            ..GemmConfig::tile_32x64_k16() }
     }
 }
 
@@ -288,24 +353,29 @@ mod auto_select_tests {
 
     #[test]
     fn test_auto_select_sizes() {
-        // Small square → split_k
+        // Small square → split-K, 64×64
         let c = auto_select(256, 256, 256);
         assert!(c.split_k.unwrap_or(1) > 1, "small should use split-K");
-
-        // Medium → 64×64 k16 no-split
-        let c = auto_select(1024, 1024, 1024);
         assert_eq!(c.tile_m, 64);
-        assert_eq!(c.tile_k, 16);
-        assert!(c.split_k.is_none() || c.split_k == Some(1));
 
-        // Very large → split_k=4 k16 (k>=4096, m>=512)
+        // Medium → 128×64 k16 WGP, sk=2
+        let c = auto_select(1024, 1024, 1024);
+        assert_eq!(c.tile_m, 128);
+        assert_eq!(c.tile_k, 16);
+        assert!(c.wgp_mode, "1024² should use WGP");
+        assert_eq!(c.split_k, Some(2));
+
+        // Very large → 128×64 k16 WGP, sk=8
         let c = auto_select(8192, 8192, 8192);
         assert!(c.split_k.is_some(), "large should use split-K");
+        assert!(c.wgp_mode, "large should use WGP");
 
-        // Rectangular small M → 64×64_k16_sk8
+        // Thin M → 128×64_k16_mg_wgp_sk4
         let c = auto_select(128, 4096, 4096);
-        assert_eq!(c.split_k, Some(8));
-        assert_eq!(c.tile_m, 64);
+        assert_eq!(c.split_k, Some(4));
+        assert_eq!(c.tile_m, 128);
+        assert!(c.wgp_mode, "thin should use WGP");
+        assert!(!c.swap_grid, "thin should use M-on-X (swap_grid=false)");
     }
 }
 
@@ -324,6 +394,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     let lds_wt = cfg.lds_wt_size();
     let lds_buf = lds_x + lds_wt;  // per buffer
     k.set_lds_size(lds_buf * 2);   // double buffer
+    k.set_wgp_mode(cfg.wgp_mode);
 
     let x_row_stride = cfg.lds_x_row_stride();   // tile_k * 2 bytes
     let wt_row_stride = cfg.lds_wt_row_stride();
@@ -343,35 +414,56 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.emit_arg_loads();
 
     // ── TGIDs with split-K support ──
-    // Grid layout: TGID.x → tile_col (N), TGID.y → tile_row (M) [+ split_k_id]
-    // Consecutive WGs (TGID.x) share X rows → better L2 cache reuse
-    let tile_col_raw_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_raw_s);
-
+    // swap_grid=true:  TGID.x → tile_col (N), TGID.y → tile_row (M)
+    // swap_grid=false: TGID.x → tile_row (M), TGID.y → tile_col (N)
+    let tgid_x_s = k.alloc_sreg();
+    k.capture_tgid_x(tgid_x_s);
     let tgid_y_s = k.alloc_sreg();
     k.capture_tgid_y(tgid_y_s);
 
-    // Extract tile_col and split_k_id from TGID.y using compile-time shift
     let split_k = cfg.split_k.unwrap_or(1);
     let split_k_shift: u8 = match split_k { 1 => 0, 2 => 1, 4 => 2, 8 => 3, 16 => 4, _ => panic!("unsupported split_k") };
 
+    // Assign tile_col / tile_row based on swap_grid
     let tile_col_s = k.alloc_sreg();
     let tile_row_s = k.alloc_sreg();
     let split_k_id_s = k.alloc_sreg();
-    // tile_col comes from TGID.x directly
-    k.push(Op::SAddU32 { dst: tile_col_s, src0: tile_col_raw_s, src1: SOperand::InlineInt(0) });
-    if split_k <= 1 {
-        // No split: tile_row = TGID.y, split_k_id = 0
-        k.push(Op::SAddU32 { dst: tile_row_s, src0: tgid_y_s, src1: SOperand::InlineInt(0) });
-        k.s_mov_imm(split_k_id_s, 0);
+
+    // The "raw" fast-axis TGID and slow-axis TGID
+    let (fast_tgid, slow_tgid) = if cfg.swap_grid {
+        // fast = TGID.x = tile_col, slow = TGID.y = tile_row [+ split_k]
+        (tgid_x_s, tgid_y_s)
     } else {
-        // Split-K: pack split_k_id in low bits of TGID.y
-        // tile_row = TGID.y >> split_k_shift
-        k.s_lshr_b32(tile_row_s, tgid_y_s, split_k_shift);
-        // split_k_id = TGID.y & (split_k - 1)
-        let mask_s = k.alloc_sreg();
-        k.s_mov_imm(mask_s, (split_k - 1) as i32);
-        k.s_and_b32(split_k_id_s, tgid_y_s, mask_s);
+        // fast = TGID.x = tile_row, slow = TGID.y = tile_col [+ split_k]
+        (tgid_x_s, tgid_y_s)
+    };
+
+    if cfg.swap_grid {
+        // TGID.x = tile_col directly
+        k.push(Op::SAddU32 { dst: tile_col_s, src0: fast_tgid, src1: SOperand::InlineInt(0) });
+        if split_k <= 1 {
+            k.push(Op::SAddU32 { dst: tile_row_s, src0: slow_tgid, src1: SOperand::InlineInt(0) });
+            k.s_mov_imm(split_k_id_s, 0);
+        } else {
+            // tile_row = TGID.y >> shift, split_k_id = TGID.y & mask
+            k.s_lshr_b32(tile_row_s, slow_tgid, split_k_shift);
+            let mask_s = k.alloc_sreg();
+            k.s_mov_imm(mask_s, (split_k - 1) as i32);
+            k.s_and_b32(split_k_id_s, slow_tgid, mask_s);
+        }
+    } else {
+        // TGID.x = tile_row directly
+        k.push(Op::SAddU32 { dst: tile_row_s, src0: fast_tgid, src1: SOperand::InlineInt(0) });
+        if split_k <= 1 {
+            k.push(Op::SAddU32 { dst: tile_col_s, src0: slow_tgid, src1: SOperand::InlineInt(0) });
+            k.s_mov_imm(split_k_id_s, 0);
+        } else {
+            // tile_col = TGID.y >> shift, split_k_id = TGID.y & mask
+            k.s_lshr_b32(tile_col_s, slow_tgid, split_k_shift);
+            let mask_s = k.alloc_sreg();
+            k.s_mov_imm(mask_s, (split_k - 1) as i32);
+            k.s_and_b32(split_k_id_s, slow_tgid, mask_s);
+        }
     }
 
     // k_end = K >> split_k_shift (= K when no split)
@@ -796,6 +888,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
 
 
 
+    // ══════════════════════════════════════════════════════════════════
     // ══════════════════════════════════════════════════════════════════
     // PROLOGUE
     // ══════════════════════════════════════════════════════════════════

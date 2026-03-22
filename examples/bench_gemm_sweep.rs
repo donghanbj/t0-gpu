@@ -46,6 +46,39 @@ fn main() -> Result<(), String> {
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() },
         // ── NEW: deeper K for fewer loop iterations ──
         GemmConfig::tile_64x64_k64(),                 // 4× fewer K-loop iters vs k16
+        // ── M-on-X grid (better for rectangular M<N) ──
+        GemmConfig { swap_grid: false, ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { swap_grid: false, split_k: Some(4), ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { swap_grid: false, split_k: Some(8), ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { swap_grid: false, ..GemmConfig::tile_128x64_k32() },
+        GemmConfig { swap_grid: false, split_k: Some(2), ..GemmConfig::tile_128x64_k32() },
+        // ── WGP mode (workgroup spans 2 CUs: 128KB LDS + 4 SIMDs) ──
+        GemmConfig { wgp_mode: true, ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { wgp_mode: true, split_k: Some(8), ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { wgp_mode: true, split_k: Some(16), ..GemmConfig::tile_64x64_k16() },
+        GemmConfig { wgp_mode: true, ..GemmConfig::tile_128x64_k32() },
+        GemmConfig { wgp_mode: true, split_k: Some(2), ..GemmConfig::tile_128x64_k32() },
+        // ── 128×64 WGP + deeper split-K (higher CU utilization) ──
+        GemmConfig { wgp_mode: true, split_k: Some(4), ..GemmConfig::tile_128x64_k32() },
+        GemmConfig { wgp_mode: true, split_k: Some(4), ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { wgp_mode: true, split_k: Some(8), ..GemmConfig::tile_128x64_k16() },
+        // ── 64×64 WGP + split-K 4 (fill medium matrices) ──
+        GemmConfig { wgp_mode: true, split_k: Some(4), ..GemmConfig::tile_64x64_k16() },
+        // ── Thin-matrix optimized: 128×64 k16, M-on-X + WGP ──
+        GemmConfig { swap_grid: false, wgp_mode: true, ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: Some(2), ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: Some(4), ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: Some(8), ..GemmConfig::tile_128x64_k16() },
+        // ── Deep-K CU mode for thin matrices ──
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_128x64_k32() },
+        GemmConfig { split_k: Some(8), ..GemmConfig::tile_128x64_k32() },
+        GemmConfig { wgp_mode: true, split_k: Some(8), ..GemmConfig::tile_128x64_k32() },
+        // ── Higher split-K for thin matrices (128×4096: sk16→1024 WGs) ──
+        GemmConfig { wgp_mode: true, split_k: Some(16), ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { swap_grid: false, wgp_mode: true, split_k: Some(16), ..GemmConfig::tile_128x64_k16() },
+        GemmConfig { wgp_mode: true, split_k: Some(16), ..GemmConfig::tile_64x64_k16() },
+        // ── Small-matrix focused (keep minimal) ──
+        GemmConfig { wgp_mode: true, split_k: Some(8), ..GemmConfig::tile_32x64_k16() },
     ];
 
     // Matrix sizes: focus on small + representative large
@@ -113,7 +146,9 @@ fn main() -> Result<(), String> {
 
             let x_buf = device.alloc_vram(x_bytes)?;
             let w_buf = device.alloc_vram(w_bytes)?;
-            let y_buf = device.alloc_vram(y_bytes)?;
+            // Pre-allocate Y workspace for max split-K (16) to avoid per-config alloc/drop racing
+            let max_sk = 16u32;
+            let y_workspace = device.alloc_vram(y_bytes * max_sk as usize)?;
 
             // Fill with 1.0 bf16
             let x_data = vec![0x3F80u16; (m * k) as usize];
@@ -128,7 +163,7 @@ fn main() -> Result<(), String> {
             let mut ka = [0u8; 40];
             ka[0..8].copy_from_slice(&x_buf.gpu_addr().to_le_bytes());
             ka[8..16].copy_from_slice(&w_buf.gpu_addr().to_le_bytes());
-            ka[16..24].copy_from_slice(&y_buf.gpu_addr().to_le_bytes());
+            ka[16..24].copy_from_slice(&y_workspace.gpu_addr().to_le_bytes());
             ka[24..28].copy_from_slice(&k.to_le_bytes());
             ka[28..32].copy_from_slice(&n.to_le_bytes());
             ka[32..36].copy_from_slice(&0u32.to_le_bytes());   // split_k_shift = 0 (no split)
@@ -140,7 +175,8 @@ fn main() -> Result<(), String> {
             for (ci, cfg) in configs.iter().enumerate() {
                 // Check if this config is compatible with the matrix size
                 let sk = cfg.split_k.unwrap_or(1);
-                if m % cfg.tile_m != 0 || n % cfg.tile_n != 0 || k % (cfg.tile_k * sk) != 0 {
+                let effective_n = cfg.tile_n * cfg.n_col_passes;
+                if m % cfg.tile_m != 0 || n % effective_n != 0 || k % (cfg.tile_k * sk) != 0 {
                     eprint!("      skip   |");
                     continue;
                 }
@@ -151,23 +187,17 @@ fn main() -> Result<(), String> {
                     compute_grid(cfg, m, n)
                 };
 
-                // For split-K, allocate workspace and set y_split_stride
+                // Reuse pre-allocated workspace (already big enough for max split-K)
                 let y_stride = if sk > 1 { (m * n * 4) as u32 } else { 0 };
-                let y_target = if sk > 1 {
-                    // Workspace for sk partial results
-                    device.alloc_vram((m as usize) * (n as usize) * 4 * sk as usize)?
-                } else {
-                    device.alloc_vram(y_bytes)?
-                };
 
                 let mut ska = [0u8; 40];
                 ska[0..8].copy_from_slice(&x_buf.gpu_addr().to_le_bytes());
                 ska[8..16].copy_from_slice(&w_buf.gpu_addr().to_le_bytes());
-                ska[16..24].copy_from_slice(&y_target.gpu_addr().to_le_bytes());
+                ska[16..24].copy_from_slice(&y_workspace.gpu_addr().to_le_bytes());
                 ska[24..28].copy_from_slice(&k.to_le_bytes());
                 ska[28..32].copy_from_slice(&n.to_le_bytes());
-                ska[32..36].copy_from_slice(&0u32.to_le_bytes());   // split_k_shift (unused, config-embedded)
-                ska[36..40].copy_from_slice(&y_stride.to_le_bytes()); // y_split_stride
+                ska[32..36].copy_from_slice(&0u32.to_le_bytes());
+                ska[36..40].copy_from_slice(&y_stride.to_le_bytes());
 
                 // Warmup
                 for _ in 0..2 {
@@ -198,6 +228,9 @@ fn main() -> Result<(), String> {
                 }
             }
             eprintln!(" ★ {} ({:.1} TF)", configs[best_idx].name().replace("t0_gemm_", ""), best_tf);
+
+            // Synchronize GPU before dropping buffers — prevents use-after-free
+            queue.synchronize()?;
         }
 
         // Summary: best config per size

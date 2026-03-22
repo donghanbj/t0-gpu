@@ -148,7 +148,8 @@ fn main() -> Result<(), String> {
             for (ci, cfg) in configs.iter().enumerate() {
                 let sk = cfg.split_k.unwrap_or(1);
                 // Check compatibility
-                if m % cfg.tile_m != 0 || n % cfg.tile_n != 0 || k % (cfg.tile_k * sk) != 0 {
+                let effective_n = cfg.tile_n * cfg.n_col_passes;
+                if m % cfg.tile_m != 0 || n % effective_n != 0 || k % (cfg.tile_k * sk) != 0 {
                     continue;
                 }
 

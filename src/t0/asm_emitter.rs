@@ -30,6 +30,7 @@ impl AsmEmitter {
         target: Target,
         kernarg_size: u32,
         lds_size: u32,
+        wgp_mode: bool,
     ) {
         // Header
         writeln!(self.buf, ".amdgcn_target \"amdgcn-amd-amdhsa--{}\"", target.mcpu_str()).unwrap();
@@ -68,6 +69,9 @@ impl AsmEmitter {
         writeln!(self.buf, "  .amdhsa_system_sgpr_workgroup_id_z 1").unwrap();
         writeln!(self.buf, "  .amdhsa_float_denorm_mode_32 3").unwrap();
         writeln!(self.buf, "  .amdhsa_float_denorm_mode_16_64 3").unwrap();
+        if wgp_mode {
+            writeln!(self.buf, "  .amdhsa_workgroup_processor_mode 1").unwrap();
+        }
         writeln!(self.buf, ".end_amdhsa_kernel").unwrap();
         writeln!(self.buf).unwrap();
 
