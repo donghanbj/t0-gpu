@@ -882,20 +882,25 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
         k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
         k.v_lshlrev_b32(row_bytes, 2, row_bytes);
 
+        // Compute row_block y_base = y_ptr + y_offset + row_bytes + col_bytes (once per row_block)
+        let y_base = k.alloc_vreg_array(2, Alignment::Align2);
+        k.v_mov_from_sgpr(y_base, SReg(y_ptr.0));
+        k.v_mov_from_sgpr(VReg(y_base.0 + 1), SReg(y_ptr.0 + 1));
+        {
+            let v_yoff = k.alloc_vreg();
+            k.v_mov_from_sgpr(v_yoff, y_offset_s);
+            k.v_add_co(y_base, y_base, v_yoff);
+            k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
+        }
+        k.v_add_co(y_base, y_base, row_bytes);
+        k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
+        k.v_add_u32(y_base, y_base, col_bytes);
+
         for c in 0..n_col_tiles {
+            // y_addr = y_base + c*64 (16 cols × 4 bytes)
             let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-            k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-            k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-            // Add split-K workspace offset (0 when no split)
-            {
-                let v_yoff = k.alloc_vreg();
-                k.v_mov_from_sgpr(v_yoff, y_offset_s);
-                k.v_add_co(y_addr, y_addr, v_yoff);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-            k.v_add_co(y_addr, y_addr, row_bytes);
-            k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            k.v_add_u32(y_addr, y_addr, col_bytes);
+            k.v_mov(y_addr, y_base);
+            k.v_mov(VReg(y_addr.0 + 1), VReg(y_base.0 + 1));
             if c > 0 {
                 k.push(Op::VAddU32 {
                     dst: y_addr, src0: Operand::VReg(y_addr),
