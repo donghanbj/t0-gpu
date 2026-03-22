@@ -46,7 +46,7 @@ pub struct GemmConfig {
 impl GemmConfig {
     /// 16×64, K=16, LDS double-buffered (small-M: 1 wave, max M-parallelism)
     pub fn tile_16x64_k16() -> Self {
-        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 32×64, K=16, no LDS (equivalent to `matmul`)
     pub fn tile_32x64_direct() -> Self {
@@ -54,7 +54,7 @@ impl GemmConfig {
     }
     /// 32×64, K=16, LDS double-buffered (equivalent to `matmul_lds_db`)
     pub fn tile_32x64_k16() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 32×64, K=32, LDS double-buffered (small-M optimized with deeper K unroll)
     pub fn tile_32x64_k32() -> Self {
@@ -62,11 +62,11 @@ impl GemmConfig {
     }
     /// 32×128, K=16, LDS double-buffered (small-M: wide N for more compute per WG)
     pub fn tile_32x128_k16() -> Self {
-        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 64×64, K=16, LDS double-buffered (equivalent to `matmul_64x64_lds_db`)
     pub fn tile_64x64_k16() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 64×64, K=32, LDS double-buffered (equivalent to `matmul_64x64_k32`)
     pub fn tile_64x64_k32() -> Self {
@@ -74,11 +74,11 @@ impl GemmConfig {
     }
     /// 128×64, K=16, LDS double-buffered (higher compute density)
     pub fn tile_128x64_k16() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 64×128, K=16, LDS double-buffered (wider N tiles)
     pub fn tile_64x128_k16() -> Self {
-        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 32 }
+        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
     /// 128×64, K=32 (max compute density)
     pub fn tile_128x64_k32() -> Self {
@@ -199,26 +199,24 @@ pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (
 pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
     let mn = (m as u64) * (n as u64);
 
-    // Post LDS-padding sweep results (2026-03-21):
-    // k16+pad32 tiles now dominate thanks to bank-conflict-free LDS reads.
+    // Post GMEM-fix sweep results (2026-03-21):
+    // k16 tiles (no padding): strong at 1024², large rectangular
+    // k32 tiles: strong at 2048²+, medium square
     if m <= 512 && k >= 1024 && n >= 1024 {
-        // Small M: sk8 for maximum parallelism
+        // Small M with large K/N: sk8 for maximum parallelism
         GemmConfig { split_k: Some(8), ..GemmConfig::tile_64x64_k16() }
     } else if mn <= 512 * 512 {
-        // Tiny: sk4 k16 (LDS padding makes k16 better than k32 here too)
-        GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() }
+        // Small square: 128×64_k32_sk2 (more CU fill)
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() }
+    } else if mn <= 1024 * 1024 {
+        // Medium: 64×64 k16 no-split (36.58 TF at 1024²)
+        GemmConfig::tile_64x64_k16()
     } else if mn <= 2048 * 2048 {
-        // Medium to large: k16 sk4 is now dominant (54 TF at 2048²)
-        GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() }
+        // Large-medium: 128×64_k32_sk2 (43.29 TF at 2048²)
+        GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() }
     } else {
-        // Very large: k16 no-split or sk4
-        // 4096²: 64x64_k16 (no split) = 68.75 TF
-        // 8192²: 64x64_k16_sk4 = 66.43 TF
-        if m >= 4096 && n >= 4096 && k <= 4096 {
-            GemmConfig::tile_64x64_k16()
-        } else {
-            GemmConfig { split_k: Some(4), ..GemmConfig::tile_64x64_k16() }
-        }
+        // Very large: 32×128_k16_sk4 (50.80 TF at 4096²)
+        GemmConfig { split_k: Some(4), ..GemmConfig::tile_32x128_k16() }
     }
 }
 
@@ -283,11 +281,11 @@ mod auto_select_tests {
         let c = auto_select(256, 256, 256);
         assert!(c.split_k.unwrap_or(1) > 1, "small should use split-K");
 
-        // Medium → 64×64 k16 sk4
+        // Medium → 64×64 k16 no-split
         let c = auto_select(1024, 1024, 1024);
         assert_eq!(c.tile_m, 64);
         assert_eq!(c.tile_k, 16);
-        assert_eq!(c.split_k, Some(4));
+        assert!(c.split_k.is_none() || c.split_k == Some(1));
 
         // Very large → split_k=4 k16 (k>=4096, m>=512)
         let c = auto_select(8192, 8192, 8192);
@@ -446,17 +444,22 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
 
     // ── X cooperative load address (COALESCED) ──
-    let xrs_shift = match x_row_stride { 32 => 5, 64 => 6, 128 => 7, _ => panic!("xrs") };
-    let wrs_shift = match wt_row_stride { 32 => 5, 64 => 6, 128 => 7, _ => panic!("wrs") };
+    // CRITICAL: GMEM rows are tile_k*2 bytes wide (no padding).
+    // LDS rows are x_row_stride bytes wide (with padding).
+    // Thread decomposition uses GMEM width; LDS store uses padded stride.
+    let gmem_row_bytes_x = cfg.tile_k * 2;  // actual data bytes per row
+    let gmem_row_bytes_wt = cfg.tile_k * 2;
+    // LDS row stride may not be power-of-2 (e.g., 36 = 32+4 pad)
+    // Use shift when possible, multiply otherwise
+    let xrs_is_pow2 = x_row_stride.is_power_of_two();
+    let wrs_is_pow2 = wt_row_stride.is_power_of_two();
+    let xrs_shift_val = if xrs_is_pow2 { x_row_stride.trailing_zeros() as u8 } else { 0 };
+    let wrs_shift_val = if wrs_is_pow2 { wt_row_stride.trailing_zeros() as u8 } else { 0 };
     // Thread t loads from byte offset (t * 16) within the tile's GMEM footprint.
-    // With x_row_stride bytes per row, thread t corresponds to:
-    //   row_in_tile = (t * 16) / x_row_stride
-    //   col_byte    = (t * 16) % x_row_stride
-    // Adjacent threads access adjacent 16-byte chunks → coalesced within cache lines!
-    //
-    // For tile_k=16, x_row_stride=32: threads 2t,2t+1 share the same row.
-    // For tile_k=32, x_row_stride=64: threads 4t..4t+3 share the same row.
-    let chunks_per_row_x = x_row_stride / 16;  // 2 for k16, 4 for k32
+    // Using GMEM row width for decomposition:
+    //   row_in_tile = (t * 16) / gmem_row_bytes
+    //   col_byte    = (t * 16) % gmem_row_bytes
+    let chunks_per_row_x = gmem_row_bytes_x / 16;  // 2 for k16, 4 for k32
     let x_cpr_shift = match chunks_per_row_x { 2 => 1, 4 => 2, 8 => 3, _ => panic!("cpr_x") };
 
     let x_row_in_tile = k.alloc_vreg();
@@ -485,13 +488,21 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
     k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
 
-    // X LDS store addr: row_in_tile * x_row_stride + col_chunk * 16
+    // X LDS store addr: row_in_tile * x_row_stride(padded) + col_chunk * 16
     let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, xrs_shift, x_row_in_tile);  // row * row_stride
+    if xrs_is_pow2 {
+        k.v_lshlrev_b32(x_lds_off, xrs_shift_val, x_row_in_tile);
+    } else {
+        let s_xrs = k.alloc_sreg();
+        k.s_mov_imm(s_xrs, x_row_stride as i32);
+        let v_xrs = k.alloc_vreg();
+        k.v_mov_from_sgpr(v_xrs, s_xrs);
+        k.v_mul_lo_u32(x_lds_off, x_row_in_tile, v_xrs);
+    }
     k.v_add_u32(x_lds_off, x_lds_off, x_col_byte);          // + col_chunk * 16
 
     // ── WT cooperative load address (COALESCED) ──
-    let chunks_per_row_wt = wt_row_stride / 16;
+    let chunks_per_row_wt = gmem_row_bytes_wt / 16;  // use GMEM width, not LDS stride
     let wt_cpr_shift = match chunks_per_row_wt { 2 => 1, 4 => 2, 8 => 3, _ => panic!("cpr_wt") };
 
     let wt_row_in_tile = k.alloc_vreg();
@@ -518,7 +529,15 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
 
     // WT LDS store addr: lds_x + row_in_tile * wt_row_stride + col_chunk * 16
     let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, wrs_shift, wt_row_in_tile);
+    if wrs_is_pow2 {
+        k.v_lshlrev_b32(wt_lds_off, wrs_shift_val, wt_row_in_tile);
+    } else {
+        let s_wrs = k.alloc_sreg();
+        k.s_mov_imm(s_wrs, wt_row_stride as i32);
+        let v_wrs = k.alloc_vreg();
+        k.v_mov_from_sgpr(v_wrs, s_wrs);
+        k.v_mul_lo_u32(wt_lds_off, wt_row_in_tile, v_wrs);
+    }
     k.v_add_u32(wt_lds_off, wt_lds_off, wt_col_byte);
     k.push(Op::VAddU32 {
         dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
@@ -528,7 +547,15 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     // ── LDS read addresses for WMMA fragments ──
     // X frag[r]: (wave_id * rows_per_wave + r*16 + lane_row) * x_row_stride
     let lane_row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(lane_row_stride, xrs_shift, lane_row);
+    if xrs_is_pow2 {
+        k.v_lshlrev_b32(lane_row_stride, xrs_shift_val, lane_row);
+    } else {
+        let s_xrs2 = k.alloc_sreg();
+        k.s_mov_imm(s_xrs2, x_row_stride as i32);
+        let v_xrs2 = k.alloc_vreg();
+        k.v_mov_from_sgpr(v_xrs2, s_xrs2);
+        k.v_mul_lo_u32(lane_row_stride, lane_row, v_xrs2);
+    }
 
     let s_wave_x_off = k.alloc_sreg();
     let s_wave_stride = k.alloc_sreg();
@@ -551,7 +578,15 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
 
     // WT: lane_row * wt_row_stride (tile offset as LDS_X + col*16*wt_row_stride)
     let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, wrs_shift, lane_row);
+    if wrs_is_pow2 {
+        k.v_lshlrev_b32(wt_lds_read_base, wrs_shift_val, lane_row);
+    } else {
+        let s_wrs2 = k.alloc_sreg();
+        k.s_mov_imm(s_wrs2, wt_row_stride as i32);
+        let v_wrs2 = k.alloc_vreg();
+        k.v_mov_from_sgpr(v_wrs2, s_wrs2);
+        k.v_mul_lo_u32(wt_lds_read_base, lane_row, v_wrs2);
+    }
 
     // ── Temp VGPRs (pre-allocated, reused) ──
     let n_x_gmem_regs = x_loads_per_thread as usize;
