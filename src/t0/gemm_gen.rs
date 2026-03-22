@@ -84,6 +84,16 @@ impl GemmConfig {
     pub fn tile_128x64_k32() -> Self {
         Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
     }
+    /// 128×128, K=16, LDS double-buffered (highest AI = 64 FLOP/byte)
+    /// Acc VGPRs: 4 row_blocks × 8 col_tiles × 8 = 256 — BUT each wave only uses
+    /// n_row_blocks(2) × n_col_tiles(8) × 8 = 128 VGPRs. Tight but feasible.
+    pub fn tile_128x128_k16() -> Self {
+        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+    }
+    /// 64×64, K=64, LDS double-buffered (4× fewer loop iterations)
+    pub fn tile_64x64_k64() -> Self {
+        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0 }
+    }
 
     /// Number of WMMA column tiles = tile_n / 16
     pub fn n_col_tiles(&self) -> usize { (self.tile_n / 16) as usize }
@@ -173,16 +183,17 @@ pub fn generate(cfg: &GemmConfig) -> T0Kernel {
 pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
     let tiles_m = m / cfg.tile_m;
     let tiles_n = n / cfg.tile_n;
-    // Swizzled: TGID.x → tile_row, TGID.y → tile_col
-    // Grid X iterates M-rows first for L2 locality on X data
-    (tiles_m * cfg.wg_size, tiles_n)
+    // L2 tiling: Grid.x = N-tiles (fast), Grid.y = M-tiles (slow)
+    // Consecutive WGs share X rows in L2 cache
+    (tiles_n * cfg.wg_size, tiles_m)
 }
 
 /// Grid with split-K: Y dimension = tiles_n * split_k
 pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (u32, u32) {
     let tiles_m = m / cfg.tile_m;
     let tiles_n = n / cfg.tile_n;
-    (tiles_m * cfg.wg_size, tiles_n * split_k)
+    // L2 tiling: N-tiles on X, M-tiles × split_k on Y
+    (tiles_n * cfg.wg_size, tiles_m * split_k)
 }
 
 // ============================================================================
@@ -332,9 +343,10 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     k.emit_arg_loads();
 
     // ── TGIDs with split-K support ──
-    // Swizzled grid: TGID.x → tile_row, TGID.y → tile_col (possibly packed with split_k_id)
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_row_s);
+    // Grid layout: TGID.x → tile_col (N), TGID.y → tile_row (M) [+ split_k_id]
+    // Consecutive WGs (TGID.x) share X rows → better L2 cache reuse
+    let tile_col_raw_s = k.alloc_sreg();
+    k.capture_tgid_x(tile_col_raw_s);
 
     let tgid_y_s = k.alloc_sreg();
     k.capture_tgid_y(tgid_y_s);
@@ -344,14 +356,18 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     let split_k_shift: u8 = match split_k { 1 => 0, 2 => 1, 4 => 2, 8 => 3, 16 => 4, _ => panic!("unsupported split_k") };
 
     let tile_col_s = k.alloc_sreg();
+    let tile_row_s = k.alloc_sreg();
     let split_k_id_s = k.alloc_sreg();
+    // tile_col comes from TGID.x directly
+    k.push(Op::SAddU32 { dst: tile_col_s, src0: tile_col_raw_s, src1: SOperand::InlineInt(0) });
     if split_k <= 1 {
-        // No split: tile_col = TGID.y, split_k_id = 0
-        k.push(Op::SAddU32 { dst: tile_col_s, src0: tgid_y_s, src1: SOperand::InlineInt(0) });
+        // No split: tile_row = TGID.y, split_k_id = 0
+        k.push(Op::SAddU32 { dst: tile_row_s, src0: tgid_y_s, src1: SOperand::InlineInt(0) });
         k.s_mov_imm(split_k_id_s, 0);
     } else {
-        // tile_col = TGID.y >> split_k_shift
-        k.s_lshr_b32(tile_col_s, tgid_y_s, split_k_shift);
+        // Split-K: pack split_k_id in low bits of TGID.y
+        // tile_row = TGID.y >> split_k_shift
+        k.s_lshr_b32(tile_row_s, tgid_y_s, split_k_shift);
         // split_k_id = TGID.y & (split_k - 1)
         let mask_s = k.alloc_sreg();
         k.s_mov_imm(mask_s, (split_k - 1) as i32);

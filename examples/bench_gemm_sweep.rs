@@ -44,6 +44,8 @@ fn main() -> Result<(), String> {
         // ── 128×64 k32 ──
         GemmConfig::tile_128x64_k32(),
         GemmConfig { split_k: Some(2), ..GemmConfig::tile_128x64_k32() },
+        // ── NEW: deeper K for fewer loop iterations ──
+        GemmConfig::tile_64x64_k64(),                 // 4× fewer K-loop iters vs k16
     ];
 
     // Matrix sizes: focus on small + representative large
