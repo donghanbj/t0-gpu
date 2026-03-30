@@ -26,8 +26,8 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 > **GEMM 89.1 TFLOPS** — 128×128 k64 WGP 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**达到 rocBLAS 的 98%**。
 > **89.1 TFLOPS** on 128×128 k64 WGP config, 4096³ bf16 GEMM on RX 7900 XTX — **98% of rocBLAS performance**.
 
-> **🏆 7/9 矩阵尺寸超越 rocBLAS**，最高领先 **97%**，峰值 **89.1 TFLOPS**。
-> **Beats rocBLAS on 7 out of 9 matrix sizes**, by up to **97%**, peaking at **89.1 TFLOPS**.
+> 纯 Rust 手写编译器生成的 GEMM 内核，与 AMD 官方预编译库 rocBLAS (~90.78 TF) 性能持平。
+> Hand-written Rust compiler-generated GEMM kernel, on par with AMD's precompiled rocBLAS (~90.78 TF).
 
 > **Zero-Overhead Dispatch** — 异步调度延迟 **2.26 μs**（HIP: 2.6 μs），同步调度 **14.96 μs**（HIP: 20.5 μs）。
 > Async dispatch **2.26 μs** (HIP: 2.6 μs), sync dispatch **14.96 μs** (HIP: 20.5 μs) — **13-27% faster** than HIP.
