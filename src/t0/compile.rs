@@ -171,6 +171,15 @@ impl T0Kernel {
         v
     }
 
+    /// Allocate a 64-bit address pair: 2 consecutive VGPRs (lo, hi).
+    /// Returns (addr_lo, addr_hi) guaranteed to be VReg(n) and VReg(n+1).
+    /// This is REQUIRED for GlobalLoad/GlobalStore which emit v[lo:lo+1].
+    pub fn alloc_addr_pair(&mut self) -> (VReg, VReg) {
+        let pair = self.alloc_vreg_array(2, Alignment::Align2);
+        self.mark_coalesced_group(pair, 2);
+        (pair, VReg(pair.0 + 1))
+    }
+
     /// Allocate a single virtual SGPR.
     pub fn alloc_sreg(&mut self) -> SReg {
         let s = SReg(self.next_sreg);
@@ -249,11 +258,17 @@ impl T0Kernel {
     }
 
     pub fn buffer_load(&mut self, dst: VReg, voffset: VReg, srsrc: SReg, width: Width, offset: u16) {
-        self.ops.push(Op::BufferLoad { dst, voffset, srsrc, width, offset });
+        self.ops.push(Op::BufferLoad { dst, voffset, srsrc, width, offset, soffset: SOFFSET_ZERO });
+    }
+
+    /// buffer_load with scalar offset: effective addr = voffset + soffset + offset
+    /// Used to eliminate serial v_add chains for GMEM row addressing.
+    pub fn buffer_load_soffset(&mut self, dst: VReg, voffset: VReg, srsrc: SReg, width: Width, offset: u16, soffset: SReg) {
+        self.ops.push(Op::BufferLoad { dst, voffset, srsrc, width, offset, soffset });
     }
 
     pub fn buffer_store(&mut self, voffset: VReg, src: VReg, srsrc: SReg, width: Width, offset: u16) {
-        self.ops.push(Op::BufferStore { voffset, src, srsrc, width, offset });
+        self.ops.push(Op::BufferStore { voffset, src, srsrc, width, offset, soffset: SOFFSET_ZERO });
     }
 
     pub fn lds_load(&mut self, dst: VReg, addr: VReg, width: Width, offset: u16) {
@@ -728,6 +743,15 @@ impl T0Kernel {
 
     /// 64-bit address add: addr[lo:hi] += offset (modifies addr in place)
     pub fn addr64_add(&mut self, addr_lo: VReg, addr_hi: VReg, offset: VReg) {
+        // SAFETY: GlobalLoad/GlobalStore emit v[addr_lo : addr_lo+1], so
+        // addr_hi MUST be the next VReg from addr_lo.
+        debug_assert_eq!(
+            addr_hi.0, addr_lo.0 + 1,
+            "addr64_add: addr_lo=VReg({}) and addr_hi=VReg({}) are NOT consecutive! \
+             Use alloc_addr_pair() to get a guaranteed-consecutive pair. \
+             Non-consecutive pairs cause GlobalStore to use wrong high address → GPU hang.",
+            addr_lo.0, addr_hi.0
+        );
         self.v_add_co_u32(addr_lo, addr_lo, offset);
         self.v_add_co_ci_u32(addr_hi, addr_hi);
     }

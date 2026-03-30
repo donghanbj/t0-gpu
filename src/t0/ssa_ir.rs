@@ -2431,27 +2431,55 @@ pub fn compute_live_intervals(
         }
     }
 
-    // Extend live ranges for values used inside loops
-    for &(loop_start, loop_end) in &loop_ranges {
-        for (mval, last_use) in last_uses.iter_mut() {
-            // If this value's last_use is within the loop body, extend to loop_end
-            if *last_use >= loop_start && *last_use <= loop_end {
-                if let Some(&def) = def_points.get(mval) {
-                    // Only extend if the def is at or before the loop
-                    if def <= loop_end {
-                        *last_use = loop_end;
-                    }
-                }
+    // Extend live ranges for values used inside loops.
+    //
+    // CRITICAL DISTINCTION:
+    //   - Loop-CARRIED values (defined BEFORE the loop, used inside) → MUST extend
+    //     to loop_end because the value persists across iterations.
+    //   - In-place updates (value defined inside loop that belongs to a VReg
+    //     also defined before the loop, e.g., accumulators) → MUST extend.
+    //   - Loop-LOCAL temporaries (VReg only defined inside loop, never before it)
+    //     → do NOT extend. These are re-created each iteration.
+    //
+    // The key insight: after Step 6 (VReg merge), all MVal versions of the same
+    // VReg become ONE interval. If any MVal version isn't extended, the merged
+    // interval's last_use may be too short → regalloc overwrites the register
+    // mid-loop → silent data corruption.
+
+    // Build MVal → VReg mapping (needed to detect in-place updates)
+    let mval_to_vreg_tmp = build_mval_to_vreg(func);
+
+    // Identify VRegs that have at least one def BEFORE any loop
+    let earliest_loop_start = loop_ranges.iter().map(|r| r.0).min().unwrap_or(u32::MAX);
+    let mut pre_loop_vregs: std::collections::HashSet<VReg> = std::collections::HashSet::new();
+    for (&mv, &def) in def_points.iter() {
+        if def < earliest_loop_start {
+            if let Some(&vreg) = mval_to_vreg_tmp.get(&mv) {
+                pre_loop_vregs.insert(vreg);
             }
         }
-        // Also extend defs that are inside the loop (loop-carried values)
-        // If a value is defined inside the loop and used inside the loop,
-        // its live range spans the entire loop iteration
-        for (mval, def) in def_points.iter() {
-            if *def >= loop_start && *def <= loop_end {
-                if let Some(lu) = last_uses.get_mut(mval) {
-                    if *lu < loop_end {
-                        *lu = loop_end;
+    }
+
+    for &(loop_start, loop_end) in &loop_ranges {
+        for (mval, last_use) in last_uses.iter_mut() {
+            if *last_use >= loop_start && *last_use <= loop_end {
+                if let Some(&def) = def_points.get(mval) {
+                    // Case 1: Defined BEFORE the loop → loop-carried → extend
+                    if def < loop_start {
+                        *last_use = loop_end;
+                        continue;
+                    }
+                    // Case 2: Defined INSIDE loop — check if in-place update
+                    // (same VReg has a definition before the loop)
+                    if def >= loop_start && def <= loop_end {
+                        if let Some(&vreg) = mval_to_vreg_tmp.get(mval) {
+                            if pre_loop_vregs.contains(&vreg) {
+                                // In-place update of a loop-carried VReg → extend
+                                *last_use = loop_end;
+                                continue;
+                            }
+                        }
+                        // Pure loop-local temporary → do NOT extend
                     }
                 }
             }

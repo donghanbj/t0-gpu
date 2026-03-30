@@ -443,7 +443,7 @@ mod tests {
             tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128,
             use_lds: true, double_buffer: true, split_k: None,
             lds_pad: 0, n_col_passes: 1, swap_grid: true,
-            wgp_mode: false,
+            wgp_mode: true,
             transpose: gemm_gen::GemmTranspose::NT,
             epilogue: gemm_gen::EpilogueOp::StoreF32,
         };

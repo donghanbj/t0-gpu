@@ -19,6 +19,10 @@ pub struct VReg(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SReg(pub u32);
 
+/// Sentinel SReg value meaning "use literal 0 as soffset" in BufferLoad/BufferStore.
+/// The assembler recognizes this and emits `0` instead of `sN`.
+pub const SOFFSET_ZERO: SReg = SReg(u32::MAX - 100);
+
 /// Virtual SGPR pair (64-bit pointer in two adjacent SGPRs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SRegPair(pub u32);  // refers to SReg(n) and SReg(n+1)
@@ -187,6 +191,7 @@ pub enum Op {
         srsrc: SReg,     // first of 4 SGPRs (buffer resource descriptor)
         width: Width,
         offset: u16,     // constant byte offset (12-bit, 0..4095)
+        soffset: SReg,   // scalar offset SGPR (added to voffset). Use SOFFSET_ZERO for literal 0.
     },
     BufferStore {
         voffset: VReg,   // per-thread byte offset in VGPR
@@ -194,6 +199,7 @@ pub enum Op {
         srsrc: SReg,     // first of 4 SGPRs (buffer resource descriptor)
         width: Width,
         offset: u16,     // constant byte offset (12-bit, 0..4095)
+        soffset: SReg,   // scalar offset SGPR. Use SOFFSET_ZERO for literal 0.
     },
 
     // ── LDS (Local Data Share) ──

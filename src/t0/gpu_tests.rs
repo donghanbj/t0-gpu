@@ -53,8 +53,7 @@ mod t0_gpu_tests {
         let offset = k.alloc_vreg();
         k.v_lshlrev_b32(offset, 2, gid);
 
-        let addr_lo = k.alloc_vreg();
-        let addr_hi = k.alloc_vreg();
+        let (addr_lo, addr_hi) = k.alloc_addr_pair();
         let val = k.alloc_vreg();
         k.v_mov_from_sgpr(addr_lo, SReg(ptr.0));
         k.v_mov_from_sgpr(addr_hi, SReg(ptr.0 + 1));
@@ -384,8 +383,7 @@ mod t0_gpu_tests {
             k.s_barrier();
             let offset = k.alloc_vreg();
             k.v_lshlrev_b32(offset, 2, gid);
-            let addr_lo = k.alloc_vreg();
-            let addr_hi = k.alloc_vreg();
+            let (addr_lo, addr_hi) = k.alloc_addr_pair();
             k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
             k.addr64_add(addr_lo, addr_hi, offset);
@@ -421,8 +419,7 @@ mod t0_gpu_tests {
             k.s_barrier();
             let offset = k.alloc_vreg();
             k.v_lshlrev_b32(offset, 2, gid);
-            let addr_lo = k.alloc_vreg();
-            let addr_hi = k.alloc_vreg();
+            let (addr_lo, addr_hi) = k.alloc_addr_pair();
             k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
             k.addr64_add(addr_lo, addr_hi, offset);
@@ -481,8 +478,7 @@ mod t0_gpu_tests {
             // Store to GMEM
             let offset = k.alloc_vreg();
             k.v_lshlrev_b32(offset, 2, gid);
-            let addr_lo = k.alloc_vreg();
-            let addr_hi = k.alloc_vreg();
+            let (addr_lo, addr_hi) = k.alloc_addr_pair();
             k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
             k.addr64_add(addr_lo, addr_hi, offset);
@@ -531,8 +527,7 @@ mod t0_gpu_tests {
             k.wait_lgkmcnt(0);
             let offset = k.alloc_vreg();
             k.v_lshlrev_b32(offset, 2, gid);
-            let addr_lo = k.alloc_vreg();
-            let addr_hi = k.alloc_vreg();
+            let (addr_lo, addr_hi) = k.alloc_addr_pair();
             k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
             k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
             k.addr64_add(addr_lo, addr_hi, offset);
@@ -771,8 +766,7 @@ mod t0_gpu_tests {
         k.wait_lgkmcnt(0);
         let offset = k.alloc_vreg();
         k.v_lshlrev_b32(offset, 2, gid);
-        let addr_lo = k.alloc_vreg();
-        let addr_hi = k.alloc_vreg();
+        let (addr_lo, addr_hi) = k.alloc_addr_pair();
         k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
         k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
         k.addr64_add(addr_lo, addr_hi, offset);
@@ -824,8 +818,7 @@ mod t0_gpu_tests {
         k_cu.wait_lgkmcnt(0);
         let offset2 = k_cu.alloc_vreg();
         k_cu.v_lshlrev_b32(offset2, 2, gid2);
-        let addr_lo2 = k_cu.alloc_vreg();
-        let addr_hi2 = k_cu.alloc_vreg();
+        let (addr_lo2, addr_hi2) = k_cu.alloc_addr_pair();
         k_cu.v_mov_from_sgpr(addr_lo2, SReg(out_ptr2.0));
         k_cu.v_mov_from_sgpr(addr_hi2, SReg(out_ptr2.0 + 1));
         k_cu.addr64_add(addr_lo2, addr_hi2, offset2);
@@ -849,5 +842,149 @@ mod t0_gpu_tests {
         eprintln!("═══ End KD diff ═══");
 
         eprintln!("\n[PASS] test_wgp_asm_dump: WGP kernel compiles correctly");
+    }
+
+    /// COMPILE-ONLY: Dump the WGP probe kernel ASM for root cause analysis.
+    /// Does NOT dispatch to GPU — safe to run after hard hang.
+    #[test]
+    fn test_wgp_probe_asm_dump() {
+        use crate::t0::compile::T0Kernel;
+        use crate::t0::ir::*;
+
+        let mut k = T0Kernel::new("wgp_probe_cu_baseline");
+        k.set_wg_size(256);
+        let out_ptr = k.arg_ptr("out");
+        k.emit_arg_loads();
+        let gid = k.compute_global_id_x(256);
+        let val = k.alloc_vreg();
+        k.push(Op::VCvtF32U32 { dst: val, src: gid });
+        k.wait_vmcnt(0);
+        k.wait_lgkmcnt(0);
+        k.s_barrier();
+        let offset = k.alloc_vreg();
+        k.v_lshlrev_b32(offset, 2, gid);
+        let (addr_lo, addr_hi) = k.alloc_addr_pair();
+        k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
+        k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
+        k.addr64_add(addr_lo, addr_hi, offset);
+        k.global_store(addr_lo, val, Width::B32, 0);
+        k.wait_vscnt(0);
+        k.endpgm();
+
+        let (asm, _) = k.to_assembly_with_info(Target::GFX1100)
+            .expect("CU compile failed");
+
+        eprintln!("\n=== CU Probe Kernel ASM ===\n");
+        for (i, line) in asm.lines().enumerate() {
+            eprintln!("{:4}: {}", i + 1, line);
+        }
+        eprintln!("\n[PASS] compile-only, no GPU dispatch");
+    }
+
+    /// COMPILE-ONLY: Verify WGP mode is correctly set in the ELF RSRC1 field.
+    #[test]
+    fn test_wgp_rsrc1_verification() {
+        use crate::t0::compile::T0Kernel;
+        use crate::t0::ir::*;
+
+        // Build a simple WGP kernel
+        let mut k = T0Kernel::new("wgp_rsrc1_check");
+        k.set_wg_size(256);
+        k.set_wgp_mode(true);
+        k.set_lds_size(81920);
+        let out_ptr = k.arg_ptr("out");
+        k.emit_arg_loads();
+        k.endpgm();
+
+        // Get assembly text to verify directive is present
+        let (asm, _) = k.to_assembly_with_info(Target::GFX1100).expect("asm");
+        let has_wgp_directive = asm.contains(".amdhsa_workgroup_processor_mode 1");
+        eprintln!("[ASM] .amdhsa_workgroup_processor_mode 1 present: {}", has_wgp_directive);
+        assert!(has_wgp_directive, "WGP directive missing from assembly text!");
+
+        // Compile to ELF binary
+        let (elf, _) = k.compile_with_info(Target::GFX1100).expect("compile");
+        eprintln!("[ELF] {} bytes", elf.len());
+
+        // Find the kernel descriptor in the ELF .rodata section
+        // KD is 64 bytes, starts at a 64-byte aligned boundary
+        // COMPUTE_PGM_RSRC1 is at KD offset 0x30 (48)
+        // We search for the KD by looking for a known pattern:
+        // group_segment_fixed_size = 81920 = 0x00014000
+        let target_lds = 81920u32.to_le_bytes(); // [00, 40, 01, 00]
+        
+        let mut kd_offset = None;
+        for i in 0..elf.len().saturating_sub(64) {
+            if i % 64 == 0 && elf[i..i+4] == target_lds {
+                kd_offset = Some(i);
+                break;
+            }
+        }
+        // Also try non-aligned search
+        if kd_offset.is_none() {
+            for i in 0..elf.len().saturating_sub(64) {
+                if elf[i..i+4] == target_lds {
+                    kd_offset = Some(i);
+                    break;
+                }
+            }
+        }
+
+        if let Some(off) = kd_offset {
+            eprintln!("[KD] Found at ELF offset 0x{:X}", off);
+            // Dump KD hex
+            for row in 0..4 {
+                let base = off + row * 16;
+                if base + 16 <= elf.len() {
+                    eprint!("  {:02X}:", row * 16);
+                    for j in 0..16 {
+                        eprint!(" {:02X}", elf[base + j]);
+                    }
+                    eprintln!();
+                }
+            }
+
+            // RSRC1 at KD+0x30
+            if off + 0x34 <= elf.len() {
+                let rsrc1 = u32::from_le_bytes([
+                    elf[off + 0x30], elf[off + 0x31], elf[off + 0x32], elf[off + 0x33]
+                ]);
+                let wgp_bit = (rsrc1 >> 27) & 1;
+                let mem_ordered = (rsrc1 >> 25) & 1;
+                let vgpr_gran = rsrc1 & 0x3F;
+                
+                eprintln!("\n[RSRC1] 0x{:08X}", rsrc1);
+                eprintln!("  WGP_MODE (bit 27):  {}", wgp_bit);
+                eprintln!("  MEM_ORDERED (bit 25): {}", mem_ordered);
+                eprintln!("  VGPR granulated: {} → {} VGPRs", vgpr_gran, (vgpr_gran + 1) * 8);
+
+                if wgp_bit == 0 {
+                    eprintln!("\n❌ WGP_MODE NOT SET in RSRC1! This is the root cause of WGP hang.");
+                    eprintln!("   .amdhsa_workgroup_processor_mode 1 is in the ASM but LLVM did not set bit 27.");
+                } else {
+                    eprintln!("\n✅ WGP_MODE correctly set in RSRC1!");
+                }
+            }
+
+            // kernel_code_properties at KD+0x38
+            if off + 0x3A <= elf.len() {
+                let kcp = u16::from_le_bytes([elf[off + 0x38], elf[off + 0x39]]);
+                eprintln!("[KCP] 0x{:04X}", kcp);
+                eprintln!("  bit 3 (ENABLE_SGPR_KERNARG): {}", (kcp >> 3) & 1);
+                eprintln!("  bit 9 (WAVEFRONT_SIZE32): {}", (kcp >> 9) & 1);
+                eprintln!("  bit 10 (ENABLE_WGP_MODE): {}", (kcp >> 10) & 1);
+            }
+        } else {
+            eprintln!("[KD] NOT FOUND in ELF! Searching for LDS=81920 pattern failed.");
+            // Dump first 256 bytes for inspection
+            for row in 0..16 {
+                let base = row * 16;
+                if base + 16 <= elf.len() {
+                    eprint!("  {:04X}:", base);
+                    for j in 0..16 { eprint!(" {:02X}", elf[base + j]); }
+                    eprintln!();
+                }
+            }
+        }
     }
 }

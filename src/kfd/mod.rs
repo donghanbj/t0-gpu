@@ -2579,11 +2579,16 @@ impl GpuKernel {
         // The AQL header's HSA_ACQUIRE_SYSTEM fence will also invalidate L1i/L2.
         let _ = unsafe { std::ptr::read_volatile(code_buf.host_ptr) };
 
-        // Patch PRIV bit in kernel descriptor's compute_pgm_rsrc1 (offset 48)
-        // Required for KFD bare-metal dispatch: without PRIV, CWSR context
-        // save/restore fails and the kernel hangs on preemption attempts.
-        // Reference: kfd_bare_metal_dispatch_architecture.md section 4.3
-        // Tinygrad: desc.compute_pgm_rsrc1 |= (1 << 20)
+        // Patch kernel descriptor's compute_pgm_rsrc1 (KD offset 48):
+        //   bit 20: PRIV — Required for KFD bare-metal dispatch (CWSR context save/restore)
+        //   bit 27: WGP_MODE — Propagated from kernel_code_properties (KCP, KD offset 56)
+        //
+        // CRITICAL: LLVM's .amdhsa_workgroup_processor_mode sets KCP bit 10 but does NOT
+        // set RSRC1 bit 27 on GFX11. The hardware CP reads WGP mode from RSRC1, so the
+        // runtime must propagate this. Without this, WGP kernels using >64KB LDS will hang
+        // because the hardware stays in CU mode (max 64KB LDS per CU).
+        //
+        // Reference: tinygrad desc.compute_pgm_rsrc1 |= (1 << 20)
         let (rsrc1, rsrc2, entry_offset);
         unsafe {
             let kd_host_ptr = code_buf.host_ptr.add(kd_offset);
@@ -2600,7 +2605,16 @@ impl GpuKernel {
             }
             let rsrc1_ptr = kd_host_ptr.add(48) as *mut u32;
             let raw_rsrc1 = std::ptr::read_volatile(rsrc1_ptr);
-            let patched_rsrc1 = raw_rsrc1 | (1 << 20); // PRIV bit
+            let mut patched_rsrc1 = raw_rsrc1 | (1 << 20); // PRIV bit
+
+            // Propagate WGP mode from kernel_code_properties (KD offset 0x38) to RSRC1 bit 27
+            let kcp = std::ptr::read_volatile(kd_host_ptr.add(0x38) as *const u16);
+            let wgp_kcp = (kcp >> 10) & 1;
+            if wgp_kcp == 1 {
+                patched_rsrc1 |= 1 << 27; // WGP_MODE in RSRC1
+                eprintln!("[KFD] WGP mode enabled: KCP=0x{:04X} → RSRC1 bit 27 set", kcp);
+            }
+
             std::ptr::write_volatile(rsrc1_ptr, patched_rsrc1);
             rsrc1 = patched_rsrc1;
             rsrc2 = std::ptr::read_volatile(kd_host_ptr.add(52) as *const u32);

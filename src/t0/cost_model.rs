@@ -397,10 +397,10 @@ pub fn estimate_tile_cost(
 /// Auto-schedule GEMM: search tile space and return the best configuration.
 ///
 /// Searches over:
-/// - tile_m ∈ {16, 32, 64, 128}
-/// - tile_n ∈ {32, 64, 128}
-/// - tile_k ∈ {16, 32}
-/// - waves_per_wg ∈ {1, 2, 4, 8}
+/// - tile_m ∈ {32, 64, 128}
+/// - tile_n ∈ {64, 128}
+/// - tile_k ∈ {16, 32, 48, 64}
+/// - waves_per_wg ∈ {2, 4, 8}
 /// - split_k ∈ {1, 2, 4, 8}
 /// - wgp_mode ∈ {false, true}
 /// - swap_grid ∈ {false, true}
@@ -413,8 +413,8 @@ pub fn auto_schedule_gemm(
     let hw = GFX1100Limits::default();
 
     let tile_m_candidates = [32u32, 64, 128];
-    let tile_n_candidates = [64u32]; // 128 maps to 64+2pass (scoring mismatch); keep single-pass only
-    let tile_k_candidates = [16u32, 32];
+    let tile_n_candidates = [64u32, 128]; // 128 enables larger output tiles (needs tile_ir path)
+    let tile_k_candidates = [16u32, 32, 48, 64]; // k64 shows +5-60% gains vs k32 in benchmarks
     let waves_candidates = [2u32, 4, 8];
     let split_k_candidates = [1u32, 2, 4, 8];
 
@@ -538,6 +538,41 @@ impl TileConfig {
             transpose: super::gemm_gen::GemmTranspose::NT,  // default
             epilogue: super::gemm_gen::EpilogueOp::StoreF32,
         }
+    }
+
+    /// Convert cost-model TileConfig to tile_ir TileGemm.
+    ///
+    /// tile_ir handles tile_n=128 natively (streaming mode) without multi-pass.
+    /// Only valid for tile_k values that are powers of 2 (16, 32, 64, 128).
+    pub fn to_tile_gemm(&self) -> super::tile_ir::TileGemm {
+        super::tile_ir::TileGemm {
+            tile_m: self.tile_m,
+            tile_n: self.tile_n,
+            tile_k: self.tile_k,
+            wgp_mode: self.wgp_mode,
+            double_buffer: self.use_lds,
+            split_k: self.split_k,
+            swap_grid: true,  // tile_ir presets always use swap_grid=true (L2 friendly + proven safe)
+            transpose: super::tile_ir::TileTranspose::NT,
+            acc_swap: false,
+        }
+    }
+
+    /// Whether this config can be compiled and dispatched by tile_ir.
+    ///
+    /// Safety constraints (violating any of these causes GPU hang):
+    /// - tile_k must be power-of-2 (bitwise tid decomposition in cooperative load)
+    /// - waves_per_wg must match tile_ir's derived n_waves = tile_m / 32
+    ///   (grid dimensions use wg_size, which tile_ir computes as n_waves * 32)
+    /// - swap_grid must be true (all tile_ir presets use true; false is
+    ///   untested in autotuner dispatch and has caused hangs)
+    pub fn can_use_tile_ir(&self) -> bool {
+        let tile_ir_waves = self.tile_m / 32;
+        self.tile_k.is_power_of_two()
+            && self.tile_m >= 32
+            && self.tile_n >= 32
+            && self.waves_per_wg == tile_ir_waves
+            && self.swap_grid  // only proven-safe grid layout
     }
 }
 

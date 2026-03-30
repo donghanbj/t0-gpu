@@ -40,6 +40,7 @@ pub mod profile_guided;
 pub mod insn_latency;
 pub mod kloop_simulator;
 pub mod autotune_oracle;
+pub mod auto_gemm;
 pub mod softmax_kernels;
 pub mod ce_loss_kernels;
 pub mod rope_kernels;

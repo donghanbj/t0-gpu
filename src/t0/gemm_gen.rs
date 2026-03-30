@@ -86,62 +86,62 @@ pub struct GemmConfig {
 impl GemmConfig {
     /// 16×64, K=16, LDS double-buffered (small-M: 1 wave, max M-parallelism)
     pub fn tile_16x64_k16() -> Self {
-        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=16, no LDS (equivalent to `matmul`)
     pub fn tile_32x64_direct() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=16, LDS double-buffered (equivalent to `matmul_lds_db`)
     pub fn tile_32x64_k16() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=32, LDS double-buffered (small-M optimized with deeper K unroll)
     pub fn tile_32x64_k32() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×128, K=16, LDS double-buffered (small-M: wide N for more compute per WG)
     pub fn tile_32x128_k16() -> Self {
-        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=16, LDS double-buffered (equivalent to `matmul_64x64_lds_db`)
     pub fn tile_64x64_k16() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=32, LDS double-buffered (equivalent to `matmul_64x64_k32`)
     pub fn tile_64x64_k32() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×64, K=16, LDS double-buffered (higher compute density)
     pub fn tile_128x64_k16() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×128, K=16, LDS double-buffered (wider N tiles)
     pub fn tile_64x128_k16() -> Self {
-        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×64, K=32 (max compute density)
     pub fn tile_128x64_k32() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×128, K=16, LDS double-buffered (highest AI = 64 FLOP/byte)
     /// Acc VGPRs: 4 row_blocks × 8 col_tiles × 8 = 256 — BUT each wave only uses
     /// n_row_blocks(2) × n_col_tiles(8) × 8 = 128 VGPRs. Tight but feasible.
     pub fn tile_128x128_k16() -> Self {
-        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=64, LDS double-buffered (4× fewer loop iterations)
     pub fn tile_64x64_k64() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×128 via 2×(128×64) column passes. Effective AI=64.
     /// X data reused from L2 cache on second pass.
     pub fn tile_128x128_2pass() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×128 via 2×(64×64) column passes. Effective AI=43.
     pub fn tile_64x128_2pass() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: true, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
 
     /// Number of WMMA column tiles = tile_n / 16

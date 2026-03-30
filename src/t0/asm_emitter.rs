@@ -204,7 +204,7 @@ impl AsmEmitter {
                 self.outstanding_vmcnt += 1;
             }
 
-            Op::BufferLoad { dst, voffset, srsrc, width, offset } => {
+            Op::BufferLoad { dst, voffset, srsrc, width, offset, soffset } => {
                 let vd = a.phys_v(*dst);
                 let vo = a.phys_v(*voffset);
                 let sr = a.phys_s(SReg(srsrc.0));
@@ -215,17 +215,22 @@ impl AsmEmitter {
                     Width::B128 => "buffer_load_b128",
                 };
                 let dst_str = vreg_range_str(vd, width.vreg_count());
-                if *offset == 0 {
-                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen",
-                        self.indent, instr, dst_str, vo, sr, sr + 3).unwrap();
+                let soff_str = if *soffset == SOFFSET_ZERO {
+                    "0".to_string()
                 } else {
-                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen offset:{}",
-                        self.indent, instr, dst_str, vo, sr, sr + 3, offset).unwrap();
+                    format!("s{}", a.phys_s(*soffset))
+                };
+                if *offset == 0 {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], {} offen",
+                        self.indent, instr, dst_str, vo, sr, sr + 3, soff_str).unwrap();
+                } else {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], {} offen offset:{}",
+                        self.indent, instr, dst_str, vo, sr, sr + 3, soff_str, offset).unwrap();
                 }
                 self.outstanding_vmcnt += 1;
             }
 
-            Op::BufferStore { voffset, src, srsrc, width, offset } => {
+            Op::BufferStore { voffset, src, srsrc, width, offset, soffset } => {
                 let vo = a.phys_v(*voffset);
                 let vs = a.phys_v(*src);
                 let sr = a.phys_s(SReg(srsrc.0));
@@ -236,12 +241,17 @@ impl AsmEmitter {
                     Width::B128 => "buffer_store_b128",
                 };
                 let src_str = vreg_range_str(vs, width.vreg_count());
-                if *offset == 0 {
-                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen",
-                        self.indent, instr, src_str, vo, sr, sr + 3).unwrap();
+                let soff_str = if *soffset == SOFFSET_ZERO {
+                    "0".to_string()
                 } else {
-                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen offset:{}",
-                        self.indent, instr, src_str, vo, sr, sr + 3, offset).unwrap();
+                    format!("s{}", a.phys_s(*soffset))
+                };
+                if *offset == 0 {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], {} offen",
+                        self.indent, instr, src_str, vo, sr, sr + 3, soff_str).unwrap();
+                } else {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], {} offen offset:{}",
+                        self.indent, instr, src_str, vo, sr, sr + 3, soff_str, offset).unwrap();
                 }
                 self.outstanding_vscnt += 1;
             }
