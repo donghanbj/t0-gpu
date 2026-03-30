@@ -4,7 +4,7 @@
 //! Computes live intervals from IR ops and reuses dead physical registers.
 //! Handles alignment constraints (WMMA needs 8-aligned VGPRs).
 
-use std::collections::{HashMap, BTreeSet};
+use std::collections::HashMap;
 use super::ir::*;
 
 // ============================================================================
@@ -101,13 +101,16 @@ pub fn allocate(
         }
     }
     for (op_idx, op) in ops.iter().enumerate() {
-        if let Op::BranchScc1(target) = op {
-            if let Some(&label_pos) = label_positions.get(target) {
-                if label_pos < op_idx {
-                    // Backward branch = loop: label_pos..op_idx
-                    loop_ranges.push((label_pos, op_idx));
+        match op {
+            Op::BranchScc1(target) | Op::Branch(target) => {
+                if let Some(&label_pos) = label_positions.get(target) {
+                    if label_pos < op_idx {
+                        // Backward branch = loop: label_pos..op_idx
+                        loop_ranges.push((label_pos, op_idx));
+                    }
                 }
             }
+            _ => {}
         }
     }
 
@@ -146,6 +149,13 @@ pub fn allocate(
             sgpr_map.insert(sa.sreg, aligned);
             sgpr_map.insert(SReg(sa.sreg.0 + 1), aligned + 1);
             next_sgpr = aligned + 2;
+        } else if sa.count == 4 {
+            // Buffer resource descriptors need 4-aligned SGPRs
+            let aligned = (next_sgpr + 3) & !3;
+            for i in 0..4u32 {
+                sgpr_map.insert(SReg(sa.sreg.0 + i), aligned + i as u8);
+            }
+            next_sgpr = aligned + 4;
         } else {
             let base = next_sgpr;
             for i in 0..sa.count {
@@ -205,8 +215,10 @@ pub fn allocate(
         let count = intervals[idx].count;
         let align = intervals[idx].alignment;
 
-        // Try to find a suitable range in the free list
+        // Try to find the best-fit range in the free list (smallest suitable range
+        // to minimize fragmentation and reduce peak VGPR count).
         let mut found = None;
+        let mut best_waste_total = u32::MAX; // total waste = alignment_gap + leftover
         for (fi, &(start, fcount)) in free_ranges.iter().enumerate() {
             // Apply alignment
             let aligned = match align {
@@ -217,8 +229,13 @@ pub fn allocate(
             };
             let waste = (aligned - start) as u32;
             if fcount >= count + waste {
-                found = Some((fi, aligned, waste));
-                break;
+                let leftover = fcount - count - waste;
+                let total_waste = waste + leftover;
+                if total_waste < best_waste_total {
+                    best_waste_total = total_waste;
+                    found = Some((fi, aligned, waste));
+                    if total_waste == 0 { break; } // perfect fit — stop early
+                }
             }
         }
 
@@ -266,10 +283,64 @@ pub fn allocate(
         active.push(idx);
     }
 
+    // ── Overflow and occupancy diagnostics ──
+    #[allow(unused_comparisons)]  // max_vgpr is u8 so >255 is always false, but documents intent
+    if max_vgpr > 255 {
+        // Fatal: cannot fit in hardware
+        panic!(
+            "[T0 RegAlloc] FATAL: {} VGPRs needed, hardware max is 256. \
+             Kernel is too complex for register allocation without spilling.\n\
+             Top allocations by size:\n{}",
+            max_vgpr,
+            top_allocs_report(&intervals, 5)
+        );
+    }
+    if next_sgpr > 106 {
+        panic!(
+            "[T0 RegAlloc] FATAL: {} SGPRs needed, hardware max is 106.",
+            next_sgpr
+        );
+    }
+
+    // Occupancy tiers for GFX1100 (RDNA3, Wave32, 256 VGPRs/SIMD):
+    //   ≤64  VGPRs → 16 waves/SIMD (max occupancy)
+    //   ≤96  VGPRs → 10 waves/SIMD
+    //   ≤128 VGPRs → 8 waves/SIMD
+    //   ≤192 VGPRs → 4 waves/SIMD
+    //   ≤256 VGPRs → 2 waves/SIMD (min occupancy)
+    let (waves, tier) = if max_vgpr <= 64 { (16, "excellent") }
+        else if max_vgpr <= 96 { (10, "good") }
+        else if max_vgpr <= 128 { (8, "fair") }
+        else if max_vgpr <= 192 { (4, "low") }
+        else { (2, "critical") };
+
+    if max_vgpr > 128 {
+        eprintln!(
+            "[T0 RegAlloc] Kernel uses {} VGPRs, {} SGPRs → {} waves/SIMD ({})",
+            max_vgpr, next_sgpr, waves, tier
+        );
+        eprintln!("  Top register-heavy allocations:\n{}", top_allocs_report(&intervals, 3));
+    }
+
     RegAlloc {
         total_vgprs: max_vgpr,
         total_sgprs: next_sgpr,
         vgpr_map,
         sgpr_map,
     }
+}
+
+/// Report the top N largest VGPR allocations for diagnostics.
+fn top_allocs_report(intervals: &[LiveInterval], n: usize) -> String {
+    let mut sorted: Vec<_> = intervals.iter()
+        .filter(|i| i.count > 1)
+        .collect();
+    sorted.sort_by(|a, b| b.count.cmp(&a.count));
+    sorted.iter().take(n)
+        .map(|i| format!("    VReg({}) × {} regs (phys v{}..v{})",
+            i.vreg_base.0, i.count,
+            i.phys_base.unwrap_or(255),
+            i.phys_base.unwrap_or(255) as u32 + i.count - 1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

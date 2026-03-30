@@ -1,27 +1,26 @@
-//! Benchmark all T0 GEMM variants to find the fastest
+//! Benchmark T0 parameterized GEMM variants — tile size comparison
 //!
 //! Run: cargo run --example bench_gemm_variants --features rocm --release
 
-use t0_gpu::t0::{GFX1100Schedule, Schedule, Target};
-use t0_gpu::t0::math;
+use t0_gpu::t0::Target;
+use t0_gpu::t0::gemm_gen::{GemmConfig, generate};
 
 fn main() -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════════════════════════════╗");
-    eprintln!("║  T0 GEMM Variant Benchmark — RX 7900 XTX                   ║");
+    eprintln!("║  T0 GEMM Tile Variant Benchmark — RX 7900 XTX              ║");
     eprintln!("╚══════════════════════════════════════════════════════════════╝");
 
-    let sched = GFX1100Schedule {};
-
-    // Compile all variants
-    let variants: Vec<(&str, _)> = vec![
-        ("matmul (basic)", math::matmul(&sched)),
-        ("matmul_lds_db (LDS+DB)", math::matmul_lds_db(&sched)),
-        ("matmul_direct (zero-LDS)", math::matmul_direct(&sched)),
+    // Compare different tile configurations from gemm_gen
+    let variants: Vec<(&str, GemmConfig)> = vec![
+        ("32x64_k16", GemmConfig::tile_32x64_k16()),
+        ("64x64_k16", GemmConfig::tile_64x64_k16()),
+        ("128x64_k16", GemmConfig::tile_128x64_k16()),
     ];
 
     #[cfg(feature = "rocm")]
     {
         use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+        use t0_gpu::t0::gemm_gen::compute_grid_auto;
 
         let device = KfdDevice::open()?;
         let queue = device.create_queue()?;
@@ -32,55 +31,47 @@ fn main() -> Result<(), String> {
             (1024, 1024, 1024),
             (2048, 2048, 2048),
             (4096, 4096, 4096),
-            (128, 1024, 4096),
         ];
 
-        for (name, kernel_ir) in &variants {
+        for (name, cfg) in &variants {
+            let kernel_ir = generate(cfg);
             let elf = kernel_ir.compile(Target::GFX1100)?;
 
-            let lds_size = if name.contains("lds_db") { 6144 } else { 0 };
             let gpu_kernel = GpuKernel::load(&device, &elf, &KernelLoadConfig {
-                workgroup_size: [64, 1, 1],
-                lds_size,
+                workgroup_size: [cfg.wg_size, 1, 1],
+                lds_size: cfg.lds_total(),
             })?;
 
-            eprintln!("\n── {} ({} bytes) ──", name, elf.len());
+            eprintln!("\n── {} ({} bytes, wg={}, lds={}) ──",
+                name, elf.len(), cfg.wg_size, cfg.lds_total());
             eprintln!("{:>6} {:>6} {:>6} | {:>8} {:>8}", "M", "K", "N", "Time", "TFLOPS");
 
             for &(m, k, n) in &test_sizes {
-                let x_bytes = (m as usize) * (k as usize) * 2;
-                let w_bytes = (n as usize) * (k as usize) * 2;
-                let y_bytes = (m as usize) * (n as usize) * 4;
+                let x_buf = device.alloc_vram((m * k * 2) as usize)?;
+                let w_buf = device.alloc_vram((n * k * 2) as usize)?;
+                let sk = cfg.split_k.unwrap_or(1);
+                let y_buf = device.alloc_vram((m * n * 4 * sk) as usize)?;
 
-                let x_buf = device.alloc_vram(x_bytes)?;
-                let w_buf = device.alloc_vram(w_bytes)?;
-                let y_buf = device.alloc_vram(y_bytes)?;
-
-                // Fill bf16 1.0
-                let data = vec![0x3F80u16; std::cmp::max(m*k, n*k) as usize];
+                // Fill with bf16 1.0
+                let data = vec![0x3C00u16; (m * k) as usize];
                 x_buf.write(unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, x_bytes)
+                    std::slice::from_raw_parts(data.as_ptr() as *const u8, (m * k * 2) as usize)
                 });
+                let data_w = vec![0x3C00u16; (n * k) as usize];
                 w_buf.write(unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const u8, w_bytes)
+                    std::slice::from_raw_parts(data_w.as_ptr() as *const u8, (n * k * 2) as usize)
                 });
 
-                let tiles_m = m / 32;
-                let tiles_n = n / 64;
-                let grid_x = tiles_n * 64;
-                let grid_y = tiles_m;
-
-                let mut ka = [0u8; 32];
-                ka[0..8].copy_from_slice(&x_buf.gpu_addr().to_le_bytes());
-                ka[8..16].copy_from_slice(&w_buf.gpu_addr().to_le_bytes());
-                ka[16..24].copy_from_slice(&y_buf.gpu_addr().to_le_bytes());
-                ka[24..28].copy_from_slice(&k.to_le_bytes());
-                ka[28..32].copy_from_slice(&n.to_le_bytes());
+                let ka = t0_gpu::t0::gemm_gen::build_kernargs(
+                    x_buf.gpu_addr(), w_buf.gpu_addr(), y_buf.gpu_addr(),
+                    k, n, m, cfg,
+                );
+                let (gx, gy) = compute_grid_auto(cfg, m, n);
 
                 // Warmup
                 for _ in 0..5 {
                     let ka_buf = pool.write_kernargs(0, &ka);
-                    queue.submit(&gpu_kernel, [grid_x, grid_y, 1], ka_buf);
+                    queue.submit(&gpu_kernel, [gx, gy, 1], ka_buf);
                     queue.wait_idle()?;
                 }
 
@@ -89,7 +80,7 @@ fn main() -> Result<(), String> {
                 let start = std::time::Instant::now();
                 for i in 0..n_iter {
                     let ka_buf = pool.write_kernargs(i % 16, &ka);
-                    queue.submit(&gpu_kernel, [grid_x, grid_y, 1], ka_buf);
+                    queue.submit(&gpu_kernel, [gx, gy, 1], ka_buf);
                     queue.wait_idle()?;
                 }
                 let avg_us = start.elapsed().as_micros() as f64 / n_iter as f64;

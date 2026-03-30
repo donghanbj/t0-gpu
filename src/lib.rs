@@ -1,22 +1,34 @@
+#![allow(dead_code)]           // Reserved hardware constants/fields
+#![allow(non_camel_case_types)] // WmmaFormat: BF16_F32 etc.
+#![allow(unreachable_patterns)] // Redundant Op match arms in asm_emitter
+
 //! # T0-GPU
 //!
 //! RDNA3 (GFX1100) 裸金属 GPU 内核编译器 & KFD 运行时。
 //!
+//! - **DSL**: 声明式内核定义 → 自动编译到 GFX1100 ISA
 //! - **T0 编译器**: 数学 IR → GFX1100 ISA → AMD HSA ELF
 //! - **KFD 运行时**: 直接通过 /dev/kfd 驱动接口与 GPU 通信
 //!
-//! ## 示例
+//! ## 示例 (DSL API)
 //! ```ignore
-//! use t0_gpu::t0::{T0Kernel, Target, GFX1100Schedule};
-//! use t0_gpu::t0::math;
+//! use t0_gpu::prelude::*;
 //!
-//! // 编译一个 bf16 GEMM 内核
-//! let kernel = math::matmul_direct(&GFX1100Schedule {});
-//! let elf = kernel.compile(Target::GFX1100).unwrap();
+//! // GEMM — 自动选择最优配置
+//! let kernel = gemm(1024, 1024, 4096).compile()?;
+//!
+//! // 融合操作
+//! let fused = KernelBuilder::new(Target::GFX1100)
+//!     .op(Op::SiLU)
+//!     .op(Op::Mul)
+//!     .compile()?;
 //! ```
 
 // ── T0 编译器 ──
 pub mod t0;
+
+// ── 便捷导入 ──
+pub mod prelude;
 
 // ── ISA 编码器 ──
 pub mod rdna3_asm;
@@ -27,3 +39,7 @@ pub mod rdna3_code_object;
 // ── KFD 裸金属运行时 ──
 #[cfg(feature = "rocm")]
 pub mod kfd;
+
+// ── Ignis — GPU-native autodiff framework ──
+#[cfg(feature = "rocm")]
+pub mod ignis;

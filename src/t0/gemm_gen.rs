@@ -19,9 +19,39 @@ use super::compile::T0Kernel;
 // Configuration
 // ============================================================================
 
+/// GEMM transpose mode — determines how input matrices are laid out in memory.
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+pub enum GemmTranspose {
+    /// Y[M,N] = A[M,K] @ B[N,K]^T — both row-major with stride=K (default, forward GEMM)
+    NT,
+    /// Y[M,N] = A[M,K] @ B[K,N]   — A stride=K, B stride=N (backward dX = dY @ W)
+    NN,
+}
+
+impl Default for GemmTranspose {
+    fn default() -> Self { GemmTranspose::NT }
+}
+
+/// GEMM epilogue operation — fused into the store phase after WMMA accumulation.
+///
+/// Each variant determines what happens to each accumulator value before
+/// it is written to global memory. Bias is loaded from a separate pointer
+/// (passed as kernarg), broadcast across rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum EpilogueOp {
+    /// Store f32 accumulators directly (no fusion). Default behavior.
+    #[default]
+    StoreF32,
+    /// acc += bias[col]; store f32
+    BiasAddStoreF32,
+    /// acc += bias[col]; acc = max(acc, 0); store f32
+    BiasAddReluStoreF32,
+}
+
 /// GEMM kernel configuration — each combination produces a different optimized kernel.
 ///
-/// Y[M,N] = X[M,K] @ WT[N,K]^T  (bf16 in, f32 accumulate, f32 out)
+/// NT mode: Y[M,N] = X[M,K] @ WT[N,K]^T  (bf16 in, f32 accumulate, f32 out)
+/// NN mode: Y[M,N] = X[M,K] @ B[K,N]     (bf16 in, f32 accumulate, f32 out)
 #[derive(Clone, Debug)]
 pub struct GemmConfig {
     /// Output tile rows per workgroup (must be multiple of 32).
@@ -47,67 +77,71 @@ pub struct GemmConfig {
     pub swap_grid: bool,
     /// WGP mode: workgroup spans 2 CUs = 128KB LDS + 4 SIMDs + doubled VGPR pool.
     pub wgp_mode: bool,
+    /// Transpose mode: NT (default, Y=A@B^T) or NN (Y=A@B).
+    pub transpose: GemmTranspose,
+    /// Epilogue operation fused into the store phase.
+    pub epilogue: EpilogueOp,
 }
 
 impl GemmConfig {
     /// 16×64, K=16, LDS double-buffered (small-M: 1 wave, max M-parallelism)
     pub fn tile_16x64_k16() -> Self {
-        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 16, tile_n: 64, tile_k: 16, wg_size: 32, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=16, no LDS (equivalent to `matmul`)
     pub fn tile_32x64_direct() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: false, double_buffer: false, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=16, LDS double-buffered (equivalent to `matmul_lds_db`)
     pub fn tile_32x64_k16() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 32, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×64, K=32, LDS double-buffered (small-M optimized with deeper K unroll)
     pub fn tile_32x64_k32() -> Self {
-        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 32, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 32×128, K=16, LDS double-buffered (small-M: wide N for more compute per WG)
     pub fn tile_32x128_k16() -> Self {
-        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 32, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=16, LDS double-buffered (equivalent to `matmul_64x64_lds_db`)
     pub fn tile_64x64_k16() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=32, LDS double-buffered (equivalent to `matmul_64x64_k32`)
     pub fn tile_64x64_k32() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 64, tile_n: 64, tile_k: 32, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×64, K=16, LDS double-buffered (higher compute density)
     pub fn tile_128x64_k16() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×128, K=16, LDS double-buffered (wider N tiles)
     pub fn tile_64x128_k16() -> Self {
-        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 64, tile_n: 128, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×64, K=32 (max compute density)
     pub fn tile_128x64_k32() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 128, tile_n: 64, tile_k: 32, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×128, K=16, LDS double-buffered (highest AI = 64 FLOP/byte)
     /// Acc VGPRs: 4 row_blocks × 8 col_tiles × 8 = 256 — BUT each wave only uses
     /// n_row_blocks(2) × n_col_tiles(8) × 8 = 128 VGPRs. Tight but feasible.
     pub fn tile_128x128_k16() -> Self {
-        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 128, tile_n: 128, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×64, K=64, LDS double-buffered (4× fewer loop iterations)
     pub fn tile_64x64_k64() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 64, tile_n: 64, tile_k: 64, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 1, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 128×128 via 2×(128×64) column passes. Effective AI=64.
     /// X data reused from L2 cache on second pass.
     pub fn tile_128x128_2pass() -> Self {
-        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 128, tile_n: 64, tile_k: 16, wg_size: 128, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
     /// 64×128 via 2×(64×64) column passes. Effective AI=43.
     pub fn tile_64x128_2pass() -> Self {
-        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false }
+        Self { tile_m: 64, tile_n: 64, tile_k: 16, wg_size: 64, use_lds: true, double_buffer: true, split_k: None, lds_pad: 0, n_col_passes: 2, swap_grid: true, wgp_mode: false, transpose: GemmTranspose::NT, epilogue: EpilogueOp::default() }
     }
 
     /// Number of WMMA column tiles = tile_n / 16
@@ -150,6 +184,25 @@ impl GemmConfig {
     pub fn wmma_per_k_tile(&self) -> usize {
         self.n_row_blocks() * self.n_col_tiles() * self.k_sub_steps() as usize
     }
+    /// Estimated VGPR usage for LDS double-buffer kernel.
+    /// Used to reject infeasible configs before compilation (GFX1100: 256 VGPRs max).
+    pub fn estimated_vgprs(&self) -> u32 {
+        let nrb = self.n_row_blocks() as u32;
+        let nct = self.n_col_tiles() as u32;
+        let x_lpt = self.x_bytes_per_thread() / 16; // b128 loads for X
+        let wt_lpt = self.wt_bytes_per_thread() / 16; // b128 loads for WT
+        let acc = nrb * nct * 8;          // accumulator groups
+        let x_frag = nrb * 8;              // X WMMA fragments
+        let wt_frag = nct * 8;             // WT WMMA fragments
+        let gmem_x = x_lpt * 4;            // GMEM load regs for X (b128 = 4 VGPRs)
+        let gmem_wt = wt_lpt * 4;          // GMEM load regs for WT
+        let addr_temps = 49;               // address computation, LDS offsets, store temps
+        acc + x_frag + wt_frag + gmem_x + gmem_wt + addr_temps
+    }
+    /// Check if this config is feasible on GFX1100 (VGPR limit = 256).
+    pub fn is_feasible(&self) -> bool {
+        self.estimated_vgprs() <= 256
+    }
     /// Descriptive name
     pub fn name(&self) -> String {
         let lds_tag = if self.use_lds {
@@ -164,7 +217,13 @@ impl GemmConfig {
         } else { String::new() };
         let grid_tag = if !self.swap_grid { "_mg" } else { "" }; // mg = M-on-grid-X
         let wgp_tag = if self.wgp_mode { "_wgp" } else { "" };
-        format!("t0_gemm_{}x{}_k{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, lds_tag, sk_tag, pass_tag, grid_tag, wgp_tag)
+        let trans_tag = if self.transpose == GemmTranspose::NN { "_nn" } else { "" };
+        let epi_tag = match self.epilogue {
+            EpilogueOp::StoreF32 => "",
+            EpilogueOp::BiasAddStoreF32 => "_bias",
+            EpilogueOp::BiasAddReluStoreF32 => "_bias_relu",
+        };
+        format!("t0_gemm_{}x{}_k{}{}{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, lds_tag, sk_tag, pass_tag, grid_tag, wgp_tag, trans_tag, epi_tag)
     }
 }
 
@@ -192,24 +251,42 @@ pub fn sweep_configs() -> Vec<GemmConfig> {
 /// Returns (kernel, lds_size, workgroup_size, grid_fn) where grid_fn
 /// computes grid dimensions for a given (M, N).
 pub fn generate(cfg: &GemmConfig) -> T0Kernel {
-    if cfg.use_lds && cfg.double_buffer {
+    // Safety check: reject configs that exceed GFX1100 VGPR limit
+    let est_vgprs = cfg.estimated_vgprs();
+    if est_vgprs > 256 {
+        panic!(
+            "[gemm_gen] Config '{}' requires ~{} VGPRs (max 256). \
+             Use n_col_passes=2 or smaller tile. Breakdown: acc={}, x_frag={}, wt_frag={}, gmem={}, temps=49",
+            cfg.name(), est_vgprs,
+            cfg.n_row_blocks() as u32 * cfg.n_col_tiles() as u32 * 8,
+            cfg.n_row_blocks() as u32 * 8,
+            cfg.n_col_tiles() as u32 * 8,
+            cfg.x_bytes_per_thread() / 16 * 4 + cfg.wt_bytes_per_thread() / 16 * 4,
+        );
+    }
+    let mut k = if cfg.use_lds && cfg.double_buffer {
         generate_lds_db(cfg)
     } else {
         generate_direct(cfg)
-    }
+    };
+    // GEMM kernels use carefully hand-crafted instruction sequences
+    // (cooperative loads, barriers, LDS double-buffering, WMMA scheduling).
+    // The optimization passes (DCE, CSE, instruction scheduling, etc.) are
+    // designed for DSL/tile-IR kernels and will break these patterns.
+    k.set_skip_optimize(true);
+    // SSA regalloc is safe for GEMM: insert_spill_reloads() places spill slots
+    // at existing_lds + offset, avoiding overlap with the GEMM double-buffer.
+    // The spill infrastructure (compile.rs L917-920) correctly passes lds_size.
+    k
 }
 
 /// Returns (grid_x, grid_y) for a given (M, N) based on this config.
-/// Panics if M/N are not divisible by tile dimensions.
+/// Uses ceiling division — caller must ensure output buffer is large enough
+/// for the padded tile dimensions (m_padded * n_padded elements).
 pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
     let effective_n = cfg.tile_n * cfg.n_col_passes;
-    assert!(m % cfg.tile_m == 0,
-        "M={} not divisible by tile_m={}", m, cfg.tile_m);
-    assert!(n % effective_n == 0,
-        "N={} not divisible by effective_n={} (tile_n={} × n_col_passes={})",
-        n, effective_n, cfg.tile_n, cfg.n_col_passes);
-    let tiles_m = m / cfg.tile_m;
-    let tiles_n = n / effective_n;
+    let tiles_m = (m + cfg.tile_m - 1) / cfg.tile_m;
+    let tiles_n = (n + effective_n - 1) / effective_n;
     if cfg.swap_grid {
         (tiles_n * cfg.wg_size, tiles_m)
     } else {
@@ -217,17 +294,13 @@ pub fn compute_grid(cfg: &GemmConfig, m: u32, n: u32) -> (u32, u32) {
     }
 }
 
-/// Grid with split-K. Panics on invalid dimensions.
+/// Grid with split-K. Uses ceiling division for M/N.
 pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (u32, u32) {
     let effective_n = cfg.tile_n * cfg.n_col_passes;
-    assert!(m % cfg.tile_m == 0,
-        "M={} not divisible by tile_m={}", m, cfg.tile_m);
-    assert!(n % effective_n == 0,
-        "N={} not divisible by effective_n={}", n, effective_n);
     assert!(split_k > 0 && split_k.is_power_of_two(),
         "split_k={} must be power of 2", split_k);
-    let tiles_m = m / cfg.tile_m;
-    let tiles_n = n / effective_n;
+    let tiles_m = (m + cfg.tile_m - 1) / cfg.tile_m;
+    let tiles_n = (n + effective_n - 1) / effective_n;
     if cfg.swap_grid {
         (tiles_n * cfg.wg_size, tiles_m * split_k)
     } else {
@@ -241,12 +314,21 @@ pub fn compute_grid_split_k(cfg: &GemmConfig, m: u32, n: u32, split_k: u32) -> (
 
 /// Select the optimal GEMM kernel configuration for given matrix dimensions.
 ///
+/// Uses the cost_model exhaustive search (400+ candidates × hardware model)
+/// to pick the best config. Falls back to the hand-tuned heuristic if the
+/// cost model finds no feasible solution.
+pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
+    super::cost_model::predict_best(m, k, n)
+}
+
+/// Legacy hand-tuned heuristic (preserved as fallback and for A/B comparison).
+///
 /// Based on empirical sweep data (RX 7900 XTX, GFX1100):
 /// - Tiny squares (≤512): split_k=4 k32 for CU fill
 /// - Medium squares (1024): 64×64 k16
 /// - Large squares (≥2048): k32 split2 or 128×64 k32
 /// - Rectangular (small M, big K): split_k=8 k16
-pub fn auto_select(m: u32, k: u32, n: u32) -> GemmConfig {
+pub fn auto_select_legacy(m: u32, k: u32, n: u32) -> GemmConfig {
     let mn = (m as u64) * (n as u64);
 
     // Optimal configs from benchmark sweep (2026-03-21, post-WGP optimization).
@@ -347,35 +429,204 @@ pub fn build_kernargs(
     ka
 }
 
+/// Build 48-byte kernarg buffer for a GEMM dispatch with epilogue fusion.
+///
+/// Layout (extends 40-byte layout):
+/// [X:u64, WT:u64, Y:u64, K:u32, N:u32, split_k_shift:u32, y_split_stride:u32, bias:u64]
+///
+/// Set bias_addr=0 for no bias (EpilogueOp::StoreF32).
+pub fn build_kernargs_with_bias(
+    x_addr: u64, wt_addr: u64, y_addr: u64,
+    k: u32, n: u32, m: u32,
+    cfg: &GemmConfig,
+    bias_addr: u64,
+) -> [u8; 48] {
+    let sk = cfg.split_k.unwrap_or(1);
+    let y_stride = if sk > 1 { m * n * 4 } else { 0 };
+    let mut ka = [0u8; 48];
+    ka[0..8].copy_from_slice(&x_addr.to_le_bytes());
+    ka[8..16].copy_from_slice(&wt_addr.to_le_bytes());
+    ka[16..24].copy_from_slice(&y_addr.to_le_bytes());
+    ka[24..28].copy_from_slice(&k.to_le_bytes());
+    ka[28..32].copy_from_slice(&n.to_le_bytes());
+    ka[32..36].copy_from_slice(&0u32.to_le_bytes());
+    ka[36..40].copy_from_slice(&y_stride.to_le_bytes());
+    ka[40..48].copy_from_slice(&bias_addr.to_le_bytes());
+    ka
+}
+
+// ============================================================================
+// GEMM Backward Helpers
+// ============================================================================
+//
+// Given forward: Y[M,N] = X[M,K] @ W[N,K]^T   (NT GEMM)
+//
+// Backward data:   dX[M,K] = dY[M,N] @ W[N,K]^T
+//   → This IS an NT GEMM!  A=dY, B=W, M_dim=M, K_dim=N, N_dim=K
+//   → W is already in [N,K] layout from forward. Zero transpose needed.
+//
+// Backward weight: dW[N,K] = dY^T[N,M] @ X[M,K]^T
+//   → Need: transpose dY[M,N]→dY_T[N,M], transpose X[M,K]→X_T[K,M]
+//   → Then NT GEMM: A=dY_T[N,M], B=X_T[K,M], M_dim=N, K_dim=M, N_dim=K
+//   → Result: dW[N,K]
+//
+// Both use the SAME NT kernel generated by `generate()`. Only dimensions differ.
+
+/// Select config for backward-data GEMM: dX[M,K] = dY[M,N] @ WT,
+/// where forward was Y = X @ WT^T, so WT is stored as [N,K].
+///
+/// **Caller must transpose WT[N,K] → W[K,N] first!**
+/// Then NT GEMM: A=dY[M,N], B=W[K,N], output=dX[M,K]
+///   → GEMM dimensions: M_gemm=M, K_gemm=N (contraction), N_gemm=K (output)
+///   → B has [K, N] layout with stride=N per row, K_gemm=N ✓
+pub fn auto_select_backward_data(m: u32, n_orig: u32, k_orig: u32) -> GemmConfig {
+    // dX = dY[M, N_orig] @ W[K_orig, N_orig]^T
+    // GEMM: M=M, K=N_orig (contraction), N=K_orig (output cols)
+    auto_select(m, n_orig, k_orig)
+}
+
+/// Build kernargs for backward-data: dX = dY @ W^T
+///
+/// **`w_addr` must point to the TRANSPOSED weight W[K_orig, N_orig], NOT WT[N_orig, K_orig]!**
+///
+/// - `dy_addr`: GPU addr of dY[M, N_orig] (bf16, row-major, stride=N_orig)
+/// - `w_addr`:  GPU addr of W[K_orig, N_orig] = WT^T (bf16, row-major, stride=N_orig)
+/// - `dx_addr`: GPU addr of dX[M, K_orig] (f32, output)
+pub fn build_kernargs_backward_data(
+    dy_addr: u64, w_addr: u64, dx_addr: u64,
+    m: u32, n_orig: u32, k_orig: u32,
+    cfg: &GemmConfig,
+) -> [u8; 40] {
+    // NT GEMM: A=dY[M,N], B=W[K,N] (transposed WT), K_contract=N, N_out=K
+    build_kernargs(dy_addr, w_addr, dx_addr, n_orig, k_orig, m, cfg)
+}
+
+/// Grid dimensions for backward-data GEMM.
+pub fn compute_grid_backward_data(cfg: &GemmConfig, m: u32, k_orig: u32) -> (u32, u32) {
+    // NT GEMM output is [M, K_orig], grid tiles over M and K_orig
+    compute_grid_auto(cfg, m, k_orig)
+}
+
+/// Select config for backward-weight GEMM: dW[N,K] = dY_T[N,M] @ X_T[K,M]^T
+///
+/// **Caller must pre-transpose dY and X before dispatching!**
+///   - dY[M,N]   → dY_T[N,M]   (use T0 transpose kernel)
+///   - X[M,K]    → X_T[K,M]    (use T0 transpose kernel)
+///
+/// Then: NT GEMM A=dY_T, B=X_T, M_gemm=N, K_gemm=M, N_gemm=K
+pub fn auto_select_backward_weight(m: u32, n_orig: u32, k_orig: u32) -> GemmConfig {
+    // dW = dY_T[N_orig, M] @ X_T[K_orig, M]^T
+    // GEMM: M=N_orig, K=M (contraction), N=K_orig (output cols)
+    auto_select(n_orig, m, k_orig)
+}
+
+/// Build kernargs for backward-weight: dW = dY_T @ X_T^T
+///
+/// **Inputs must already be transposed!**
+/// - `dy_t_addr`: GPU addr of dY^T[N_orig, M] (bf16, row-major, stride=M)
+/// - `x_t_addr`:  GPU addr of X^T[K_orig, M] (bf16, row-major, stride=M)
+/// - `dw_addr`:   GPU addr of dW[N_orig, K_orig] (f32, output)
+pub fn build_kernargs_backward_weight(
+    dy_t_addr: u64, x_t_addr: u64, dw_addr: u64,
+    m: u32, n_orig: u32, k_orig: u32,
+    cfg: &GemmConfig,
+) -> [u8; 40] {
+    // NT GEMM: A=dY_T[N,M], B=X_T[K,M], K_contract=M, N_out=K_orig
+    build_kernargs(dy_t_addr, x_t_addr, dw_addr, m, k_orig, n_orig, cfg)
+}
+
+/// Grid dimensions for backward-weight GEMM.
+pub fn compute_grid_backward_weight(cfg: &GemmConfig, n_orig: u32, k_orig: u32) -> (u32, u32) {
+    // NT GEMM output is [N_orig, K_orig]
+    compute_grid_auto(cfg, n_orig, k_orig)
+}
+
 #[cfg(test)]
 mod auto_select_tests {
     use super::*;
 
     #[test]
     fn test_auto_select_sizes() {
-        // Small square → split-K, 64×64
+        // Small square: should produce a valid config
         let c = auto_select(256, 256, 256);
-        assert!(c.split_k.unwrap_or(1) > 1, "small should use split-K");
+        assert!(c.tile_m >= 16 && c.tile_m <= 256, "tile_m={}", c.tile_m);
+        assert!(c.tile_n >= 32 && c.tile_n <= 128, "tile_n={}", c.tile_n);
+        assert!(c.wg_size >= 32, "wg_size={}", c.wg_size);
+        eprintln!("256×256: {}", c.name());
+
+        // Medium square: should use >=64 tile_m
+        let c = auto_select(1024, 1024, 1024);
+        assert!(c.tile_m >= 64, "1024² tile_m should be >= 64: {}", c.tile_m);
+        assert_eq!(c.tile_k, 16);
+        eprintln!("1024×1024: {}", c.name());
+
+        // Very large: should use large tiles
+        let c = auto_select(8192, 8192, 8192);
+        assert!(c.tile_m >= 64, "8192³ tile_m should be >= 64: {}", c.tile_m);
+        eprintln!("8192×8192: {}", c.name());
+
+        // Thin M: tile_m should divide M
+        let c = auto_select(128, 4096, 4096);
+        assert!(128 % c.tile_m == 0, "tile_m={} should divide M=128", c.tile_m);
+        eprintln!("128×4096: {}", c.name());
+    }
+
+    /// Verify auto_select_legacy still works (preserved for A/B comparison)
+    #[test]
+    fn test_auto_select_legacy_preserved() {
+        let c = auto_select_legacy(256, 256, 256);
+        assert!(c.split_k.unwrap_or(1) > 1, "legacy small should use split-K");
         assert_eq!(c.tile_m, 64);
 
-        // Medium → 128×64 k16 WGP, sk=2
-        let c = auto_select(1024, 1024, 1024);
+        let c = auto_select_legacy(1024, 1024, 1024);
         assert_eq!(c.tile_m, 128);
-        assert_eq!(c.tile_k, 16);
-        assert!(c.wgp_mode, "1024² should use WGP");
-        assert_eq!(c.split_k, Some(2));
+        assert!(c.wgp_mode);
+    }
+}
 
-        // Very large → 128×64 k16 WGP, sk=8
-        let c = auto_select(8192, 8192, 8192);
-        assert!(c.split_k.is_some(), "large should use split-K");
-        assert!(c.wgp_mode, "large should use WGP");
+#[cfg(test)]
+mod epilogue_tests {
+    use super::*;
 
-        // Thin M → 128×64_k16_mg_wgp_sk4
-        let c = auto_select(128, 4096, 4096);
-        assert_eq!(c.split_k, Some(4));
-        assert_eq!(c.tile_m, 128);
-        assert!(c.wgp_mode, "thin should use WGP");
-        assert!(!c.swap_grid, "thin should use M-on-X (swap_grid=false)");
+    #[test]
+    fn test_epilogue_name_tags() {
+        let mut cfg = GemmConfig::tile_32x64_k16();
+        assert!(cfg.name().contains("t0_gemm_32x64_k16"));
+        assert!(!cfg.name().contains("_bias"));
+
+        cfg.epilogue = EpilogueOp::BiasAddStoreF32;
+        assert!(cfg.name().ends_with("_bias"), "name={}", cfg.name());
+
+        cfg.epilogue = EpilogueOp::BiasAddReluStoreF32;
+        assert!(cfg.name().ends_with("_bias_relu"), "name={}", cfg.name());
+    }
+
+    #[test]
+    fn test_epilogue_bias_generates() {
+        let mut cfg = GemmConfig::tile_32x64_k16();
+        cfg.epilogue = EpilogueOp::BiasAddStoreF32;
+        // generate() should succeed without panic
+        let _kernel = generate(&cfg);
+    }
+
+    #[test]
+    fn test_epilogue_bias_relu_generates() {
+        let mut cfg = GemmConfig::tile_32x64_k16();
+        cfg.epilogue = EpilogueOp::BiasAddReluStoreF32;
+        let _kernel = generate(&cfg);
+    }
+
+    #[test]
+    fn test_kernargs_with_bias_layout() {
+        let cfg = GemmConfig::tile_32x64_k16();
+        let ka = build_kernargs_with_bias(
+            0x1000, 0x2000, 0x3000,
+            64, 64, 128, &cfg, 0x4000,
+        );
+        assert_eq!(ka.len(), 48);
+        // Verify bias_ptr at bytes 40..48
+        let bias = u64::from_le_bytes(ka[40..48].try_into().unwrap());
+        assert_eq!(bias, 0x4000);
     }
 }
 
@@ -387,7 +638,7 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     let mut k = T0Kernel::new(&cfg.name());
     let n_col_tiles = cfg.n_col_tiles();
     let n_row_blocks = cfg.n_row_blocks();
-    let n_waves = cfg.n_waves();
+    let _n_waves = cfg.n_waves();
     let rows_per_wave = cfg.rows_per_wave();
 
     let lds_x = cfg.lds_x_size();
@@ -409,8 +660,16 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
     let y_ptr = k.arg_ptr("Y");
     let k_dim = k.arg_u32("K");
     let n_dim = k.arg_u32("N");
-    let split_k_shift_arg = k.arg_u32("split_k_shift");  // reserved (unused, kept for layout)
+    let _split_k_shift_arg = k.arg_u32("split_k_shift");  // reserved (unused, kept for layout)
     let y_split_stride_arg = k.arg_u32("y_split_stride"); // M*N*4 for split, 0 for normal
+
+    // Epilogue: bias pointer (only declared when epilogue needs it)
+    let bias_ptr = if cfg.epilogue != EpilogueOp::StoreF32 {
+        let bp = k.arg_ptr("bias");
+        Some(bp)
+    } else {
+        None
+    };
     k.emit_arg_loads();
 
     // ── TGIDs with split-K support ──
@@ -825,8 +1084,18 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                 let k_byte_within = (ks * 32) as u16;
 
                 if n_row_blocks >= 2 {
-                    // ── INTERLEAVED SCHEDULE ──
-                    // Phase 1: Load X[0] + all WT frags
+                    // ── INTERLEAVED SCHEDULE with refined waitcnt + WMMA ILP ──
+                    //
+                    // Load order (C = 2 + n_col_tiles*2 total ds_load_b128):
+                    //   [0,1]: x_frags[0] (lo, hi)
+                    //   [2,3]: wt_frags[0] (lo, hi)
+                    //   [4,5]: wt_frags[1] ...
+                    //   [2c+2, 2c+3]: wt_frags[c]
+                    //
+                    // LGKM counter is FIFO: lgkmcnt(N) means "≤N outstanding"
+                    // → first (C-N) loads completed.
+
+                    // ── Issue ALL Phase-1 ds_loads ──
                     $k.v_add_u32(tmp_frag_addr, x_lds_reads[0], $buf_off);
                     $k.ds_load_b128(x_frags[0], tmp_frag_addr, k_byte_within);
                     $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
@@ -836,50 +1105,65 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
                         $k.ds_load_b128(wt_frags[c], tmp_frag_addr, base_off + k_byte_within);
                         $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
                     }
-                    $k.wait_lgkmcnt(0);
+                    // Total in-flight: C = 2 + n_col_tiles * 2
 
-                    // Phase 2: WMMA X[0]×WT[all] while loading X[1]
-                    // Issue X[1] load BEFORE starting WMMA — hides LDS latency behind compute
-                    $k.v_add_u32(tmp_frag_addr, x_lds_reads[1], $buf_off);
-                    $k.ds_load_b128(x_frags[1], tmp_frag_addr, k_byte_within);
-                    $k.ds_load_b128(VReg(x_frags[1].0 + 4), tmp_frag_addr, k_byte_within + 16);
-                    // WMMA with X[0] executes concurrently with X[1] LDS loads
+                    // ── Graduated waitcnt: dispatch WMMA as operands become ready ──
+                    // For WMMA x_frags[0] × wt_frags[c], we need loads [0..2c+3].
+                    // lgkmcnt(C - (2c+4)) ensures those loads are done.
+                    let total_loads = (2 + n_col_tiles * 2) as u8;
                     for c in 0..n_col_tiles {
+                        let loads_needed = (2 * c + 4) as u8; // x[0](2) + wt[0..c](2*(c+1))
+                        let remaining = total_loads.saturating_sub(loads_needed);
+                        $k.wait_lgkmcnt(remaining);
                         let a_idx = 0 * n_col_tiles + c;
                         $k.wmma_bf16_f32(acc[a_idx], x_frags[0], wt_frags[c], acc[a_idx]);
                     }
-                    $k.wait_lgkmcnt(0);
 
-                    // Phase 3: remaining row blocks
-                    for r in 1..n_row_blocks {
-                        if r + 1 < n_row_blocks {
-                            // Prefetch next X frag
-                            $k.v_add_u32(tmp_frag_addr, x_lds_reads[r + 1], $buf_off);
-                            $k.ds_load_b128(x_frags[r + 1], tmp_frag_addr, k_byte_within);
-                            $k.ds_load_b128(VReg(x_frags[r + 1].0 + 4), tmp_frag_addr, k_byte_within + 16);
-                        }
+                    // ── Phase 2: load X[1], then WMMA X[1]×WT[all] ──
+                    // X[1] loads overlap with last WMMA(s) above (WMMA ~32 cyc each)
+                    $k.v_add_u32(tmp_frag_addr, x_lds_reads[1], $buf_off);
+                    $k.ds_load_b128(x_frags[1], tmp_frag_addr, k_byte_within);
+                    $k.ds_load_b128(VReg(x_frags[1].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    // Wait for X[1] — only 2 loads in flight
+                    $k.wait_lgkmcnt(0);
+                    // WMMA X[1]×WT — wt_frags still valid from Phase 1
+                    for c in 0..n_col_tiles {
+                        let a_idx = 1 * n_col_tiles + c;
+                        $k.wmma_bf16_f32(acc[a_idx], x_frags[1], wt_frags[c], acc[a_idx]);
+                    }
+
+                    // ── Phase 3: remaining row blocks (r >= 2) ──
+                    for r in 2..n_row_blocks {
+                        // Prefetch X[r] while computing WMMA X[r-1] (already done above for r=1)
+                        $k.v_add_u32(tmp_frag_addr, x_lds_reads[r], $buf_off);
+                        $k.ds_load_b128(x_frags[r], tmp_frag_addr, k_byte_within);
+                        $k.ds_load_b128(VReg(x_frags[r].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                        $k.wait_lgkmcnt(0);
                         for c in 0..n_col_tiles {
                             let a_idx = r * n_col_tiles + c;
                             $k.wmma_bf16_f32(acc[a_idx], x_frags[r], wt_frags[c], acc[a_idx]);
                         }
-                        if r + 1 < n_row_blocks {
-                            $k.wait_lgkmcnt(0);
-                        }
                     }
                 } else {
                     // ── SIMPLE SCHEDULE (n_row_blocks == 1) ──
+                    // Refined: issue x_frag[0] first, then wt_frags with graduated wait
                     $k.v_add_u32(tmp_frag_addr, x_lds_reads[0], $buf_off);
                     $k.ds_load_b128(x_frags[0], tmp_frag_addr, k_byte_within);
                     $k.ds_load_b128(VReg(x_frags[0].0 + 4), tmp_frag_addr, k_byte_within + 16);
+                    // Issue all wt_frag loads
                     for c in 0..n_col_tiles {
                         $k.v_add_u32(tmp_frag_addr, wt_lds_read_base, $buf_off);
                         let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
                         $k.ds_load_b128(wt_frags[c], tmp_frag_addr, base_off + k_byte_within);
                         $k.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_frag_addr, base_off + k_byte_within + 16);
                     }
-                    $k.wait_lgkmcnt(0);
+                    // Graduated waitcnt: dispatch WMMA as each wt_frag pair completes
+                    let total_loads = (2 + n_col_tiles * 2) as u8;
                     for c in 0..n_col_tiles {
-                        $k.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frags[0], wt_frags[c], acc[0 * n_col_tiles + c]);
+                        let loads_needed = (2 * c + 4) as u8;
+                        let remaining = total_loads.saturating_sub(loads_needed);
+                        $k.wait_lgkmcnt(remaining);
+                        $k.wmma_bf16_f32(acc[c], x_frags[0], wt_frags[c], acc[c]);
                     }
                 }
             }
@@ -990,6 +1274,35 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
         k.v_add_u32(y_base, y_base, col_bytes);
 
         for c in 0..n_col_tiles {
+            // ── Epilogue: load bias[col] for this col_tile ──
+            // bias layout: bias[N] f32 row-vector, index = base_n + c*16 + lane_row
+            // One f32 per lane, broadcast across all 8 acc rows.
+            let bias_val = if cfg.epilogue != EpilogueOp::StoreF32 {
+                if let Some(bp) = bias_ptr {
+                    let bv = k.alloc_vreg();
+                    let bias_addr = k.alloc_vreg_array(2, Alignment::Align2);
+                    k.v_mov_from_sgpr(bias_addr, SReg(bp.0));
+                    k.v_mov_from_sgpr(VReg(bias_addr.0 + 1), SReg(bp.0 + 1));
+                    // bias byte offset = (base_n + c*16 + lane_row) * 4
+                    let bias_col = k.alloc_vreg();
+                    k.v_mov_from_sgpr(bias_col, base_n_s);
+                    k.v_add_u32(bias_col, bias_col, lane_row);
+                    if c > 0 {
+                        k.push(Op::VAddU32 {
+                            dst: bias_col, src0: Operand::VReg(bias_col),
+                            src1: Operand::InlineInt((c * 16) as i32),
+                        });
+                    }
+                    let bias_byte_off = k.alloc_vreg();
+                    k.v_lshlrev_b32(bias_byte_off, 2, bias_col); // * 4
+                    k.v_add_co(bias_addr, bias_addr, bias_byte_off);
+                    k.v_add_co_ci(VReg(bias_addr.0 + 1), VReg(bias_addr.0 + 1));
+                    k.global_load(bv, bias_addr, Width::B32, 0);
+                    k.wait_vmcnt(0);
+                    Some(bv)
+                } else { None }
+            } else { None };
+
             // y_addr = y_base + c*64 (16 cols × 4 bytes)
             let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
             k.v_mov(y_addr, y_base);
@@ -1002,7 +1315,25 @@ fn generate_lds_db(cfg: &GemmConfig) -> T0Kernel {
             }
             let a_idx = r * n_col_tiles + c;
             for vk in 0..8u32 {
-                k.global_store(y_addr, VReg(acc[a_idx].0 + vk), Width::B32, 0);
+                let acc_reg = VReg(acc[a_idx].0 + vk);
+
+                // Apply epilogue: bias add + optional relu
+                if let Some(bv) = bias_val {
+                    k.push(Op::VAddF32 {
+                        dst: acc_reg,
+                        src0: Operand::VReg(acc_reg),
+                        src1: Operand::VReg(bv),
+                    });
+                }
+                if cfg.epilogue == EpilogueOp::BiasAddReluStoreF32 {
+                    k.push(Op::VMaxF32 {
+                        dst: acc_reg,
+                        src0: Operand::VReg(acc_reg),
+                        src1: Operand::InlineFloat(0.0),
+                    });
+                }
+
+                k.global_store(y_addr, acc_reg, Width::B32, 0);
                 if vk < 7 {
                     k.v_add_co(y_addr, y_addr, row_stride);
                     k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));

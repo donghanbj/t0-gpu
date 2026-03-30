@@ -15,7 +15,7 @@
 //! use t0::{math, GFX1100Schedule, Target};
 //!
 //! let sched = GFX1100Schedule;
-//! let gemm = math::matmul(&sched);
+//! let gemm = math::rmsnorm(&sched);
 //! let elf = gemm.compile(Target::GFX1100)?;
 //! // Load elf into KFD runtime
 //! ```
@@ -79,4435 +79,12 @@ pub enum BinaryOp {
 /// | 16     | 8    | Y_ptr (bf16, row-major [M, N]) |
 /// | 24     | 4    | K (reduction dimension) |
 /// | 28     | 4    | N (output columns) |
-pub fn matmul(sched: &dyn Schedule) -> T0Kernel {
-    // Delegate to the schedule layer's GEMM template,
-    // adding the store phase with f32→bf16 conversion
-    let mut k = T0Kernel::new("t0_matmul");
-    let (tile_m, tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
 
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
+// ════════════════════════════════════════════
+// Legacy hand-written GEMM variants removed in DSL refactor.
+// All GEMM generation is now handled by gemm_gen.rs
+// ════════════════════════════════════════════
 
-    // ── Capture TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── X base address ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);     // tile_row * 32
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);      // wave_id * 16
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let x_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_row, s_tmp1);
-    k.v_add_u32(x_row, x_row, lane_row);
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let x_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_off, x_row, k_vreg);
-    k.v_lshlrev_b32(x_row_off, 1, x_row_off);
-
-    let x_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_base, x_base, x_row_off);
-    k.v_add_co_ci(VReg(x_base.0 + 1), VReg(x_base.0 + 1));
-
-    // ── WT base ──
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-    let base_n = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_n, base_n_s);
-    k.v_add_u32(base_n, base_n, lane_row);
-
-    let wt_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_off, base_n, k_vreg);
-    k.v_lshlrev_b32(wt_row_off, 1, wt_row_off);
-
-    // ── WMMA fragments ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    let loop_label = k.make_label("k_loop");
-    k.label(&loop_label);
-
-    // Load X fragment
-    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(x_addr, x_base);
-    k.v_mov(VReg(x_addr.0 + 1), VReg(x_base.0 + 1));
-    k.v_add_co(x_addr, x_addr, k_byte_off);
-    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    k.global_load(x_frag, x_addr, Width::B128, 0);
-    k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
-
-    // Load WT fragments
-    let wt_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_addr, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_addr.0 + 1), SReg(wt_ptr.0 + 1));
-    let wt_total_off = k.alloc_vreg();
-    k.v_add_u32(wt_total_off, wt_row_off, k_byte_off);
-    k.v_add_co(wt_addr, wt_addr, wt_total_off);
-    k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-
-    let tile_stride = k.alloc_vreg();
-    k.v_mov_from_sgpr(tile_stride, SReg(k_dim.0));
-    k.v_lshlrev_b32(tile_stride, 5, tile_stride);
-
-    for t in 0..n_tiles {
-        k.global_load(wt_frags[t], wt_addr, Width::B128, 0);
-        k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
-        if t + 1 < n_tiles {
-            k.v_add_co(wt_addr, wt_addr, tile_stride);
-            k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-        }
-    }
-
-    k.wait_vmcnt(0);
-
-    // WMMA
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-
-    // K-loop advance
-    k.push(Op::VAddU32 {
-        dst: k_byte_off,
-        src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(tile_k as i32 * 2),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE: f32 accumulators → global memory
-    // ══════════════════════════════════════════════════════════════════
-    //
-    // WMMA f32_16x16x16_bf16 output layout (Wave32):
-    //   row = base_row + lane_half + 2*vgpr_k    (vgpr_k = 0..7)
-    //   col = tile_col*64 + tile_t*16 + lane_row  (lane_row = lane_id & 15)
-    //
-    // lane_half = lane_id >> 4  (0 or 1)
-    // base_row = tile_row*32 + wave_id*16
-    //
-    // Store format: f32 (4 bytes per element)
-    // Row stride: N * 4 bytes * 2 (skipping odd/even rows)
-    //
-    // NOTE: bf16 output via global_store_b16 causes GPU hang through LLVM
-    // text asm path on GFX1100. Using f32 output + separate f32_to_bf16
-    // conversion kernel as workaround.
-
-    // base_row = tile_row*32 + wave_id*16 + lane_half
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);  // lane_half = lane_id >> 4
-
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);   // s_tmp1 = tile_row*32 + wave_id*16
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    // row_bytes = base_row * N * 4
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);  // * 4 for f32
-
-    // row_stride = N * 8 bytes (2 rows, f32)
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);  // N * 8
-
-    // col_bytes_base = (tile_col*64 + lane_row) * 4
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);  // tile_col * 64
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);  // * 4 for f32
-
-    for t in 0..n_tiles {
-        // Y address = y_ptr + row_bytes + col_bytes + tile_col_extra
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        // Extra offset for tile t: t*16*4 = t*64 bytes
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr,
-                src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-
-        // Store 8 f32 values, advancing by row_stride (2 rows) each time
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_db: Double-Buffered GEMM  Y = X @ W^T
-// ============================================================================
-
-/// Generate a double-buffered GEMM kernel: Y = X @ W^T
-///
-/// Software-pipelined K-loop: while WMMA computes on buffer A,
-/// GMEM loads fill buffer B, and vice versa. Hides ~400-cycle
-/// GMEM latency behind WMMA compute (~32 cycles per 4 tiles).
-///
-/// Same kernargs/grid/store as matmul(). K must be multiple of 16.
-///
-/// Loop structure (unrolled by 2):
-///   Prologue: load K=0 → buf_a
-///   Loop body:
-///     wait(buf_a) → load K+16 → buf_b → WMMA(buf_a)
-///     wait(buf_b) → load K+32 → buf_a → WMMA(buf_b)
-///   Epilogue: WMMA on last loaded buffer
-pub fn matmul_db(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_db");
-    let (tile_m, tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    // ── Args (same as matmul) ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── X base address ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);     // tile_row * 32
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);      // wave_id * 16
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let x_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_row, s_tmp1);
-    k.v_add_u32(x_row, x_row, lane_row);
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let x_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_off, x_row, k_vreg);
-    k.v_lshlrev_b32(x_row_off, 1, x_row_off);
-
-    let x_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_base, x_base, x_row_off);
-    k.v_add_co_ci(VReg(x_base.0 + 1), VReg(x_base.0 + 1));
-
-    // ── WT base ──
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-    let base_n = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_n, base_n_s);
-    k.v_add_u32(base_n, base_n, lane_row);
-
-    let wt_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_off, base_n, k_vreg);
-    k.v_lshlrev_b32(wt_row_off, 1, wt_row_off);
-
-    // WT tile stride = 16 rows * K * 2
-    let tile_stride = k.alloc_vreg();
-    k.v_mov_from_sgpr(tile_stride, SReg(k_dim.0));
-    k.v_lshlrev_b32(tile_stride, 5, tile_stride);
-
-    // ── Double-buffered WMMA fragments ──
-    let x_frag_a = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags_a: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    let x_frag_b = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags_b: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop state ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    // Helper: emit GMEM loads for X + WT into given fragment set
-    // This is a macro-like pattern since we call it multiple times
-    macro_rules! emit_loads {
-        ($kernel:expr, $x_frag:expr, $wt_frags:expr, $koff:expr) => {{
-            // X address = x_base + k_byte_off
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load($x_frag, xa, Width::B128, 0);
-            $kernel.global_load(VReg($x_frag.0 + 4), xa, Width::B128, 16);
-
-            // WT addresses
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov_from_sgpr(wa, SReg(wt_ptr.0));
-            $kernel.v_mov_from_sgpr(VReg(wa.0 + 1), SReg(wt_ptr.0 + 1));
-            let woff = $kernel.alloc_vreg();
-            $kernel.v_add_u32(woff, wt_row_off, $koff);
-            $kernel.v_add_co(wa, wa, woff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-
-            for t in 0..n_tiles {
-                $kernel.global_load($wt_frags[t], wa, Width::B128, 0);
-                $kernel.global_load(VReg($wt_frags[t].0 + 4), wa, Width::B128, 16);
-                if t + 1 < n_tiles {
-                    $kernel.v_add_co(wa, wa, tile_stride);
-                    $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-                }
-            }
-        }};
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // PROLOGUE: Load first K-tile into buf_a
-    // ══════════════════════════════════════════════════════════════════
-    emit_loads!(k, x_frag_a, wt_frags_a, k_byte_off);
-
-    // Advance k
-    let k_step_bytes = (tile_k * 2) as i32;
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step_bytes),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // MAIN LOOP (unrolled by 2)
-    // ══════════════════════════════════════════════════════════════════
-    let loop_label = k.make_label("k_loop_db");
-    k.label(&loop_label);
-
-    // Check: if k_iter >= K, go to epilogue_a
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a_label = k.make_label("epilog_a");
-    k.branch_scc1(&epilog_a_label);
-
-    // ── Phase A: wait for buf_a, start loading buf_b, compute buf_a ──
-    k.wait_vmcnt(0);
-    emit_loads!(k, x_frag_b, wt_frags_b, k_byte_off);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag_a, wt_frags_a[t], acc[t]);
-    }
-
-    // Advance k
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step_bytes),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // Check: if k_iter >= K, go to epilogue_b
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b_label = k.make_label("epilog_b");
-    k.branch_scc1(&epilog_b_label);
-
-    // ── Phase B: wait for buf_b, start loading buf_a, compute buf_b ──
-    k.wait_vmcnt(0);
-    emit_loads!(k, x_frag_a, wt_frags_a, k_byte_off);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag_b, wt_frags_b[t], acc[t]);
-    }
-
-    // Advance k
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step_bytes),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // Check if more iterations needed, branch back
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUE A: last loaded data is in buf_a
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_a_label);
-    k.wait_vmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag_a, wt_frags_a[t], acc[t]);
-    }
-    let store_label = k.make_label("store_phase");
-    // Use s_cmp + branch to skip epilog_b
-    k.s_mov_imm(k_iter_s, 0); // dummy: set SCC for branch
-    k.s_cmp_eq_u32_imm(k_iter_s, 0); // SCC = 1 (always)
-    k.branch_scc1(&store_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUE B: last loaded data is in buf_b
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_b_label);
-    k.wait_vmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag_b, wt_frags_b[t], acc[t]);
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE (same as matmul)
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr,
-                src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_lds_db: LDS-Staged + Double-Buffered GEMM  Y = X @ W^T
-// ============================================================================
-
-/// LDS cooperative-load + double-buffered GEMM: Y[M,N] = X[M,K] @ WT[N,K]
-///
-/// All 64 threads cooperatively load X (1 b128/thread) + WT (2 b128/thread)
-/// into LDS. Each wave then reads its WMMA fragments from LDS (~40 cycle
-/// latency vs ~400 for GMEM). Two LDS buffers enable overlapping GMEM
-/// loads for the next K-tile with LDS reads + WMMA for the current tile.
-///
-/// LDS layout (6144 bytes = 2 × 3072B buffers):
-///   Buf 0: X[0..1023] (32×16 bf16) + WT[1024..3071] (64×16 bf16)
-///   Buf 1: X[3072..4095] + WT[4096..6143]
-///
-/// Same kernargs/grid as matmul(). K must be multiple of 16.
-pub fn matmul_lds_db(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_lds_db");
-    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    const LDS_X: u32 = 1024;   // 32 rows × 16 cols × 2B
-    const LDS_WT: u32 = 2048;  // 64 rows × 16 cols × 2B
-    const LDS_BUF: u32 = LDS_X + LDS_WT;  // 3072
-    k.set_lds_size(LDS_BUF * 2);           // 6144
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let tid = VReg(0); // WORKITEM_ID_X = 0..63
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── s_tmp1 = tile_row*32 + wave_id*16 (for store phase) ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ══════════════════════════════════════════════════════════════════
-    // COOPERATIVE LOAD ADDRESSES (computed once, reused per K-tile)
-    // ══════════════════════════════════════════════════════════════════
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    // ── X cooperative: thread t → row=t>>1, half=t&1, loads 16B ──
-    let x_coop_row = k.alloc_vreg();
-    k.v_lshrrev_b32(x_coop_row, 1, tid);       // t >> 1 = row (0..31)
-    let x_coop_half = k.alloc_vreg();
-    k.v_and_b32_imm(x_coop_half, tid, 1);       // t & 1
-
-    // X GMEM base = X_ptr + (tile_row*32 + row) * K * 2 + half*16
-    let x_abs_row = k.alloc_vreg();
-    let s_base_row = k.alloc_sreg();
-    k.s_lshl_b32(s_base_row, tile_row_s, 5);
-    k.v_mov_from_sgpr(x_abs_row, s_base_row);
-    k.v_add_u32(x_abs_row, x_abs_row, x_coop_row);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_half_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_half_off, 4, x_coop_half); // half * 16
-
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-    k.v_add_u32(x_gmem_base, x_gmem_base, x_half_off);
-
-    // X LDS addr = (t>>1)*32 + (t&1)*16 = t*16 (relative to buf base)
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 4, tid); // t * 16
-
-    // ── WT cooperative: thread t → loads WT row t (32B = 2×b128) ──
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-
-    // WT LDS addr = LDS_X + t*32 (relative to buf base)
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 5, tid);
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    // ── LDS read addresses for WMMA fragments (relative to buf base) ──
-    // X read: (wave_id*16 + lane_row) * 32
-    let x_lds_read = k.alloc_vreg();
-    let s_wave_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_off, wave_id_s, 9);     // wave_id * 512
-    k.v_lshlrev_b32(x_lds_read, 5, lane_row);   // lane_row * 32
-    let tmp_wave = k.alloc_vreg();
-    k.v_mov_from_sgpr(tmp_wave, s_wave_off);
-    k.v_add_u32(x_lds_read, x_lds_read, tmp_wave);
-
-    // WT read base: lane_row * 32 (tile offset added as immediate)
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
-
-    // ── Temp VGPRs for GMEM → LDS transfer ──
-    let gmem_x = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-
-    // ── WMMA fragment registers ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop state ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (tile_k * 2) as i32;
-
-    // ── Macro: cooperative GMEM load → temp VGPRs ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            // X: global_load_b128, 1 per thread
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x, xa, Width::B128, 0);
-
-            // WT: 2× global_load_b128, 1 row per thread
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
-        }};
-    }
-
-    // ── Macro: temp VGPRs → LDS store (at buf_offset) ──
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            let x_a = $kernel.alloc_vreg();
-            $kernel.v_add_u32(x_a, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(x_a, gmem_x, 0);
-
-            let w_a = $kernel.alloc_vreg();
-            $kernel.v_add_u32(w_a, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(w_a, gmem_wt0, 0);
-            $kernel.ds_store_b128(w_a, gmem_wt1, 16);
-        }};
-    }
-
-    // ── Macro: LDS read → WMMA fragments (from buf_offset) ──
-    macro_rules! lds_read_frags {
-        ($kernel:expr, $buf_off:expr) => {{
-            // X fragment
-            let xr = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr, x_lds_read, $buf_off);
-            $kernel.ds_load_b128(x_frag, xr, 0);
-            $kernel.ds_load_b128(VReg(x_frag.0 + 4), xr, 16);
-
-            // WT fragments (4 tiles)
-            for t in 0..n_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off_base: u16 = (LDS_X + (t as u32) * 16 * 32) as u16;
-                $kernel.ds_load_b128(wt_frags[t], wr, off_base);
-                $kernel.ds_load_b128(VReg(wt_frags[t].0 + 4), wr, off_base + 16);
-            }
-        }};
-    }
-
-    // ── Buffer offset VGPRs ──
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // PROLOGUE: Load K=0 → LDS buf0
-    // ══════════════════════════════════════════════════════════════════
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    // barrier removed — Phase A at loop top will do the barrier
-
-    // Advance K
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // MAIN LOOP (unrolled by 2)
-    // ══════════════════════════════════════════════════════════════════
-    let loop_label = k.make_label("k_lds_loop");
-    k.label(&loop_label);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a = k.make_label("lds_epilog_a");
-    k.branch_scc1(&epilog_a);
-
-    // ── Phase A: Tensile-style overlap ──
-    // barrier → LDS read → GMEM load (parallel!) → wait LDS → WMMA → wait GMEM → LDS store
-    k.s_barrier();                            // sync (prologue/Phase B stores done)
-    lds_read_frags!(k, buf0_off);             // 10 ds_loads (LDS reads first!)
-    coop_gmem_load!(k, k_byte_off);           // 3 global_loads (parallel with ds_loads)
-    k.wait_lgkmcnt(0);                        // wait ds_loads
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    k.wait_vmcnt(0);                          // wait GMEM loads
-    coop_lds_store!(k, buf1_off);             // 3 ds_stores (async, overlap with advance K!)
-
-    // Advance K
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b = k.make_label("lds_epilog_b");
-    k.branch_scc1(&epilog_b);
-
-    // ── Phase B: Tensile-style overlap ──
-    k.wait_lgkmcnt(0);                        // wait Phase A ds_stores
-    k.s_barrier();                            // sync all waves
-    lds_read_frags!(k, buf1_off);             // 10 ds_loads
-    coop_gmem_load!(k, k_byte_off);           // 3 global_loads (parallel)
-    k.wait_lgkmcnt(0);                        // wait ds_loads
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    k.wait_vmcnt(0);                          // wait GMEM
-    coop_lds_store!(k, buf0_off);             // 3 ds_stores (async)
-
-    // Advance K
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.wait_lgkmcnt(0);                        // wait Phase B ds_stores before loop back
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUE A: last data in buf0
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_a);
-    k.s_barrier();                            // sync before reading
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    let store_label = k.make_label("lds_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUE B: last data in buf1
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_b);
-    k.wait_lgkmcnt(0);                        // wait Phase A ds_stores
-    k.s_barrier();                            // sync before reading
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE (same as matmul)
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_lds_db_bf16out: Same as matmul_lds_db but stores Y as bf16
-// ============================================================================
-
-/// Y[i,j] (bf16) = X @ W^T — LDS double-buffered, bf16 output.
-///
-/// Identical K-loop to matmul_lds_db, but the store phase converts f32 → bf16
-/// and writes with global_store_b16, halving store bandwidth.
-///
-/// Kernargs: [X_ptr:u64, WT_ptr:u64, Y_ptr:u64, K:u32, N:u32]
-/// Grid: [tiles_N × 64, tiles_M, 1]
-pub fn matmul_lds_db_bf16out(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_lds_db_bf16out");
-    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    const LDS_X: u32 = 1024;
-    const LDS_WT: u32 = 2048;
-    const LDS_BUF: u32 = LDS_X + LDS_WT;
-    k.set_lds_size(LDS_BUF * 2);
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── s_tmp1 = tile_row*32 + wave_id*16 (for store phase) ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ══════════════════════════════════════════════════════════════════
-    // COOPERATIVE LOAD ADDRESSES (same as matmul_lds_db)
-    // ══════════════════════════════════════════════════════════════════
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    let x_coop_row = k.alloc_vreg();
-    k.v_lshrrev_b32(x_coop_row, 1, tid);
-    let x_coop_half = k.alloc_vreg();
-    k.v_and_b32_imm(x_coop_half, tid, 1);
-
-    let x_abs_row = k.alloc_vreg();
-    let s_base_row = k.alloc_sreg();
-    k.s_lshl_b32(s_base_row, tile_row_s, 5);
-    k.v_mov_from_sgpr(x_abs_row, s_base_row);
-    k.v_add_u32(x_abs_row, x_abs_row, x_coop_row);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_half_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_half_off, 4, x_coop_half);
-
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-    k.v_add_u32(x_gmem_base, x_gmem_base, x_half_off);
-
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 4, tid);
-
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 5, tid);
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    let x_lds_read = k.alloc_vreg();
-    let s_wave_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_off, wave_id_s, 9);
-    k.v_lshlrev_b32(x_lds_read, 5, lane_row);
-    let tmp_wave = k.alloc_vreg();
-    k.v_mov_from_sgpr(tmp_wave, s_wave_off);
-    k.v_add_u32(x_lds_read, x_lds_read, tmp_wave);
-
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
-
-    let gmem_x = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (tile_k * 2) as i32;
-
-    // ── Macros (same as matmul_lds_db) ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x, xa, Width::B128, 0);
-
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
-        }};
-    }
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            let x_a = $kernel.alloc_vreg();
-            $kernel.v_add_u32(x_a, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(x_a, gmem_x, 0);
-
-            let w_a = $kernel.alloc_vreg();
-            $kernel.v_add_u32(w_a, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(w_a, gmem_wt0, 0);
-            $kernel.ds_store_b128(w_a, gmem_wt1, 16);
-        }};
-    }
-    macro_rules! lds_read_frags {
-        ($kernel:expr, $buf_off:expr) => {{
-            let xr = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr, x_lds_read, $buf_off);
-            $kernel.ds_load_b128(x_frag, xr, 0);
-            $kernel.ds_load_b128(VReg(x_frag.0 + 4), xr, 16);
-
-            for t in 0..n_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off_base: u16 = (LDS_X + (t as u32) * 16 * 32) as u16;
-                $kernel.ds_load_b128(wt_frags[t], wr, off_base);
-                $kernel.ds_load_b128(VReg(wt_frags[t].0 + 4), wr, off_base + 16);
-            }
-        }};
-    }
-
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // PROLOGUE + K-LOOP (identical to matmul_lds_db)
-    // ══════════════════════════════════════════════════════════════════
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    let loop_label = k.make_label("k_lds_loop");
-    k.label(&loop_label);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a = k.make_label("lds_epilog_a");
-    k.branch_scc1(&epilog_a);
-
-    // Phase A
-    k.s_barrier();
-    lds_read_frags!(k, buf0_off);
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf1_off);
-
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b = k.make_label("lds_epilog_b");
-    k.branch_scc1(&epilog_b);
-
-    // Phase B
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    lds_read_frags!(k, buf1_off);
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.wait_lgkmcnt(0);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // Epilogue A
-    k.label(&epilog_a);
-    k.s_barrier();
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    let store_label = k.make_label("lds_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    // Epilogue B
-    k.label(&epilog_b);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE — bf16 output (half the bandwidth of f32)
-    //
-    // For each acc[t] (8 f32 values across rows), we:
-    //   1. Pack adjacent row pairs with cvt_pk_bf16_f32
-    //   2. Store packed bf16x2 with global_store_b32
-    //   This gives 4 stores per tile instead of 8 = 16 total instead of 32
-    //
-    // Row stride for bf16: 2*N bytes per row, 4*N bytes per 2 rows
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-
-    // Row offset in bytes for bf16: base_row * N * 2
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 1, row_bytes); // ×2 for bf16
-
-    // Stride per 2 rows in bytes for bf16: 2 * N * 2 = N * 4
-    let row_stride_2 = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride_2, 2, n_vreg); // N*4
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 1, col_base); // col * 2 for bf16
-
-    // Pack and store: 8 f32 → 4 bf16x2 pairs, 4 stores per tile
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 32) as i32), // 16 cols * 2 bytes
-            });
-        }
-
-        // Pack pairs: acc[t].0+0,1 → packed, acc[t].0+2,3 → packed, etc.
-        for pair in 0..4u32 {
-            let packed = k.alloc_vreg();
-            k.cvt_pk_bf16_f32(
-                packed,
-                VReg(acc[t].0 + pair * 2),      // even row
-                VReg(acc[t].0 + pair * 2 + 1),  // odd row
-            );
-            k.global_store(y_addr, packed, Width::B32, 0);
-            if pair < 3 {
-                k.v_add_co(y_addr, y_addr, row_stride_2);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-
-// matmul_direct: Zero-LDS GEMM (ported from handwritten 113 TFLOPS kernel)
-// ============================================================================
-
-/// Y[i,j] = X @ W^T  — Zero-LDS direct GMEM→VGPR→WMMA approach.
-///
-/// Each lane loads its own X row and WT rows directly from global memory,
-/// no cooperative load, no LDS staging, no barriers. This eliminates the
-/// ~30% LDS overhead that dominates small-matrix performance.
-///
-/// Same kernargs/grid as matmul_lds_db. K must be multiple of 16.
-pub fn matmul_direct(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_direct");
-    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();  // 16
-    let n_tiles = sched.gemm_n_wmma_tiles();  // 4
-
-    k.set_lds_size(0);  // Zero LDS!
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── s_tmp1 = tile_row*32 + wave_id*16 (for store phase) ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ══════════════════════════════════════════════════════════════════
-    // X BASE ADDRESS: X_ptr + (tile_row*32 + wave_id*16 + lane_row) * K * 2
-    // Pre-computed once (constant per lane, only k_offset changes in loop)
-    // ══════════════════════════════════════════════════════════════════
-    let x_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_row, s_tmp1);
-    k.v_add_u32(x_row, x_row, lane_row);
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    let x_row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_bytes, x_row, k_vreg);
-    k.v_lshlrev_b32(x_row_bytes, 1, x_row_bytes);  // ×2 for bf16
-
-    let x_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_base, x_base, x_row_bytes);
-    k.v_add_co_ci(VReg(x_base.0 + 1), VReg(x_base.0 + 1));
-
-    // ══════════════════════════════════════════════════════════════════
-    // WT BASE ADDRESS: WT_ptr + (tile_col*64 + lane_row) * K * 2
-    // Pre-computed once. Tile stride = 16 * K * 2 = K << 5 bytes
-    // ══════════════════════════════════════════════════════════════════
-    let wt_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_row, base_n_s);
-    k.v_add_u32(wt_row, wt_row, lane_row);
-
-    let wt_row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_bytes, wt_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_bytes, 1, wt_row_bytes);
-
-    let wt_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_base, wt_base, wt_row_bytes);
-    k.v_add_co_ci(VReg(wt_base.0 + 1), VReg(wt_base.0 + 1));
-
-    // Tile stride = 16 rows × K cols × 2 bytes = K << 5
-    let tile_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(tile_stride, 5, k_vreg);
-
-    // ── WMMA fragment registers ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K byte offset (VGPR, incremented each iteration) ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-
-    // K step in bytes = tile_k * 2 = 32
-    let k_step = (tile_k * 2) as i32;
-
-    // ══════════════════════════════════════════════════════════════════
-    // K-LOOP: Direct GMEM → VGPR → WMMA (zero LDS!)
-    // ══════════════════════════════════════════════════════════════════
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0i32);
-
-    let loop_label = k.make_label("k_direct_loop");
-    k.label(&loop_label);
-
-    // ── Load X fragment: X_base + k_byte_off ──
-    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(x_addr, x_base);
-    k.v_mov(VReg(x_addr.0 + 1), VReg(x_base.0 + 1));
-    k.v_add_co(x_addr, x_addr, k_byte_off);
-    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    k.global_load(x_frag, x_addr, Width::B128, 0);
-    k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
-
-    // ── Load WT fragments: 4 tiles, each 16 WT rows apart ──
-    let wt_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(wt_addr, wt_base);
-    k.v_mov(VReg(wt_addr.0 + 1), VReg(wt_base.0 + 1));
-    k.v_add_co(wt_addr, wt_addr, k_byte_off);
-    k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-
-    for t in 0..n_tiles {
-        k.global_load(wt_frags[t], wt_addr, Width::B128, 0);
-        k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
-        if t < n_tiles - 1 {
-            // Advance to next tile: +tile_stride (K*32 bytes)
-            k.v_add_co(wt_addr, wt_addr, tile_stride);
-            k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-        }
-    }
-
-    // ── Wait for all loads, then WMMA ──
-    k.wait_vmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-
-    // ── Advance K ──
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE (identical to matmul_lds_db)
-    // ══════════════════════════════════════════════════════════════════
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg2 = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg2, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg2);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg2);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_direct_add: Zero-LDS GEMM + Fused Residual Add
-// ============================================================================
-
-/// Y[i,j] = X @ W^T + residual  — Zero-LDS with fused residual add.
-///
-/// Same K-loop as matmul_direct (zero LDS, direct GMEM→VGPR→WMMA).
-/// Store phase loads residual[i,j], adds to accumulator, stores sum.
-///
-/// Kernargs (40 bytes):
-///   0:  X_ptr   (8B) — bf16 [M, K]
-///   8:  WT_ptr  (8B) — bf16 [N, K]
-///   16: Y_ptr   (8B) — f32 [M, N] output
-///   24: K       (4B)
-///   28: N       (4B)
-///   32: res_ptr (8B) — f32 [M, N] residual
-pub fn matmul_direct_add(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_direct_add");
-    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    k.set_lds_size(0);
-
-    // ── Args (40 bytes — extra res_ptr) ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    let res_ptr = k.arg_ptr("res");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── s_tmp1 = tile_row*32 + wave_id*16 ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ── X base address ──
-    let x_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_row, s_tmp1);
-    k.v_add_u32(x_row, x_row, lane_row);
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let x_row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_bytes, x_row, k_vreg);
-    k.v_lshlrev_b32(x_row_bytes, 1, x_row_bytes);
-    let x_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_base, x_base, x_row_bytes);
-    k.v_add_co_ci(VReg(x_base.0 + 1), VReg(x_base.0 + 1));
-
-    // ── WT base address + tile stride ──
-    let wt_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_row, base_n_s);
-    k.v_add_u32(wt_row, wt_row, lane_row);
-    let wt_row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_bytes, wt_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_bytes, 1, wt_row_bytes);
-    let wt_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_base, wt_base, wt_row_bytes);
-    k.v_add_co_ci(VReg(wt_base.0 + 1), VReg(wt_base.0 + 1));
-    let tile_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(tile_stride, 5, k_vreg);
-
-    // ── WMMA fragments ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_step = (tile_k * 2) as i32;
-
-    // ── K-LOOP (identical to matmul_direct) ──
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0i32);
-    let loop_label = k.make_label("k_add_loop");
-    k.label(&loop_label);
-
-    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(x_addr, x_base);
-    k.v_mov(VReg(x_addr.0 + 1), VReg(x_base.0 + 1));
-    k.v_add_co(x_addr, x_addr, k_byte_off);
-    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    k.global_load(x_frag, x_addr, Width::B128, 0);
-    k.global_load(VReg(x_frag.0 + 4), x_addr, Width::B128, 16);
-
-    let wt_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(wt_addr, wt_base);
-    k.v_mov(VReg(wt_addr.0 + 1), VReg(wt_base.0 + 1));
-    k.v_add_co(wt_addr, wt_addr, k_byte_off);
-    k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-    for t in 0..n_tiles {
-        k.global_load(wt_frags[t], wt_addr, Width::B128, 0);
-        k.global_load(VReg(wt_frags[t].0 + 4), wt_addr, Width::B128, 16);
-        if t < n_tiles - 1 {
-            k.v_add_co(wt_addr, wt_addr, tile_stride);
-            k.v_add_co_ci(VReg(wt_addr.0 + 1), VReg(wt_addr.0 + 1));
-        }
-    }
-    k.wait_vmcnt(0);
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-    k.push(Op::VAddU32 {
-        dst: k_byte_off, src0: Operand::VReg(k_byte_off),
-        src1: Operand::InlineInt(k_step),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // FUSED STORE: Y[i,j] = acc[i,j] + residual[i,j]
-    // ══════════════════════════════════════════════════════════════════
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg2 = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg2, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg2);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg2);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    let res_val = k.alloc_vreg();
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-
-        let r_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(r_addr, SReg(res_ptr.0));
-        k.v_mov_from_sgpr(VReg(r_addr.0 + 1), SReg(res_ptr.0 + 1));
-        k.v_add_co(r_addr, r_addr, row_bytes);
-        k.v_add_co_ci(VReg(r_addr.0 + 1), VReg(r_addr.0 + 1));
-        k.v_add_u32(r_addr, r_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: r_addr, src0: Operand::VReg(r_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-
-        for vk in 0..8u32 {
-            k.global_load(res_val, r_addr, Width::B32, 0);
-            k.wait_vmcnt(0);
-            k.v_add_f32(VReg(acc[t].0 + vk), VReg(acc[t].0 + vk), res_val);
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-                k.v_add_co(r_addr, r_addr, row_stride);
-                k.v_add_co_ci(VReg(r_addr.0 + 1), VReg(r_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_lds_db_add: GEMM + Residual Add Epilogue Fusion
-// ============================================================================
-
-/// Y[i,j] = X @ W^T + residual  (fused GEMM + residual add)
-///
-/// Identical computation loop to matmul_lds_db, but the store phase
-/// loads residual[row,col] from GMEM, adds to accumulator, and stores
-/// the sum. Eliminates separate add() dispatch.
-///
-/// Kernargs (40 bytes):
-///   0:  X_ptr   (8B) — bf16 [M, K]
-///   8:  WT_ptr  (8B) — bf16 [N, K]
-///   16: Y_ptr   (8B) — f32 [M, N] output
-///   24: K       (4B)
-///   28: N       (4B)
-///   32: res_ptr (8B) — f32 [M, N] residual to add
-///
-/// Grid: same as matmul_lds_db [ceil(N/64)*64, ceil(M/32), 1]
-pub fn matmul_lds_db_add(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_lds_db_add");
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    const LDS_X: u32 = 1024;
-    const LDS_WT: u32 = 2048;
-    const LDS_BUF: u32 = LDS_X + LDS_WT;
-    k.set_lds_size(LDS_BUF * 2);
-
-    // ── Args (40 bytes) ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    let res_ptr = k.arg_ptr("residual");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Store phase constants ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ══════════════════════════════════════════════════════════════════
-    // COOPERATIVE LOAD setup (identical to matmul_lds_db)
-    // ══════════════════════════════════════════════════════════════════
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    let x_coop_row = k.alloc_vreg();
-    k.v_lshrrev_b32(x_coop_row, 1, tid);
-    let x_coop_half = k.alloc_vreg();
-    k.v_and_b32_imm(x_coop_half, tid, 1);
-
-    let x_abs_row = k.alloc_vreg();
-    let s_base_row = k.alloc_sreg();
-    k.s_lshl_b32(s_base_row, tile_row_s, 5);
-    k.v_mov_from_sgpr(x_abs_row, s_base_row);
-    k.v_add_u32(x_abs_row, x_abs_row, x_coop_row);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_half_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_half_off, 4, x_coop_half);
-
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-    k.v_add_u32(x_gmem_base, x_gmem_base, x_half_off);
-
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 4, tid);
-
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 5, tid);
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    // LDS read addresses
-    let x_lds_read = k.alloc_vreg();
-    let s_wave_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_off, wave_id_s, 9);
-    k.v_lshlrev_b32(x_lds_read, 5, lane_row);
-    let tmp_wave = k.alloc_vreg();
-    k.v_mov_from_sgpr(tmp_wave, s_wave_off);
-    k.v_add_u32(x_lds_read, x_lds_read, tmp_wave);
-
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
-
-    // Temp VGPRs
-    let gmem_x = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // K-loop state
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (tile_k * 2) as i32;
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ── Macros (identical to matmul_lds_db) ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x, xa, Width::B128, 0);
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
-        }};
-    }
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            let xa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xa, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(xa, gmem_x, 0);
-            let wa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(wa, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(wa, gmem_wt0, 0);
-            $kernel.ds_store_b128(wa, gmem_wt1, 16);
-        }};
-    }
-    macro_rules! lds_read_frags {
-        ($kernel:expr, $buf_off:expr) => {{
-            let xr = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr, x_lds_read, $buf_off);
-            $kernel.ds_load_b128(x_frag, xr, 0);
-            $kernel.ds_load_b128(VReg(x_frag.0 + 4), xr, 16);
-            for t in 0..n_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off: u16 = (LDS_X + (t as u32) * 16 * 32) as u16;
-                $kernel.ds_load_b128(wt_frags[t], wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[t].0 + 4), wr, off + 16);
-            }
-        }};
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // COMPUTATION (identical to matmul_lds_db)
-    // ══════════════════════════════════════════════════════════════════
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    let loop_label = k.make_label("add_loop");
-    k.label(&loop_label);
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a = k.make_label("add_ea");
-    k.branch_scc1(&epilog_a);
-
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b = k.make_label("add_eb");
-    k.branch_scc1(&epilog_b);
-
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    k.label(&epilog_a);
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    let store_label = k.make_label("add_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    k.label(&epilog_b);
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-
-    // ══════════════════════════════════════════════════════════════════
-    // FUSED STORE: Y[i,j] = acc[i,j] + residual[i,j]
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    let res_val = k.alloc_vreg();  // temp for residual load
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-
-        // Residual address (same layout as Y)
-        let r_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(r_addr, SReg(res_ptr.0));
-        k.v_mov_from_sgpr(VReg(r_addr.0 + 1), SReg(res_ptr.0 + 1));
-        k.v_add_co(r_addr, r_addr, row_bytes);
-        k.v_add_co_ci(VReg(r_addr.0 + 1), VReg(r_addr.0 + 1));
-        k.v_add_u32(r_addr, r_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: r_addr, src0: Operand::VReg(r_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-
-        for vk in 0..8u32 {
-            // Load residual, add to acc, store
-            k.global_load(res_val, r_addr, Width::B32, 0);
-            k.wait_vmcnt(0);
-            k.v_add_f32(VReg(acc[t].0 + vk), VReg(acc[t].0 + vk), res_val);
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-                k.v_add_co(r_addr, r_addr, row_stride);
-                k.v_add_co_ci(VReg(r_addr.0 + 1), VReg(r_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_64x64: 64×64 Tiled LDS + Double-Buffered GEMM  Y = X @ W^T
-// ============================================================================
-
-/// 64×64 tile GEMM with LDS cooperative load + double buffering.
-///
-/// Each wave handles a 32×64 sub-tile with 2 row blocks × 4 col blocks = 8 WMMAs.
-/// Compared to 32×64 tile: 33% fewer GMEM bytes per output element.
-///
-/// LDS layout (8192B = 2 × 4096B):
-///   X:  64 rows × 16 cols × 2B = 2048B
-///   WT: 64 rows × 16 cols × 2B = 2048B
-///
-/// Grid: [ceil(N/64)*64, ceil(M/64), 1]  (note: M/64 not M/32!)
-/// Kernargs: same 32-byte layout as matmul().
-pub fn matmul_64x64_lds_db(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_64x64");
-    let tile_k = sched.gemm_tile_k();   // 16
-    let n_col_tiles: usize = 4;         // 64/16
-    let n_row_blocks: usize = 2;        // 32/16 per wave
-
-    const LDS_X: u32 = 2048;   // 64 × 16 × 2
-    const LDS_WT: u32 = 2048;  // 64 × 16 × 2
-    const LDS_BUF: u32 = LDS_X + LDS_WT;  // 4096
-    k.set_lds_size(LDS_BUF * 2);            // 8192
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators: 2 row blocks × 4 col blocks = 8 per wave ──
-    let mut acc = Vec::new();
-    for _r in 0..n_row_blocks {
-        for _c in 0..n_col_tiles {
-            acc.push(k.alloc_vreg_array(8, Alignment::Align8));
-        }
-    }
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Store phase constants ──
-    // s_row_base[r] = tile_row*64 + wave_id*32 + r*16
-    let s_row_base0 = k.alloc_sreg();
-    let s_row_base1 = k.alloc_sreg();
-    k.s_lshl_b32(s_row_base0, tile_row_s, 6);  // tile_row * 64
-    let s_tmp = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp, wave_id_s, 5);          // wave_id * 32
-    k.push(Op::SAddU32 { dst: s_row_base0, src0: s_row_base0, src1: SOperand::SReg(s_tmp) });
-    k.push(Op::SAddU32 { dst: s_row_base1, src0: s_row_base0, src1: SOperand::InlineInt(16) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);  // tile_col * 64
-
-    // ══════════════════════════════════════════════════════════════════
-    // COOPERATIVE LOAD ADDRESSES
-    // ══════════════════════════════════════════════════════════════════
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    // ── X: thread t loads full row t (2× b128 = 32B) ──
-    let x_abs_row = k.alloc_vreg();
-    let s_xbase = k.alloc_sreg();
-    k.s_lshl_b32(s_xbase, tile_row_s, 6);  // tile_row * 64
-    k.v_mov_from_sgpr(x_abs_row, s_xbase);
-    k.v_add_u32(x_abs_row, x_abs_row, tid);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-
-    // X LDS store addr = t * 32
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 5, tid);
-
-    // ── WT: thread t loads WT row t (2× b128 = 32B) ──
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-
-    // WT LDS store addr = LDS_X + t * 32
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 5, tid);
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    // ── LDS read addresses ──
-    // X frag[0]: (wave_id*32 + lane_row) * 32 = wave_id*1024 + lane_row*32
-    // X frag[1]: (wave_id*32 + 16 + lane_row) * 32 = wave_id*1024 + 512 + lane_row*32
-    let lane_row_x32 = k.alloc_vreg();
-    k.v_lshlrev_b32(lane_row_x32, 5, lane_row);
-
-    let s_wave_x_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_x_off, wave_id_s, 10);  // wave_id * 1024
-
-    let x_lds_read0 = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_lds_read0, s_wave_x_off);
-    k.v_add_u32(x_lds_read0, x_lds_read0, lane_row_x32);
-
-    let x_lds_read1 = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_lds_read1, s_wave_x_off);
-    k.v_add_u32(x_lds_read1, x_lds_read1, lane_row_x32);
-    k.push(Op::VAddU32 {
-        dst: x_lds_read1, src0: Operand::VReg(x_lds_read1),
-        src1: Operand::InlineInt(512),
-    });
-
-    // WT: lane_row * 32 (tile offset as immediate)
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
-
-    // ── Temp VGPRs ──
-    let gmem_x0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_x1 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-
-    // ── WMMA fragment registers ──
-    let x_frag0 = k.alloc_vreg_array(8, Alignment::Align8);
-    let x_frag1 = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_col_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop state ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (tile_k * 2) as i32;
-
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ── Pre-allocated temp VGPRs (reused across all macro invocations) ──
-    let tmp_xa = k.alloc_vreg_array(2, Alignment::Align2);  // GMEM X addr
-    let tmp_wa = k.alloc_vreg_array(2, Alignment::Align2);  // GMEM WT addr
-    let tmp_lds_x = k.alloc_vreg();                          // LDS X store addr
-    let tmp_lds_w = k.alloc_vreg();                          // LDS WT store addr
-    let tmp_xr0 = k.alloc_vreg();                            // LDS X read addr 0
-    let tmp_xr1 = k.alloc_vreg();                            // LDS X read addr 1
-    let tmp_wr = k.alloc_vreg();                              // LDS WT read addr
-
-    // ── Macros (now reuse pre-allocated temps) ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            $kernel.v_mov(tmp_xa, x_gmem_base);
-            $kernel.v_mov(VReg(tmp_xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(tmp_xa, tmp_xa, $koff);
-            $kernel.v_add_co_ci(VReg(tmp_xa.0 + 1), VReg(tmp_xa.0 + 1));
-            $kernel.global_load(gmem_x0, tmp_xa, Width::B128, 0);
-            $kernel.global_load(gmem_x1, tmp_xa, Width::B128, 16);
-
-            $kernel.v_mov(tmp_wa, wt_gmem_base);
-            $kernel.v_mov(VReg(tmp_wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(tmp_wa, tmp_wa, $koff);
-            $kernel.v_add_co_ci(VReg(tmp_wa.0 + 1), VReg(tmp_wa.0 + 1));
-            $kernel.global_load(gmem_wt0, tmp_wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, tmp_wa, Width::B128, 16);
-        }};
-    }
-
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            $kernel.v_add_u32(tmp_lds_x, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(tmp_lds_x, gmem_x0, 0);
-            $kernel.ds_store_b128(tmp_lds_x, gmem_x1, 16);
-
-            $kernel.v_add_u32(tmp_lds_w, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(tmp_lds_w, gmem_wt0, 0);
-            $kernel.ds_store_b128(tmp_lds_w, gmem_wt1, 16);
-        }};
-    }
-
-    macro_rules! lds_read_and_wmma {
-        ($kernel:expr, $buf_off:expr) => {{
-            // X frag[0]
-            $kernel.v_add_u32(tmp_xr0, x_lds_read0, $buf_off);
-            $kernel.ds_load_b128(x_frag0, tmp_xr0, 0);
-            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), tmp_xr0, 16);
-            // X frag[1]
-            $kernel.v_add_u32(tmp_xr1, x_lds_read1, $buf_off);
-            $kernel.ds_load_b128(x_frag1, tmp_xr1, 0);
-            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), tmp_xr1, 16);
-            // WT frags
-            for c in 0..n_col_tiles {
-                $kernel.v_add_u32(tmp_wr, wt_lds_read_base, $buf_off);
-                let off: u16 = (LDS_X + (c as u32) * 512) as u16;
-                $kernel.ds_load_b128(wt_frags[c], tmp_wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), tmp_wr, off + 16);
-            }
-            $kernel.wait_lgkmcnt(0);
-            // WMMA: 2 row blocks × 4 col blocks
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frag0, wt_frags[c], acc[0 * n_col_tiles + c]);
-            }
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[1 * n_col_tiles + c], x_frag1, wt_frags[c], acc[1 * n_col_tiles + c]);
-            }
-        }};
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // PROLOGUE
-    // ══════════════════════════════════════════════════════════════════
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // MAIN LOOP
-    // ══════════════════════════════════════════════════════════════════
-    let loop_label = k.make_label("k64_loop");
-    k.label(&loop_label);
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a = k.make_label("k64_ea");
-    k.branch_scc1(&epilog_a);
-
-    // Phase A: prefetch→buf1, compute buf0
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_and_wmma!(k, buf0_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b = k.make_label("k64_eb");
-    k.branch_scc1(&epilog_b);
-
-    // Phase B: prefetch→buf0, compute buf1
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_and_wmma!(k, buf1_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUES
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_a);
-    lds_read_and_wmma!(k, buf0_off);
-    let store_label = k.make_label("k64_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    k.label(&epilog_b);
-    lds_read_and_wmma!(k, buf1_off);
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE: 2 row blocks × 4 col blocks
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);  // N * 8
-
-    let col_base_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base_v, base_n_s);
-    k.v_add_u32(col_base_v, col_base_v, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base_v);
-
-    for r in 0..n_row_blocks {
-        let rb_s = if r == 0 { s_row_base0 } else { s_row_base1 };
-        let base_row_v = k.alloc_vreg();
-        k.v_mov_from_sgpr(base_row_v, rb_s);
-        k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-        let row_bytes = k.alloc_vreg();
-        k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-        k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-        for c in 0..n_col_tiles {
-            let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-            k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-            k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-            k.v_add_co(y_addr, y_addr, row_bytes);
-            k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            k.v_add_u32(y_addr, y_addr, col_bytes);
-            if c > 0 {
-                k.push(Op::VAddU32 {
-                    dst: y_addr, src0: Operand::VReg(y_addr),
-                    src1: Operand::InlineInt((c * 64) as i32),
-                });
-            }
-            let a_idx = r * n_col_tiles + c;
-            for vk in 0..8u32 {
-                k.global_store(y_addr, VReg(acc[a_idx].0 + vk), Width::B32, 0);
-                if vk < 7 {
-                    k.v_add_co(y_addr, y_addr, row_stride);
-                    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-                }
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_64x64_k32: 64×64 tile with K_tile=32 for 16 WMMAs per loop body
-// ============================================================================
-
-/// 64×64 tile GEMM with K_tile=32, LDS cooperative load + double buffering.
-///
-/// Each K-loop iteration loads 32 K-columns and does 2 rounds of WMMA (K=0..15, K=16..31).
-/// This gives 16 WMMAs per loop body, halving loop overhead vs K_tile=16.
-///
-/// LDS layout (16384B = 2 × 8192B):
-///   X:  64 rows × 32 cols × 2B = 4096B   (row stride = 64B)
-///   WT: 64 rows × 32 cols × 2B = 4096B   (row stride = 64B)
-///
-/// Grid: [ceil(N/64)*64, ceil(M/64), 1]
-/// Kernargs: same 32-byte layout as matmul().
-pub fn matmul_64x64_k32(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_64x64_k32");
-    let n_col_tiles: usize = 4;     // 64/16
-    let n_row_blocks: usize = 2;    // 32/16 per wave
-
-    const K_TILE: u32 = 32;
-    const LDS_X: u32 = 4096;    // 64 × 32 × 2
-    const LDS_WT: u32 = 4096;   // 64 × 32 × 2
-    const LDS_BUF: u32 = LDS_X + LDS_WT;  // 8192
-    k.set_lds_size(LDS_BUF * 2);            // 16384
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators: 2 row blocks × 4 col blocks = 8 per wave ──
-    let mut acc = Vec::new();
-    for _r in 0..n_row_blocks {
-        for _c in 0..n_col_tiles {
-            acc.push(k.alloc_vreg_array(8, Alignment::Align8));
-        }
-    }
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Store phase constants ──
-    let s_row_base0 = k.alloc_sreg();
-    let s_row_base1 = k.alloc_sreg();
-    k.s_lshl_b32(s_row_base0, tile_row_s, 6);
-    let s_tmp = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp, wave_id_s, 5);
-    k.push(Op::SAddU32 { dst: s_row_base0, src0: s_row_base0, src1: SOperand::SReg(s_tmp) });
-    k.push(Op::SAddU32 { dst: s_row_base1, src0: s_row_base0, src1: SOperand::InlineInt(16) });
-
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ══════════════════════════════════════════════════════════════════
-    // COOPERATIVE LOAD ADDRESSES (K=32: each thread loads 64B per matrix)
-    // ══════════════════════════════════════════════════════════════════
-
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-
-    // ── X: thread t loads row t: 4× b128 = 64B ──
-    let x_abs_row = k.alloc_vreg();
-    let s_xbase = k.alloc_sreg();
-    k.s_lshl_b32(s_xbase, tile_row_s, 6);
-    k.v_mov_from_sgpr(x_abs_row, s_xbase);
-    k.v_add_u32(x_abs_row, x_abs_row, tid);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-
-    // X LDS store addr = t * 64 (row stride for K=32)
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 6, tid);  // t * 64
-
-    // ── WT: thread t loads row t: 4× b128 = 64B ──
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-
-    // WT LDS store addr = LDS_X + t * 64
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 6, tid);  // t * 64
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    // ── LDS read addresses ──
-    // Row stride in LDS = 64B (K=32)
-    // X frag[0]: (wave_id*32 + lane_row) * 64 = wave_id*2048 + lane_row*64
-    // X frag[1]: (wave_id*32 + 16 + lane_row) * 64 = wave_id*2048 + 1024 + lane_row*64
-    let lane_row_x64 = k.alloc_vreg();
-    k.v_lshlrev_b32(lane_row_x64, 6, lane_row);  // lane_row * 64
-
-    let s_wave_x_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_x_off, wave_id_s, 11);  // wave_id * 2048
-
-    let x_lds_read0 = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_lds_read0, s_wave_x_off);
-    k.v_add_u32(x_lds_read0, x_lds_read0, lane_row_x64);
-
-    let x_lds_read1 = k.alloc_vreg();
-    k.v_mov_from_sgpr(x_lds_read1, s_wave_x_off);
-    k.v_add_u32(x_lds_read1, x_lds_read1, lane_row_x64);
-    k.push(Op::VAddU32 {
-        dst: x_lds_read1, src0: Operand::VReg(x_lds_read1),
-        src1: Operand::InlineInt(1024),  // 16 rows * 64B
-    });
-
-    // WT: lane_row * 64 (tile offset as immediate)
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 6, lane_row);  // lane_row * 64
-
-    // ── Temp VGPRs for GMEM (4× b128 each for X and WT) ──
-    let gmem_x0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_x1 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_x2 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_x3 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt2 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt3 = k.alloc_vreg_array(4, Alignment::Align4);
-
-    // ── WMMA fragment registers ──
-    let x_frag0 = k.alloc_vreg_array(8, Alignment::Align8);
-    let x_frag1 = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_col_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop state ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (K_TILE * 2) as i32;  // 64 bytes
-
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ── Macros ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            // X: 4× b128 = 64B per thread (32 bf16 columns)
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x0, xa, Width::B128, 0);
-            $kernel.global_load(gmem_x1, xa, Width::B128, 16);
-            $kernel.global_load(gmem_x2, xa, Width::B128, 32);
-            $kernel.global_load(gmem_x3, xa, Width::B128, 48);
-
-            // WT: 4× b128 = 64B per thread
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
-            $kernel.global_load(gmem_wt2, wa, Width::B128, 32);
-            $kernel.global_load(gmem_wt3, wa, Width::B128, 48);
-        }};
-    }
-
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            // X → LDS: 4× ds_store_b128 at row stride 64
-            let xa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xa, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(xa, gmem_x0, 0);
-            $kernel.ds_store_b128(xa, gmem_x1, 16);
-            $kernel.ds_store_b128(xa, gmem_x2, 32);
-            $kernel.ds_store_b128(xa, gmem_x3, 48);
-
-            // WT → LDS
-            let wa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(wa, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(wa, gmem_wt0, 0);
-            $kernel.ds_store_b128(wa, gmem_wt1, 16);
-            $kernel.ds_store_b128(wa, gmem_wt2, 32);
-            $kernel.ds_store_b128(wa, gmem_wt3, 48);
-        }};
-    }
-
-    // Read fragments and do 2 rounds of WMMA (K=0..15 and K=16..31)
-    macro_rules! lds_read_and_wmma_k32 {
-        ($kernel:expr, $buf_off:expr) => {{
-            // === Round 1: K=0..15 (offset 0 from each row) ===
-            // X frag[0] at row offset 0, K offset 0
-            let xr0 = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr0, x_lds_read0, $buf_off);
-            $kernel.ds_load_b128(x_frag0, xr0, 0);
-            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), xr0, 16);
-            // X frag[1] at row offset 1024
-            let xr1 = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr1, x_lds_read1, $buf_off);
-            $kernel.ds_load_b128(x_frag1, xr1, 0);
-            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), xr1, 16);
-            // WT frags for K=0..15
-            for c in 0..n_col_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off: u16 = (LDS_X + (c as u32) * 16 * 64) as u16;  // 16 rows × 64B stride
-                $kernel.ds_load_b128(wt_frags[c], wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), wr, off + 16);
-            }
-            $kernel.wait_lgkmcnt(0);
-            // WMMA round 1
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frag0, wt_frags[c], acc[0 * n_col_tiles + c]);
-            }
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[1 * n_col_tiles + c], x_frag1, wt_frags[c], acc[1 * n_col_tiles + c]);
-            }
-
-            // === Round 2: K=16..31 (offset 32 from each row) ===
-            $kernel.ds_load_b128(x_frag0, xr0, 32);
-            $kernel.ds_load_b128(VReg(x_frag0.0 + 4), xr0, 48);
-            $kernel.ds_load_b128(x_frag1, xr1, 32);
-            $kernel.ds_load_b128(VReg(x_frag1.0 + 4), xr1, 48);
-            for c in 0..n_col_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off: u16 = (LDS_X + (c as u32) * 16 * 64 + 32) as u16; // +32 for K=16..31
-                $kernel.ds_load_b128(wt_frags[c], wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[c].0 + 4), wr, off + 16);
-            }
-            $kernel.wait_lgkmcnt(0);
-            // WMMA round 2
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[0 * n_col_tiles + c], x_frag0, wt_frags[c], acc[0 * n_col_tiles + c]);
-            }
-            for c in 0..n_col_tiles {
-                $kernel.wmma_bf16_f32(acc[1 * n_col_tiles + c], x_frag1, wt_frags[c], acc[1 * n_col_tiles + c]);
-            }
-        }};
-    }
-
-    // ══════════════════════════════════════════════════════════════════
-    // PROLOGUE
-    // ══════════════════════════════════════════════════════════════════
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
-
-    // ══════════════════════════════════════════════════════════════════
-    // MAIN LOOP
-    // ══════════════════════════════════════════════════════════════════
-    let loop_label = k.make_label("k64k32_loop");
-    k.label(&loop_label);
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_a = k.make_label("k64k32_ea");
-    k.branch_scc1(&epilog_a);
-
-    // Phase A: prefetch→buf1, compute buf0 (16 WMMAs)
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_and_wmma_k32!(k, buf0_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_dim.0));
-    let epilog_b = k.make_label("k64k32_eb");
-    k.branch_scc1(&epilog_b);
-
-    // Phase B: prefetch→buf0, compute buf1 (16 WMMAs)
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_and_wmma_k32!(k, buf1_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, K_TILE as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ══════════════════════════════════════════════════════════════════
-    // EPILOGUES
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&epilog_a);
-    lds_read_and_wmma_k32!(k, buf0_off);
-    let store_label = k.make_label("k64k32_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    k.label(&epilog_b);
-    lds_read_and_wmma_k32!(k, buf1_off);
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE PHASE: same as matmul_64x64_lds_db
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_base_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base_v, base_n_s);
-    k.v_add_u32(col_base_v, col_base_v, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base_v);
-
-    for r in 0..n_row_blocks {
-        let rb_s = if r == 0 { s_row_base0 } else { s_row_base1 };
-        let base_row_v = k.alloc_vreg();
-        k.v_mov_from_sgpr(base_row_v, rb_s);
-        k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-        let row_bytes = k.alloc_vreg();
-        k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-        k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-
-        for c in 0..n_col_tiles {
-            let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-            k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-            k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-            k.v_add_co(y_addr, y_addr, row_bytes);
-            k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            k.v_add_u32(y_addr, y_addr, col_bytes);
-            if c > 0 {
-                k.push(Op::VAddU32 {
-                    dst: y_addr, src0: Operand::VReg(y_addr),
-                    src1: Operand::InlineInt((c * 64) as i32),
-                });
-            }
-            let a_idx = r * n_col_tiles + c;
-            for vk in 0..8u32 {
-                k.global_store(y_addr, VReg(acc[a_idx].0 + vk), Width::B32, 0);
-                if vk < 7 {
-                    k.v_add_co(y_addr, y_addr, row_stride);
-                    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-                }
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_splitk: Split-K GEMM for small M dimensions
-// ============================================================================
-
-/// Split-K GEMM: Y_partial[split][M][N] = X[M,K_chunk] @ WT[N,K_chunk]^T
-///
-/// Splits K dimension across TGID.z. Each WG computes a partial sum over
-/// K/split elements, writing to a temp buffer partitioned by split index.
-/// Use with `reduce_splitk` to sum partials into final output.
-///
-/// For M=128, Split-K=4: WGs 256→1024, occupancy 2.7→10.7 per CU.
-///
-/// Kernargs (40 bytes):
-///   0:  X_ptr      (8B) — bf16 [M, K_full], row-major
-///   8:  WT_ptr     (8B) — bf16 [N, K_full], row-major
-///   16: Y_part_ptr (8B) — f32 [split_k * M * N], partial output buffer
-///   24: K_full     (4B) — full K dimension (row stride)
-///   28: N          (4B) — output cols
-///   32: stride_mn  (4B) — M * N (stride between split planes)
-///   36: K_per_split(4B) — K elements per split (must be multiple of tile_k)
-///
-/// Grid: [ceil(N/64)*64, ceil(M/32), split_k]
-pub fn matmul_splitk(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_splitk");
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    const LDS_X: u32 = 1024;
-    const LDS_WT: u32 = 2048;
-    const LDS_BUF: u32 = LDS_X + LDS_WT;
-    k.set_lds_size(LDS_BUF * 2);
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y_partial");
-    let k_full = k.arg_u32("K_full");
-    let n_dim = k.arg_u32("N");
-    let stride_mn = k.arg_u32("stride_mn");
-    let k_per_split = k.arg_u32("K_per_split");
-    k.emit_arg_loads();
-
-    // ── TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    let split_idx_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-    k.capture_tgid_z(split_idx_s);
-
-    let tid = VReg(0);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-
-    // ── Accumulators ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Store phase: s_tmp1 = tile_row*32 + wave_id*16 ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // ── K_start = split_idx * K_per_split (in bf16 bytes) ──
-    let k_start_s = k.alloc_sreg();
-    k.s_mul_i32(k_start_s, split_idx_s, SReg(k_per_split.0));
-    let k_start_bytes_s = k.alloc_sreg();
-    k.s_lshl_b32(k_start_bytes_s, k_start_s, 1);  // * 2 for bf16
-
-    // ── Y output offset = split_idx * stride_mn * 4 ──
-    let y_off_s = k.alloc_sreg();
-    k.s_mul_i32(y_off_s, split_idx_s, SReg(stride_mn.0));
-    let y_off_bytes_s = k.alloc_sreg();
-    k.s_lshl_b32(y_off_bytes_s, y_off_s, 2);  // * 4 for f32
-
-    // ── Cooperative load addresses (same as matmul_lds_db) ──
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_full.0));  // K_full for row stride
-
-    // X: thread t → row=t>>1, half=t&1
-    let x_coop_row = k.alloc_vreg();
-    k.v_lshrrev_b32(x_coop_row, 1, tid);
-    let x_coop_half = k.alloc_vreg();
-    k.v_and_b32_imm(x_coop_half, tid, 1);
-
-    let x_abs_row = k.alloc_vreg();
-    let s_base_row = k.alloc_sreg();
-    k.s_lshl_b32(s_base_row, tile_row_s, 5);
-    k.v_mov_from_sgpr(x_abs_row, s_base_row);
-    k.v_add_u32(x_abs_row, x_abs_row, x_coop_row);
-
-    let x_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(x_row_byte, x_abs_row, k_vreg);
-    k.v_lshlrev_b32(x_row_byte, 1, x_row_byte);
-
-    let x_half_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_half_off, 4, x_coop_half);
-
-    // x_gmem_base = X_ptr + row_byte + half_off + K_start_bytes
-    let x_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_gmem_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_gmem_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_gmem_base, x_gmem_base, x_row_byte);
-    k.v_add_co_ci(VReg(x_gmem_base.0 + 1), VReg(x_gmem_base.0 + 1));
-    k.v_add_u32(x_gmem_base, x_gmem_base, x_half_off);
-    // Add K_start offset
-    let k_start_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_start_v, k_start_bytes_s);
-    k.v_add_u32(x_gmem_base, x_gmem_base, k_start_v);
-
-    let x_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(x_lds_off, 4, tid);
-
-    // WT: thread t → loads WT row t
-    let wt_abs_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(wt_abs_row, base_n_s);
-    k.v_add_u32(wt_abs_row, wt_abs_row, tid);
-
-    let wt_row_byte = k.alloc_vreg();
-    k.v_mul_lo_u32(wt_row_byte, wt_abs_row, k_vreg);
-    k.v_lshlrev_b32(wt_row_byte, 1, wt_row_byte);
-
-    let wt_gmem_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(wt_gmem_base, SReg(wt_ptr.0));
-    k.v_mov_from_sgpr(VReg(wt_gmem_base.0 + 1), SReg(wt_ptr.0 + 1));
-    k.v_add_co(wt_gmem_base, wt_gmem_base, wt_row_byte);
-    k.v_add_co_ci(VReg(wt_gmem_base.0 + 1), VReg(wt_gmem_base.0 + 1));
-    // Add K_start offset
-    k.v_add_u32(wt_gmem_base, wt_gmem_base, k_start_v);
-
-    let wt_lds_off = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_off, 5, tid);
-    k.push(Op::VAddU32 {
-        dst: wt_lds_off, src0: Operand::VReg(wt_lds_off),
-        src1: Operand::InlineInt(LDS_X as i32),
-    });
-
-    // ── LDS read addresses ──
-    let x_lds_read = k.alloc_vreg();
-    let s_wave_off = k.alloc_sreg();
-    k.s_lshl_b32(s_wave_off, wave_id_s, 9);
-    k.v_lshlrev_b32(x_lds_read, 5, lane_row);
-    let tmp_wave = k.alloc_vreg();
-    k.v_mov_from_sgpr(tmp_wave, s_wave_off);
-    k.v_add_u32(x_lds_read, x_lds_read, tmp_wave);
-
-    let wt_lds_read_base = k.alloc_vreg();
-    k.v_lshlrev_b32(wt_lds_read_base, 5, lane_row);
-
-    // ── Temp + fragment VGPRs ──
-    let gmem_x = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt0 = k.alloc_vreg_array(4, Alignment::Align4);
-    let gmem_wt1 = k.alloc_vreg_array(4, Alignment::Align4);
-
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // ── K-loop state: iterate K_per_split/tile_k times ──
-    let k_byte_off = k.alloc_vreg();
-    k.v_mov_imm(k_byte_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let k_step = (tile_k * 2) as i32;
-
-    let buf0_off = k.alloc_vreg();
-    k.v_mov_imm(buf0_off, 0);
-    let buf1_off = k.alloc_vreg();
-    k.v_mov_imm(buf1_off, LDS_BUF as i32);
-
-    // ── Reuse same macro structure as matmul_lds_db ──
-    macro_rules! coop_gmem_load {
-        ($kernel:expr, $koff:expr) => {{
-            let xa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(xa, x_gmem_base);
-            $kernel.v_mov(VReg(xa.0 + 1), VReg(x_gmem_base.0 + 1));
-            $kernel.v_add_co(xa, xa, $koff);
-            $kernel.v_add_co_ci(VReg(xa.0 + 1), VReg(xa.0 + 1));
-            $kernel.global_load(gmem_x, xa, Width::B128, 0);
-            let wa = $kernel.alloc_vreg_array(2, Alignment::Align2);
-            $kernel.v_mov(wa, wt_gmem_base);
-            $kernel.v_mov(VReg(wa.0 + 1), VReg(wt_gmem_base.0 + 1));
-            $kernel.v_add_co(wa, wa, $koff);
-            $kernel.v_add_co_ci(VReg(wa.0 + 1), VReg(wa.0 + 1));
-            $kernel.global_load(gmem_wt0, wa, Width::B128, 0);
-            $kernel.global_load(gmem_wt1, wa, Width::B128, 16);
-        }};
-    }
-
-    macro_rules! coop_lds_store {
-        ($kernel:expr, $buf_off:expr) => {{
-            let xa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xa, x_lds_off, $buf_off);
-            $kernel.ds_store_b128(xa, gmem_x, 0);
-            let wa = $kernel.alloc_vreg();
-            $kernel.v_add_u32(wa, wt_lds_off, $buf_off);
-            $kernel.ds_store_b128(wa, gmem_wt0, 0);
-            $kernel.ds_store_b128(wa, gmem_wt1, 16);
-        }};
-    }
-
-    macro_rules! lds_read_frags {
-        ($kernel:expr, $buf_off:expr) => {{
-            let xr = $kernel.alloc_vreg();
-            $kernel.v_add_u32(xr, x_lds_read, $buf_off);
-            $kernel.ds_load_b128(x_frag, xr, 0);
-            $kernel.ds_load_b128(VReg(x_frag.0 + 4), xr, 16);
-            for t in 0..n_tiles {
-                let wr = $kernel.alloc_vreg();
-                $kernel.v_add_u32(wr, wt_lds_read_base, $buf_off);
-                let off: u16 = (LDS_X + (t as u32) * 16 * 32) as u16;
-                $kernel.ds_load_b128(wt_frags[t], wr, off);
-                $kernel.ds_load_b128(VReg(wt_frags[t].0 + 4), wr, off + 16);
-            }
-        }};
-    }
-
-    // ── Prologue: load first K-tile ──
-    coop_gmem_load!(k, k_byte_off);
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    // ── Main loop (uses K_per_split as bound) ──
-    let loop_label = k.make_label("sk_loop");
-    k.label(&loop_label);
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_per_split.0));
-    let epilog_a = k.make_label("sk_ea");
-    k.branch_scc1(&epilog_a);
-
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-
-    k.s_cmp_ge_u32(k_iter_s, SReg(k_per_split.0));
-    let epilog_b = k.make_label("sk_eb");
-    k.branch_scc1(&epilog_b);
-
-    coop_gmem_load!(k, k_byte_off);
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    k.wait_vmcnt(0);
-    coop_lds_store!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-    k.push(Op::VAddU32 { dst: k_byte_off, src0: Operand::VReg(k_byte_off), src1: Operand::InlineInt(k_step) });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_per_split.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Epilogues ──
-    k.label(&epilog_a);
-    lds_read_frags!(k, buf0_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-    let store_label = k.make_label("sk_store");
-    k.s_mov_imm(k_iter_s, 0);
-    k.s_cmp_eq_u32_imm(k_iter_s, 0);
-    k.branch_scc1(&store_label);
-
-    k.label(&epilog_b);
-    lds_read_frags!(k, buf1_off);
-    k.wait_lgkmcnt(0);
-    for t in 0..n_tiles { k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]); }
-
-    // ══════════════════════════════════════════════════════════════════
-    // STORE: write to Y_partial + split_idx * stride_mn * 4
-    // ══════════════════════════════════════════════════════════════════
-    k.label(&store_label);
-
-    // Compute Y base with split offset
-    // y_split_base = Y_ptr + y_off_bytes
-    let y_split_lo = k.alloc_sreg();
-    let y_split_hi = k.alloc_sreg();
-    k.push(Op::SAddU32 { dst: y_split_lo, src0: SReg(y_ptr.0), src1: SOperand::SReg(y_off_bytes_s) });
-    k.s_addc_u32_imm(y_split_hi, SReg(y_ptr.0 + 1), 0);
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base, base_n_s);
-    k.v_add_u32(col_base, col_base, lane_row);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 2, col_base);
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, y_split_lo);
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), y_split_hi);
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr, src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// reduce_splitk: sum S partial results into final output
-// ============================================================================
-
-/// Elementwise sum of S split-K partial results.
-///
-/// out[i] = sum(partials[s * count + i] for s in 0..split_k)
-///
-/// Kernargs (24 bytes):
-///   0:  partials_ptr (8B) — f32 [split_k * count]
-///   8:  out_ptr      (8B) — f32 [count]
-///   16: count        (4B) — number of elements per split
-///   20: split_k      (4B) — number of splits
-///
-/// Grid: [ceil(count/256)*256, 1, 1], WG: [256, 1, 1]
-pub fn reduce_splitk() -> T0Kernel {
-    let mut k = T0Kernel::new("t0_reduce_splitk");
-
-    let part_ptr = k.arg_ptr("partials");
-    let out_ptr = k.arg_ptr("out");
-    let count = k.arg_u32("count");
-    let split_k = k.arg_u32("split_k");
-    k.emit_arg_loads();
-
-    let gid = k.compute_global_id_x(256);
-
-    // Bounds check
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(count.0));
-    let saved = k.bounds_check_begin(gid, n_vreg);
-
-    // Load and sum S partial values
-    let sum = k.alloc_vreg();
-    k.v_mov_imm(sum, 0);
-
-    // Base addr = partials + gid * 4
-    let base_off = k.alloc_vreg();
-    k.v_lshlrev_b32(base_off, 2, gid);
-
-    let base_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(base_addr, SReg(part_ptr.0));
-    k.v_mov_from_sgpr(VReg(base_addr.0 + 1), SReg(part_ptr.0 + 1));
-    k.v_add_co(base_addr, base_addr, base_off);
-    k.v_add_co_ci(VReg(base_addr.0 + 1), VReg(base_addr.0 + 1));
-
-    // Stride = count * 4 (bytes between split planes)
-    let stride = k.alloc_vreg();
-    k.v_mov_from_sgpr(stride, SReg(count.0));
-    k.v_lshlrev_b32(stride, 2, stride);
-
-    // Loop over S splits
-    let s_iter = k.alloc_sreg();
-    k.s_mov_imm(s_iter, 0);
-
-    let loop_label = k.make_label("reduce_loop");
-    k.label(&loop_label);
-
-    let val = k.alloc_vreg();
-    k.global_load(val, base_addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-    k.v_add_f32(sum, sum, val);
-
-    k.v_add_co(base_addr, base_addr, stride);
-    k.v_add_co_ci(VReg(base_addr.0 + 1), VReg(base_addr.0 + 1));
-
-    k.s_add_u32(s_iter, s_iter, 1);
-    k.s_cmp_lt_u32(s_iter, SReg(split_k.0));
-    k.branch_scc1(&loop_label);
-
-    // Store result
-    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(out_addr, SReg(out_ptr.0));
-    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), SReg(out_ptr.0 + 1));
-    k.v_add_co(out_addr, out_addr, base_off);
-    k.v_add_co_ci(VReg(out_addr.0 + 1), VReg(out_addr.0 + 1));
-    k.global_store(out_addr, sum, Width::B32, 0);
-
-    k.bounds_check_end(saved);
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_tn: dW = X^T @ dY  (TN-GEMM, f32 inputs, on-the-fly bf16 conversion)
-// ============================================================================
-
-/// Generate TN-GEMM backward weight kernel: dW[M,N] = X[K,M]^T @ dY[K,N]
-///
-/// Reads f32 inputs directly, converts f32→bf16 on-the-fly inside the kernel.
-/// M (inner dimension for X columns) is baked at compile time.
-///
-/// Kernargs layout (32 bytes):
-/// | Offset | Size | Name |
-/// |--------|------|------|
-/// | 0      | 8    | X_ptr (f32, [K, M]) |
-/// | 8      | 8    | DY_ptr (f32, [K, N]) |
-/// | 16     | 8    | dW_ptr (f32, [M, N]) |
-/// | 24     | 4    | K (reduction dimension) |
-/// | 28     | 4    | N (output columns of dY) |
-///
-/// Grid: [ceil(N/64)*64, ceil(M/32), 1], WG: 64 threads
-pub fn matmul_tn(sched: &dyn Schedule, m_dim: u32) -> T0Kernel {
-    let mut k = T0Kernel::new(&format!("t0_matmul_tn_m{}", m_dim));
-    let (_, _) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    let x_stride = m_dim * 4;  // X row stride in bytes (f32)
-
-    // ── Args ──
-    let x_ptr = k.arg_ptr("X");
-    let dy_ptr = k.arg_ptr("DY");
-    let dw_ptr = k.arg_ptr("dW");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── Capture TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-
-    // ── Accumulators (4 tiles × 8 VGPRs) ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Compute tile_m ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    // ── X column base: &X[0, tile_m + lane_row] ──
-    let col_in_x = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_in_x, s_tmp1);
-    k.v_add_u32(col_in_x, col_in_x, lane_row);
-    let col_off_x = k.alloc_vreg();
-    k.v_lshlrev_b32(col_off_x, 2, col_in_x);
-
-    let x_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_base, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(x_base.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(x_base, x_base, col_off_x);
-    k.v_add_co_ci(VReg(x_base.0 + 1), VReg(x_base.0 + 1));
-
-    // ── dY column base offset ──
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-    let col_base_dy = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base_dy, base_n_s);
-    k.v_add_u32(col_base_dy, col_base_dy, lane_row);
-    let col_off_dy = k.alloc_vreg();
-    k.v_lshlrev_b32(col_off_dy, 2, col_base_dy);
-
-    // ── Strides ──
-    let x_stride_v = k.alloc_vreg();
-    k.v_mov_imm(x_stride_v, x_stride as i32);
-    let dy_stride_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(dy_stride_v, SReg(n_dim.0));
-    k.v_lshlrev_b32(dy_stride_v, 2, dy_stride_v);
-
-    // ── WMMA fragments ──
-    let x_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let wt_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    let f32_scratch = k.alloc_vreg_array(16, Alignment::None);
-
-    // ── K-loop ──
-    let k_off_x = k.alloc_vreg();
-    k.v_mov_imm(k_off_x, 0);
-    let k_off_dy = k.alloc_vreg();
-    k.v_mov_imm(k_off_dy, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    let loop_label = k.make_label("k_loop");
-    k.label(&loop_label);
-
-    // Load A: 16 f32 from X column, pack to bf16x2
-    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(x_addr, x_base);
-    k.v_mov(VReg(x_addr.0 + 1), VReg(x_base.0 + 1));
-    k.v_add_co(x_addr, x_addr, k_off_x);
-    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    for i in 0..16u32 {
-        k.global_load(VReg(f32_scratch.0 + i), x_addr, Width::B32, 0);
-        if i < 15 {
-            k.v_add_co(x_addr, x_addr, x_stride_v);
-            k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-        }
-    }
-    k.wait_vmcnt(0);
-    for pair in 0..8u32 {
-        k.cvt_pk_bf16_f32(
-            VReg(x_frag.0 + pair),
-            VReg(f32_scratch.0 + pair * 2),
-            VReg(f32_scratch.0 + pair * 2 + 1),
-        );
-    }
-
-    // Load B subtiles: 4 × 16 f32 from dY columns
-    for t in 0..n_tiles {
-        let dy_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(dy_addr, SReg(dy_ptr.0));
-        k.v_mov_from_sgpr(VReg(dy_addr.0 + 1), SReg(dy_ptr.0 + 1));
-        k.v_add_co(dy_addr, dy_addr, col_off_dy);
-        k.v_add_co_ci(VReg(dy_addr.0 + 1), VReg(dy_addr.0 + 1));
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: dy_addr,
-                src0: Operand::VReg(dy_addr),
-                src1: Operand::InlineInt((t * 16 * 4) as i32),
-            });
-        }
-        k.v_add_co(dy_addr, dy_addr, k_off_dy);
-        k.v_add_co_ci(VReg(dy_addr.0 + 1), VReg(dy_addr.0 + 1));
-
-        for i in 0..16u32 {
-            k.global_load(VReg(f32_scratch.0 + i), dy_addr, Width::B32, 0);
-            if i < 15 {
-                k.v_add_co(dy_addr, dy_addr, dy_stride_v);
-                k.v_add_co_ci(VReg(dy_addr.0 + 1), VReg(dy_addr.0 + 1));
-            }
-        }
-        k.wait_vmcnt(0);
-        for pair in 0..8u32 {
-            k.cvt_pk_bf16_f32(
-                VReg(wt_frags[t].0 + pair),
-                VReg(f32_scratch.0 + pair * 2),
-                VReg(f32_scratch.0 + pair * 2 + 1),
-            );
-        }
-    }
-
-    // WMMA
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], x_frag, wt_frags[t], acc[t]);
-    }
-
-    // K-loop advance
-    let k16_x_stride = k.alloc_vreg();
-    k.v_mov_imm(k16_x_stride, (16 * x_stride) as i32);
-    k.v_add_co(k_off_x, k_off_x, k16_x_stride);
-    let dy_stride_16 = k.alloc_vreg();
-    k.v_lshlrev_b32(dy_stride_16, 4, dy_stride_v);
-    k.v_add_co(k_off_dy, k_off_dy, dy_stride_16);
-
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Store phase ──
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_bytes = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_bytes, base_n_s);
-    k.v_add_u32(col_bytes, col_bytes, lane_row);
-    k.v_lshlrev_b32(col_bytes, 2, col_bytes);
-
-    for t in 0..n_tiles {
-        let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_addr, SReg(dw_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(dw_ptr.0 + 1));
-        k.v_add_co(y_addr, y_addr, row_bytes);
-        k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-        k.v_add_u32(y_addr, y_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: y_addr,
-                src0: Operand::VReg(y_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(y_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(y_addr, y_addr, row_stride);
-                k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_nn_f32: C = A @ B (NN-GEMM, f32 inputs/outputs, on-the-fly bf16)
-// ============================================================================
-
-/// Generate NN-GEMM kernel: C[M,N] = A[M,K] @ B[K,N]
-///
-/// Reads f32 inputs directly, converts f32→bf16 on-the-fly inside the kernel.
-/// Uses WMMA for computation, stores f32 output.
-///
-/// Kernargs layout (32 bytes):
-/// | Offset | Size | Name |
-/// |--------|------|------|
-/// | 0      | 8    | A_ptr (f32, [M, K]) |
-/// | 8      | 8    | B_ptr (f32, [K, N]) |
-/// | 16     | 8    | C_ptr (f32, [M, N]) |
-/// | 24     | 4    | K (reduction dimension) |
-/// | 28     | 4    | N (output columns) |
-///
-/// Grid: [ceil(N/64)*64, ceil(M/32), 1], WG: 64 threads
-pub fn matmul_nn_f32(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_nn_f32");
-    let (_, _) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    // ── Args ──
-    let a_ptr = k.arg_ptr("A");
-    let b_ptr = k.arg_ptr("B");
-    let c_ptr = k.arg_ptr("C");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── Capture TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-
-    // ── Accumulators (4 tiles × 8 VGPRs) ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Compute tile_m ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    // ── A row base: &A[tile_m + lane_row, 0] ──
-    // In NN layout, A[m, k] is at A_ptr + m * K * 4 + k * 4
-    // For the K-loop, A's 16 consecutive k values are contiguous in memory
-    let a_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(a_row, s_tmp1);
-    k.v_add_u32(a_row, a_row, lane_row);
-    // a_row_offset = a_row * K * 4
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let a_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(a_row_off, a_row, k_vreg);
-    k.v_lshlrev_b32(a_row_off, 2, a_row_off);
-
-    let a_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(a_base, SReg(a_ptr.0));
-    k.v_mov_from_sgpr(VReg(a_base.0 + 1), SReg(a_ptr.0 + 1));
-    k.v_add_co(a_base, a_base, a_row_off);
-    k.v_add_co_ci(VReg(a_base.0 + 1), VReg(a_base.0 + 1));
-
-    // ── B column base offset ──
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-    let col_base_b = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_base_b, base_n_s);
-    k.v_add_u32(col_base_b, col_base_b, lane_row);
-    let col_off_b = k.alloc_vreg();
-    k.v_lshlrev_b32(col_off_b, 2, col_base_b);
-
-    // ── Strides ──
-    // A stride per K step: contiguous f32 → 4 bytes
-    // Not needed as a vreg; we'll load 16 consecutive elements starting k_off
-    let b_stride_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(b_stride_v, SReg(n_dim.0));
-    k.v_lshlrev_b32(b_stride_v, 2, b_stride_v);  // N * 4 bytes
-
-    // ── WMMA fragments ──
-    let a_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let b_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    let f32_scratch = k.alloc_vreg_array(16, Alignment::None);
-
-    // ── K-loop ──
-    let k_off_a = k.alloc_vreg();  // byte offset into A row for current K tile
-    k.v_mov_imm(k_off_a, 0);
-    let k_off_b = k.alloc_vreg();
-    k.v_mov_imm(k_off_b, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    let loop_label = k.make_label("k_loop");
-    k.label(&loop_label);
-
-    // Load A: 16 f32 from A row contiguously starting at k_off_a
-    // a_addr = a_base + k_off_a, then load 16 consecutive f32 (stride=4 bytes)
-    let a_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(a_addr, a_base);
-    k.v_mov(VReg(a_addr.0 + 1), VReg(a_base.0 + 1));
-    k.v_add_co(a_addr, a_addr, k_off_a);
-    k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-    for i in 0..16u32 {
-        k.global_load(VReg(f32_scratch.0 + i), a_addr, Width::B32, 0);
-        if i < 15 {
-            // A elements are contiguous: stride = 4 bytes
-            k.push(Op::VAddU32 {
-                dst: a_addr,
-                src0: Operand::VReg(a_addr),
-                src1: Operand::InlineInt(4),
-            });
-        }
-    }
-    k.wait_vmcnt(0);
-    for pair in 0..8u32 {
-        k.cvt_pk_bf16_f32(
-            VReg(a_frag.0 + pair),
-            VReg(f32_scratch.0 + pair * 2),
-            VReg(f32_scratch.0 + pair * 2 + 1),
-        );
-    }
-
-    // Load B subtiles: 4 × 16 f32 from B columns (stride = N*4)
-    for t in 0..n_tiles {
-        let b_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(b_addr, SReg(b_ptr.0));
-        k.v_mov_from_sgpr(VReg(b_addr.0 + 1), SReg(b_ptr.0 + 1));
-        k.v_add_co(b_addr, b_addr, col_off_b);
-        k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: b_addr,
-                src0: Operand::VReg(b_addr),
-                src1: Operand::InlineInt((t * 16 * 4) as i32),
-            });
-        }
-        k.v_add_co(b_addr, b_addr, k_off_b);
-        k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-
-        for i in 0..16u32 {
-            k.global_load(VReg(f32_scratch.0 + i), b_addr, Width::B32, 0);
-            if i < 15 {
-                k.v_add_co(b_addr, b_addr, b_stride_v);
-                k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-            }
-        }
-        k.wait_vmcnt(0);
-        for pair in 0..8u32 {
-            k.cvt_pk_bf16_f32(
-                VReg(b_frags[t].0 + pair),
-                VReg(f32_scratch.0 + pair * 2),
-                VReg(f32_scratch.0 + pair * 2 + 1),
-            );
-        }
-    }
-
-    // WMMA
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], a_frag, b_frags[t], acc[t]);
-    }
-
-    // K-loop advance
-    // A: advance by 16 * 4 = 64 bytes (contiguous elements)
-    k.push(Op::VAddU32 {
-        dst: k_off_a,
-        src0: Operand::VReg(k_off_a),
-        src1: Operand::InlineInt(64),
-    });
-    // B: advance by 16 * N * 4 bytes (16 rows)
-    let b_stride_16 = k.alloc_vreg();
-    k.v_lshlrev_b32(b_stride_16, 4, b_stride_v);
-    k.v_add_co(k_off_b, k_off_b, b_stride_16);
-
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Store phase: f32 output ──
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_bytes = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_bytes, base_n_s);
-    k.v_add_u32(col_bytes, col_bytes, lane_row);
-    k.v_lshlrev_b32(col_bytes, 2, col_bytes);
-
-    for t in 0..n_tiles {
-        let c_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(c_addr, SReg(c_ptr.0));
-        k.v_mov_from_sgpr(VReg(c_addr.0 + 1), SReg(c_ptr.0 + 1));
-        k.v_add_co(c_addr, c_addr, row_bytes);
-        k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-        k.v_add_u32(c_addr, c_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: c_addr,
-                src0: Operand::VReg(c_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(c_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(c_addr, c_addr, row_stride);
-                k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_abt_f32: C = A @ B^T (ABT-GEMM, f32 in/out, on-the-fly bf16)
-// ============================================================================
-
-/// Generate ABT-GEMM kernel: C[M,N] = A[M,K] @ B[N,K]^T
-///
-/// Both A and B have contiguous rows of length K. This is the simplest
-/// memory access pattern for WMMA: both fragments load contiguous data.
-///
-/// Kernargs layout (32 bytes):
-/// | Offset | Size | Name |
-/// |--------|------|------|
-/// | 0      | 8    | A_ptr (f32, [M, K]) |
-/// | 8      | 8    | B_ptr (f32, [N, K]) |
-/// | 16     | 8    | C_ptr (f32, [M, N]) |
-/// | 24     | 4    | K (reduction dimension) |
-/// | 28     | 4    | N (output columns = rows of B) |
-///
-/// Grid: [ceil(N/64)*64, ceil(M/32), 1], WG: 64 threads
-pub fn matmul_abt_f32(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_abt_f32");
-    let (_, _) = sched.gemm_tile_mn();
-    let tile_k = sched.gemm_tile_k();
-    let n_tiles = sched.gemm_n_wmma_tiles();
-
-    // ── Args ──
-    let a_ptr = k.arg_ptr("A");
-    let b_ptr = k.arg_ptr("B");
-    let c_ptr = k.arg_ptr("C");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    // ── Capture TGIDs ──
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    // ── Thread decomposition ──
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-
-    // ── Accumulators (4 tiles × 8 VGPRs) ──
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    // ── Compute tile_m ──
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-
-    // ── A row base: &A[tile_m + lane_row, 0] ──
-    let a_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(a_row, s_tmp1);
-    k.v_add_u32(a_row, a_row, lane_row);
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let a_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(a_row_off, a_row, k_vreg);
-    k.v_lshlrev_b32(a_row_off, 2, a_row_off);
-
-    let a_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(a_base, SReg(a_ptr.0));
-    k.v_mov_from_sgpr(VReg(a_base.0 + 1), SReg(a_ptr.0 + 1));
-    k.v_add_co(a_base, a_base, a_row_off);
-    k.v_add_co_ci(VReg(a_base.0 + 1), VReg(a_base.0 + 1));
-
-    // ── B row base: &B[tile_n + lane_row, 0] for each subtile ──
-    // B is [N, K], B^T column = B row. We need B rows starting at tile_n
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // B row offset per lane_row: &B[base_n + lane_row, 0]
-    let b_row_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(b_row_base, base_n_s);
-    k.v_add_u32(b_row_base, b_row_base, lane_row);
-    let b_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(b_row_off, b_row_base, k_vreg);
-    k.v_lshlrev_b32(b_row_off, 2, b_row_off);
-
-    let b_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(b_base, SReg(b_ptr.0));
-    k.v_mov_from_sgpr(VReg(b_base.0 + 1), SReg(b_ptr.0 + 1));
-    k.v_add_co(b_base, b_base, b_row_off);
-    k.v_add_co_ci(VReg(b_base.0 + 1), VReg(b_base.0 + 1));
-
-    // B subtile stride: 16 rows of B = 16 * K * 4 bytes
-    let b_subtile_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(b_subtile_stride, 2, k_vreg);  // K * 4 bytes per row
-    let b_16row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(b_16row_stride, 4, b_subtile_stride);  // not used; we compute per-tile
-
-    // ── WMMA fragments ──
-    let a_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let b_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    let f32_scratch = k.alloc_vreg_array(16, Alignment::None);
-
-    // ── K-loop ──
-    let k_off = k.alloc_vreg();  // byte offset into row for current K tile
-    k.v_mov_imm(k_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    let loop_label = k.make_label("k_loop");
-    k.label(&loop_label);
-
-    // Load A: 16 contiguous f32 from A[row, k..k+15]
-    let a_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov(a_addr, a_base);
-    k.v_mov(VReg(a_addr.0 + 1), VReg(a_base.0 + 1));
-    k.v_add_co(a_addr, a_addr, k_off);
-    k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-    for i in 0..16u32 {
-        k.global_load(VReg(f32_scratch.0 + i), a_addr, Width::B32, 0);
-        if i < 15 {
-            k.push(Op::VAddU32 {
-                dst: a_addr,
-                src0: Operand::VReg(a_addr),
-                src1: Operand::InlineInt(4),
-            });
-        }
-    }
-    k.wait_vmcnt(0);
-    for pair in 0..8u32 {
-        k.cvt_pk_bf16_f32(
-            VReg(a_frag.0 + pair),
-            VReg(f32_scratch.0 + pair * 2),
-            VReg(f32_scratch.0 + pair * 2 + 1),
-        );
-    }
-
-    // Load B subtiles: 4 × 16 contiguous f32 from B^T columns = B rows
-    for t in 0..n_tiles {
-        // b_addr = b_base + t*16*K*4 + k_off
-        let b_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov(b_addr, b_base);
-        k.v_mov(VReg(b_addr.0 + 1), VReg(b_base.0 + 1));
-        if t > 0 {
-            // Offset by t*16 rows: t * 16 * K * 4 bytes
-            let t_off = k.alloc_vreg();
-            k.v_mov_imm(t_off, (t * 16) as i32);
-            let t_byte = k.alloc_vreg();
-            k.v_mul_lo_u32(t_byte, t_off, b_subtile_stride);
-            k.v_add_co(b_addr, b_addr, t_byte);
-            k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-        }
-        k.v_add_co(b_addr, b_addr, k_off);
-        k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-
-        for i in 0..16u32 {
-            k.global_load(VReg(f32_scratch.0 + i), b_addr, Width::B32, 0);
-            if i < 15 {
-                k.push(Op::VAddU32 {
-                    dst: b_addr,
-                    src0: Operand::VReg(b_addr),
-                    src1: Operand::InlineInt(4),
-                });
-            }
-        }
-        k.wait_vmcnt(0);
-        for pair in 0..8u32 {
-            k.cvt_pk_bf16_f32(
-                VReg(b_frags[t].0 + pair),
-                VReg(f32_scratch.0 + pair * 2),
-                VReg(f32_scratch.0 + pair * 2 + 1),
-            );
-        }
-    }
-
-    // WMMA
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], a_frag, b_frags[t], acc[t]);
-    }
-
-    // K-loop advance: 16 elements * 4 bytes = 64 bytes
-    k.push(Op::VAddU32 {
-        dst: k_off,
-        src0: Operand::VReg(k_off),
-        src1: Operand::InlineInt(64),
-    });
-
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Store phase: f32 output C[M,N] ──
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_bytes = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_bytes, base_n_s);
-    k.v_add_u32(col_bytes, col_bytes, lane_row);
-    k.v_lshlrev_b32(col_bytes, 2, col_bytes);
-
-    for t in 0..n_tiles {
-        let c_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(c_addr, SReg(c_ptr.0));
-        k.v_mov_from_sgpr(VReg(c_addr.0 + 1), SReg(c_ptr.0 + 1));
-        k.v_add_co(c_addr, c_addr, row_bytes);
-        k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-        k.v_add_u32(c_addr, c_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: c_addr,
-                src0: Operand::VReg(c_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(c_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(c_addr, c_addr, row_stride);
-                k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// matmul_abt_f32_db: Vectorized + Double-Buffered backward GEMM  C = A @ B^T
-// ============================================================================
-
-/// Optimized backward GEMM: C[M,N] = A[M,K] @ B[N,K]^T (both f32 inputs).
-///
-/// Uses vectorized global_load_b128 (4× vs 16× scalar loads per fragment)
-/// plus K-loop double buffering. Each lane loads 4 contiguous f32 via b128,
-/// then packs to bf16 for WMMA. 4× better memory bandwidth vs matmul_abt_f32.
-///
-/// Kernargs (32 bytes): A_ptr(8), B_ptr(8), C_ptr(8), K(4), N(4)
-/// Grid: [ceil(N/64)*64, ceil(M/32), 1]
-pub fn matmul_abt_f32_db(sched: &dyn Schedule) -> T0Kernel {
-    let mut k = T0Kernel::new("t0_matmul_abt_f32_db");
-    let tile_k = sched.gemm_tile_k();  // 16
-    let n_tiles = sched.gemm_n_wmma_tiles();  // 4
-
-    let a_ptr = k.arg_ptr("A");
-    let b_ptr = k.arg_ptr("B");
-    let c_ptr = k.arg_ptr("C");
-    let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    let tile_col_s = k.alloc_sreg();
-    let tile_row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(tile_row_s);
-
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, VReg(0));
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, lane_id, 15);
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-
-    // Accumulators
-    let acc: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-    for a in &acc {
-        for i in 0..8u32 { k.v_mov_imm(VReg(a.0 + i), 0); }
-    }
-
-    let s_tmp1 = k.alloc_sreg();
-    let s_tmp2 = k.alloc_sreg();
-    k.s_lshl_b32(s_tmp1, tile_row_s, 5);
-    k.s_lshl_b32(s_tmp2, wave_id_s, 4);
-    k.push(Op::SAddU32 { dst: s_tmp1, src0: s_tmp1, src1: SOperand::SReg(s_tmp2) });
-    let base_n_s = k.alloc_sreg();
-    k.s_lshl_b32(base_n_s, tile_col_s, 6);
-
-    // A row base: &A[tile_m + lane_row, 0]
-    let a_row = k.alloc_vreg();
-    k.v_mov_from_sgpr(a_row, s_tmp1);
-    k.v_add_u32(a_row, a_row, lane_row);
-    let k_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(k_vreg, SReg(k_dim.0));
-    let a_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(a_row_off, a_row, k_vreg);
-    k.v_lshlrev_b32(a_row_off, 2, a_row_off);
-
-    let a_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(a_base, SReg(a_ptr.0));
-    k.v_mov_from_sgpr(VReg(a_base.0 + 1), SReg(a_ptr.0 + 1));
-    k.v_add_co(a_base, a_base, a_row_off);
-    k.v_add_co_ci(VReg(a_base.0 + 1), VReg(a_base.0 + 1));
-
-    // B row base per lane_row: &B[base_n + lane_row, 0]
-    let b_row_base = k.alloc_vreg();
-    k.v_mov_from_sgpr(b_row_base, base_n_s);
-    k.v_add_u32(b_row_base, b_row_base, lane_row);
-    let b_row_off = k.alloc_vreg();
-    k.v_mul_lo_u32(b_row_off, b_row_base, k_vreg);
-    k.v_lshlrev_b32(b_row_off, 2, b_row_off);
-
-    let b_base = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(b_base, SReg(b_ptr.0));
-    k.v_mov_from_sgpr(VReg(b_base.0 + 1), SReg(b_ptr.0 + 1));
-    k.v_add_co(b_base, b_base, b_row_off);
-    k.v_add_co_ci(VReg(b_base.0 + 1), VReg(b_base.0 + 1));
-
-    // B subtile stride: 16 * K * 4 bytes
-    let b_subtile_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(b_subtile_stride, 2, k_vreg);
-    let b_16row = k.alloc_vreg();
-    k.v_mov_imm(b_16row, 16);
-    k.v_mul_lo_u32(b_16row, b_16row, b_subtile_stride);
-
-    // WMMA fragments + vectorized load buffers
-    let a_frag = k.alloc_vreg_array(8, Alignment::Align8);
-    let b_frags: Vec<VReg> = (0..n_tiles)
-        .map(|_| k.alloc_vreg_array(8, Alignment::Align8))
-        .collect();
-
-    // Vectorized load buffers (4× b128 = 16 f32 = 4 b128 loads)
-    let a_buf = k.alloc_vreg_array(16, Alignment::Align4);
-    let b_buf = k.alloc_vreg_array(16, Alignment::Align4);
-
-    // K-loop state
-    let k_off = k.alloc_vreg();
-    k.v_mov_imm(k_off, 0);
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-
-    // ── K-loop with vectorized loads ──
-    let loop_label = k.make_label("abt_loop");
-    k.label(&loop_label);
-
-    // Load A: 4× b128 = 16 f32 values from A[row, k..k+15]
-    {
-        let a_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov(a_addr, a_base);
-        k.v_mov(VReg(a_addr.0 + 1), VReg(a_base.0 + 1));
-        k.v_add_co(a_addr, a_addr, k_off);
-        k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-        k.global_load(VReg(a_buf.0),    a_addr, Width::B128, 0);
-        k.global_load(VReg(a_buf.0+4),  a_addr, Width::B128, 16);
-        k.global_load(VReg(a_buf.0+8),  a_addr, Width::B128, 32);
-        k.global_load(VReg(a_buf.0+12), a_addr, Width::B128, 48);
-    }
-
-    // Load + convert B tiles
-    for t in 0..n_tiles {
-        let b_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov(b_addr, b_base);
-        k.v_mov(VReg(b_addr.0 + 1), VReg(b_base.0 + 1));
-        if t > 0 {
-            let t_off = k.alloc_vreg();
-            k.v_mov_imm(t_off, t as i32);
-            let t_byte = k.alloc_vreg();
-            k.v_mul_lo_u32(t_byte, t_off, b_16row);
-            k.v_add_co(b_addr, b_addr, t_byte);
-            k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-        }
-        k.v_add_co(b_addr, b_addr, k_off);
-        k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-        k.global_load(VReg(b_buf.0),    b_addr, Width::B128, 0);
-        k.global_load(VReg(b_buf.0+4),  b_addr, Width::B128, 16);
-        k.global_load(VReg(b_buf.0+8),  b_addr, Width::B128, 32);
-        k.global_load(VReg(b_buf.0+12), b_addr, Width::B128, 48);
-        k.wait_vmcnt(0);
-        // Convert f32 pairs → bf16 packed
-        for pair in 0..8u32 {
-            k.cvt_pk_bf16_f32(
-                VReg(b_frags[t].0 + pair),
-                VReg(b_buf.0 + pair * 2),
-                VReg(b_buf.0 + pair * 2 + 1),
-            );
-        }
-    }
-
-    // Wait for A loads and convert
-    k.wait_vmcnt(0);
-    for pair in 0..8u32 {
-        k.cvt_pk_bf16_f32(
-            VReg(a_frag.0 + pair),
-            VReg(a_buf.0 + pair * 2),
-            VReg(a_buf.0 + pair * 2 + 1),
-        );
-    }
-
-    // WMMA
-    for t in 0..n_tiles {
-        k.wmma_bf16_f32(acc[t], a_frag, b_frags[t], acc[t]);
-    }
-
-    // K-loop advance: 16 elements * 4 bytes = 64 bytes
-    k.push(Op::VAddU32 {
-        dst: k_off, src0: Operand::VReg(k_off), src1: Operand::InlineInt(64),
-    });
-    k.s_add_u32(k_iter_s, k_iter_s, tile_k as i32);
-    k.s_cmp_lt_u32(k_iter_s, SReg(k_dim.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Store f32 output ──
-    let base_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(base_row_v, s_tmp1);
-    k.v_add_u32(base_row_v, base_row_v, lane_half);
-
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n_dim.0));
-    let row_bytes = k.alloc_vreg();
-    k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
-    k.v_lshlrev_b32(row_bytes, 2, row_bytes);
-    let row_stride = k.alloc_vreg();
-    k.v_lshlrev_b32(row_stride, 3, n_vreg);
-
-    let col_bytes = k.alloc_vreg();
-    k.v_mov_from_sgpr(col_bytes, base_n_s);
-    k.v_add_u32(col_bytes, col_bytes, lane_row);
-    k.v_lshlrev_b32(col_bytes, 2, col_bytes);
-
-    for t in 0..n_tiles {
-        let c_addr = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(c_addr, SReg(c_ptr.0));
-        k.v_mov_from_sgpr(VReg(c_addr.0 + 1), SReg(c_ptr.0 + 1));
-        k.v_add_co(c_addr, c_addr, row_bytes);
-        k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-        k.v_add_u32(c_addr, c_addr, col_bytes);
-        if t > 0 {
-            k.push(Op::VAddU32 {
-                dst: c_addr, src0: Operand::VReg(c_addr),
-                src1: Operand::InlineInt((t * 64) as i32),
-            });
-        }
-        for vk in 0..8u32 {
-            k.global_store(c_addr, VReg(acc[t].0 + vk), Width::B32, 0);
-            if vk < 7 {
-                k.v_add_co(c_addr, c_addr, row_stride);
-                k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-            }
-        }
-    }
-
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// ============================================================================
-// sum_reduce: out = sum(x)
-// ============================================================================
-
-/// Generate sum reduction kernel: out[0] = sum(x[0..n])
-///
-/// Uses wave32 reduction (ds_swizzle butterfly).
-/// Single WG (32 threads) iterates over all elements.
-///
-/// Kernargs (20 bytes): x_ptr(0), out_ptr(8), n(16)
-/// Grid: [32, 1, 1], WG: 32
-pub fn sum_reduce() -> T0Kernel {
-    let mut k = T0Kernel::new("t0_sum_reduce");
-
-    let x_ptr = k.arg_ptr("x");
-    let out_ptr = k.arg_ptr("out");
-    let n = k.arg_u32("n");
-    k.emit_arg_loads();
-
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-
-    // Per-lane accumulator
-    let acc = k.alloc_vreg();
-    k.v_mov_imm(acc, 0);
-
-    // Loop: each iteration handles 32 elements
-    let iter_s = k.alloc_sreg();
-    k.s_mov_imm(iter_s, 0);
-    let loop_label = k.make_label("sum_loop");
-    k.label(&loop_label);
-
-    // idx = iter_base + lane_id
-    let idx = k.alloc_vreg();
-    k.v_mov_from_sgpr(idx, iter_s);
-    k.v_add_u32(idx, idx, lane_id);
-
-    // Bounds check: idx < n → EXEC mask
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(n.0));
-    let saved_exec = k.alloc_sreg();
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(idx), src1: Operand::VReg(n_vreg) });
-    k.push(Op::SaveExec { dst: saved_exec });
-
-    // Load x[idx] and accumulate
-    let byte_off = k.alloc_vreg();
-    k.v_lshlrev_b32(byte_off, 2, idx);
-    let addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(addr, SReg(x_ptr.0));
-    k.v_mov_from_sgpr(VReg(addr.0 + 1), SReg(x_ptr.0 + 1));
-    k.v_add_co(addr, addr, byte_off);
-    k.v_add_co_ci(VReg(addr.0 + 1), VReg(addr.0 + 1));
-    let val = k.alloc_vreg();
-    k.global_load(val, addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-    k.push(Op::VAddF32 { dst: acc, src0: Operand::VReg(acc), src1: Operand::VReg(val) });
-
-    // Restore EXEC
-    k.push(Op::RestoreExec { src: saved_exec });
-
-    // Loop advance
-    k.s_add_u32(iter_s, iter_s, 32);
-    k.s_cmp_lt_u32(iter_s, SReg(n.0));
-    k.branch_scc1(&loop_label);
-
-    // Wave32 butterfly reduce: all 32 lanes sum → every lane has total
-    let tmp = k.alloc_vreg();
-    k.wave_reduce_add_f32(acc, tmp);
-
-    // Lane 0 stores result
-    let zero_v = k.alloc_vreg();
-    k.v_mov_imm(zero_v, 0);
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(lane_id), src1: Operand::InlineInt(1) });
-    k.push(Op::SaveExec { dst: saved_exec });
-
-    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(out_addr, SReg(out_ptr.0));
-    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), SReg(out_ptr.0 + 1));
-    k.global_store(out_addr, acc, Width::B32, 0);
-
-    k.push(Op::RestoreExec { src: saved_exec });
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// naive_matmul: scalar f32 matmul for unaligned dimensions
-// ============================================================================
-
-/// Transpose mode for naive matmul variants
-#[derive(Clone, Copy)]
-pub enum NaiveGemmMode {
-    /// Y = A @ B  (A[M,K], B[K,N] → Y[M,N])
-    NN,
-    /// Y = A @ B^T  (A[M,P], B[N,P] → Y[M,N])  — dX = dY @ W^T
-    NT,
-    /// Y = A^T @ B  (A[K,M], B[K,N] → Y[M,N])  — dW = X^T @ dY
-    TN,
-}
-
-/// Generate naive scalar f32 matmul kernel.
-///
-/// Each thread computes one output element Y[row, col] via K-loop with v_fma_f32.
-///
-/// Kernargs (40 bytes): A_ptr(0), B_ptr(8), Y_ptr(16), M(24), K(28), N(32)
-/// For NT: args are M, P(inner), N(output cols)
-/// For TN: args are K(inner), M(K-dim of A), N
-/// Grid: [ceil(N/32)*32, M, 1], WG: 32
-pub fn naive_matmul(mode: NaiveGemmMode) -> T0Kernel {
-    let name = match mode {
-        NaiveGemmMode::NN => "t0_naive_f32_matmul",
-        NaiveGemmMode::NT => "t0_naive_f32_matmul_nt",
-        NaiveGemmMode::TN => "t0_naive_f32_matmul_tn",
-    };
-    let mut k = T0Kernel::new(name);
-
-    let a_ptr = k.arg_ptr("A");
-    let b_ptr = k.arg_ptr("B");
-    let y_ptr = k.arg_ptr("Y");
-    let dim_m = k.arg_u32("M");
-    let dim_k = k.arg_u32("K");
-    let dim_n = k.arg_u32("N");
-    k.emit_arg_loads();
-
-    let tile_col_s = k.alloc_sreg();
-    let row_s = k.alloc_sreg();
-    k.capture_tgid_x(tile_col_s);
-    k.capture_tgid_y(row_s);
-
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-
-    // col = TGID.x * 32 + lane_id
-    let col = k.alloc_vreg();
-    k.v_mov_from_sgpr(col, tile_col_s);
-    k.v_lshlrev_b32(col, 5, col);
-    k.v_add_u32(col, col, lane_id);
-
-    let row = k.alloc_vreg();
-    k.v_mov_from_sgpr(row, row_s);
-
-    // Bounds check: col < N
-    let n_vreg = k.alloc_vreg();
-    k.v_mov_from_sgpr(n_vreg, SReg(dim_n.0));
-    let saved_exec = k.alloc_sreg();
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(col), src1: Operand::VReg(n_vreg) });
-    k.push(Op::SaveExec { dst: saved_exec });
-
-    // A and B address setup depends on mode
-    //
-    // NN: A[row, k] at row*K*4, stride=4, B[k, col] at col*4, stride=N*4
-    // NT: A[row, k] at row*K*4, stride=4, B[col, k] at col*K*4, stride=4
-    // TN: A[k, row] at row*4, stride=M*4, B[k, col] at col*4, stride=N*4
-
-    // A base address
-    let a_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(a_addr, SReg(a_ptr.0));
-    k.v_mov_from_sgpr(VReg(a_addr.0 + 1), SReg(a_ptr.0 + 1));
-    let a_off = k.alloc_vreg();
-    match mode {
-        NaiveGemmMode::NN | NaiveGemmMode::NT => {
-            // A[row, 0] = a_ptr + row * K * 4
-            let k_vreg = k.alloc_vreg();
-            k.v_mov_from_sgpr(k_vreg, SReg(dim_k.0));
-            k.v_mul_lo_u32(a_off, row, k_vreg);
-            k.v_lshlrev_b32(a_off, 2, a_off);
-        }
-        NaiveGemmMode::TN => {
-            // A[0, row] = a_ptr + row * 4
-            k.v_lshlrev_b32(a_off, 2, row);
-        }
-    }
-    k.v_add_co(a_addr, a_addr, a_off);
-    k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-
-    // A stride (bytes per K iteration)
-    let a_stride = k.alloc_vreg();
-    match mode {
-        NaiveGemmMode::NN | NaiveGemmMode::NT => {
-            k.v_mov_imm(a_stride, 4);  // f32 stride
-        }
-        NaiveGemmMode::TN => {
-            // stride = M * 4
-            k.v_mov_from_sgpr(a_stride, SReg(dim_m.0));
-            k.v_lshlrev_b32(a_stride, 2, a_stride);
-        }
-    }
-
-    // B base address
-    let b_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(b_addr, SReg(b_ptr.0));
-    k.v_mov_from_sgpr(VReg(b_addr.0 + 1), SReg(b_ptr.0 + 1));
-    let b_off = k.alloc_vreg();
-    match mode {
-        NaiveGemmMode::NN | NaiveGemmMode::TN => {
-            // B[0, col] = b_ptr + col * 4
-            k.v_lshlrev_b32(b_off, 2, col);
-        }
-        NaiveGemmMode::NT => {
-            // B[col, 0] = b_ptr + col * K * 4
-            let k_vreg = k.alloc_vreg();
-            k.v_mov_from_sgpr(k_vreg, SReg(dim_k.0));
-            k.v_mul_lo_u32(b_off, col, k_vreg);
-            k.v_lshlrev_b32(b_off, 2, b_off);
-        }
-    }
-    k.v_add_co(b_addr, b_addr, b_off);
-    k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-
-    // B stride
-    let b_stride = k.alloc_vreg();
-    match mode {
-        NaiveGemmMode::NN | NaiveGemmMode::TN => {
-            // stride = N * 4
-            k.v_mov_from_sgpr(b_stride, SReg(dim_n.0));
-            k.v_lshlrev_b32(b_stride, 2, b_stride);
-        }
-        NaiveGemmMode::NT => {
-            k.v_mov_imm(b_stride, 4);
-        }
-    }
-
-    // Accumulator = 0
-    let acc = k.alloc_vreg();
-    k.v_mov_imm(acc, 0);
-
-    // K-loop
-    let k_iter_s = k.alloc_sreg();
-    k.s_mov_imm(k_iter_s, 0);
-    let loop_label = k.make_label("k_loop");
-    k.label(&loop_label);
-
-    let a_val = k.alloc_vreg();
-    k.global_load(a_val, a_addr, Width::B32, 0);
-    let b_val = k.alloc_vreg();
-    k.global_load(b_val, b_addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-    k.v_fma_f32(acc, a_val, b_val, acc);
-
-    // Advance A and B addresses
-    k.v_add_co(a_addr, a_addr, a_stride);
-    k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-    k.v_add_co(b_addr, b_addr, b_stride);
-    k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-
-    k.s_add_u32(k_iter_s, k_iter_s, 1);
-    k.s_cmp_lt_u32(k_iter_s, SReg(dim_k.0));
-    k.branch_scc1(&loop_label);
-
-    // Store Y[row, col] = acc
-    let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(y_addr, SReg(y_ptr.0));
-    k.v_mov_from_sgpr(VReg(y_addr.0 + 1), SReg(y_ptr.0 + 1));
-    let y_off = k.alloc_vreg();
-    k.v_mul_lo_u32(y_off, row, n_vreg);
-    k.v_add_u32(y_off, y_off, col);
-    k.v_lshlrev_b32(y_off, 2, y_off);
-    k.v_add_co(y_addr, y_addr, y_off);
-    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
-    k.global_store(y_addr, acc, Width::B32, 0);
-
-    k.push(Op::RestoreExec { src: saved_exec });
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-// ============================================================================
-// ============================================================================
-// relu_backward: dx = (x > 0) ? dy : 0
-// ============================================================================
-
-/// Generate ReLU backward kernel: dx[i] = (x[i] > 0) ? dy[i] : 0
-///
-/// Kernargs (24 bytes): dy_ptr(0), x_ptr(8), dx_ptr(16)
-/// Grid: [ceil(n/32)*32, 1, 1], WG: 32
-/// Uses epl (elements per lane) for throughput, compiled as constant.
 pub fn relu_backward(epl: u32) -> T0Kernel {
     let mut k = T0Kernel::new("t0_relu_backward_f32");
 
@@ -4814,6 +391,110 @@ pub fn transpose_f32() -> T0Kernel {
 }
 
 // ============================================================================
+// unpad_2d: strip padding from a 2D f32 buffer
+// ============================================================================
+
+/// Generate f32 unpad kernel: dst[i * n + j] = src[i * n_pad + j]
+///
+/// Copies valid [m, n] portion from a padded [m_pad, n_pad] buffer.
+/// Each thread handles one element (same pattern as transpose_f32).
+///
+/// Kernargs (32 bytes): src_ptr(0), dst_ptr(8), m(16), n(20), n_pad(24), _pad(28)
+/// Grid: [ceil(m*n/32)*32, 1, 1], WG: 32
+pub fn t0_unpad_2d() -> T0Kernel {
+    let mut k = T0Kernel::new("t0_unpad_2d");
+
+    let src_ptr = k.arg_ptr("src");
+    let dst_ptr = k.arg_ptr("dst");
+    let dim_m = k.arg_u32("m");
+    let dim_n = k.arg_u32("n");
+    let stride_src = k.arg_u32("n_pad");
+    k.emit_arg_loads();
+
+    let tile_s = k.alloc_sreg();
+    k.capture_tgid_x(tile_s);
+
+    let lane_id = k.alloc_vreg();
+    k.v_and_b32_imm(lane_id, VReg(0), 31);
+
+    // global_id = TGID.x * 32 + lane_id
+    let gid = k.alloc_vreg();
+    k.v_mov_from_sgpr(gid, tile_s);
+    k.v_lshlrev_b32(gid, 5, gid);
+    k.v_add_u32(gid, gid, lane_id);
+
+    // Bounds check: gid < m * n
+    let total = k.alloc_vreg();
+    let m_v = k.alloc_vreg();
+    let n_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(m_v, SReg(dim_m.0));
+    k.v_mov_from_sgpr(n_v, SReg(dim_n.0));
+    k.v_mul_lo_u32(total, m_v, n_v);
+    let saved_exec = k.alloc_sreg();
+    k.push(Op::VCmpLtU32 { src0: Operand::VReg(gid), src1: Operand::VReg(total) });
+    k.push(Op::SaveExec { dst: saved_exec });
+
+    // Divmod: i = gid / n, j = gid % n (float rcp approximation + fixup)
+    let n_f = k.alloc_vreg();
+    k.v_cvt_f32_u32(n_f, n_v);
+    let rcp_n = k.alloc_vreg();
+    k.v_rcp_f32(rcp_n, n_f);
+    let gid_f = k.alloc_vreg();
+    k.v_cvt_f32_u32(gid_f, gid);
+    let i_approx_f = k.alloc_vreg();
+    k.push(Op::VMulF32 { dst: i_approx_f, src0: Operand::VReg(gid_f), src1: Operand::VReg(rcp_n) });
+    let i_v = k.alloc_vreg();
+    k.v_cvt_u32_f32(i_v, i_approx_f);
+    let j_v = k.alloc_vreg();
+    let tmp = k.alloc_vreg();
+    k.v_mul_lo_u32(tmp, i_v, n_v);
+    k.v_sub_u32(j_v, gid, tmp);
+
+    // Fix rounding: if j >= n then i++, j -= n
+    let fix = k.alloc_vreg();
+    k.v_cmp_ge_u32(Operand::VReg(j_v), Operand::VReg(n_v));
+    k.v_mov_imm(fix, 0);
+    let one_v = k.alloc_vreg();
+    k.v_mov_imm(one_v, 1);
+    k.v_cndmask_b32(fix, Operand::VReg(fix), Operand::VReg(one_v));
+    k.v_add_u32(i_v, i_v, fix);
+    let fix_n = k.alloc_vreg();
+    k.v_mul_lo_u32(fix_n, fix, n_v);
+    k.v_sub_u32(j_v, j_v, fix_n);
+
+    // Read src: src_ptr + (i * n_pad + j) * 4
+    let n_pad_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(n_pad_v, SReg(stride_src.0));
+    let src_off = k.alloc_vreg();
+    k.v_mul_lo_u32(src_off, i_v, n_pad_v);  // i * n_pad
+    k.v_add_u32(src_off, src_off, j_v);       // i * n_pad + j
+    k.v_lshlrev_b32(src_off, 2, src_off);     // * 4 (f32 bytes)
+    let src_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(src_addr, SReg(src_ptr.0));
+    k.v_mov_from_sgpr(VReg(src_addr.0 + 1), SReg(src_ptr.0 + 1));
+    k.v_add_co(src_addr, src_addr, src_off);
+    k.v_add_co_ci(VReg(src_addr.0 + 1), VReg(src_addr.0 + 1));
+    let val = k.alloc_vreg();
+    k.global_load(val, src_addr, Width::B32, 0);
+    k.wait_vmcnt(0);
+
+    // Write dst: dst_ptr + gid * 4 (contiguous output)
+    let dst_off = k.alloc_vreg();
+    k.v_lshlrev_b32(dst_off, 2, gid);
+    let dst_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(dst_addr, SReg(dst_ptr.0));
+    k.v_mov_from_sgpr(VReg(dst_addr.0 + 1), SReg(dst_ptr.0 + 1));
+    k.v_add_co(dst_addr, dst_addr, dst_off);
+    k.v_add_co_ci(VReg(dst_addr.0 + 1), VReg(dst_addr.0 + 1));
+    k.global_store(dst_addr, val, Width::B32, 0);
+
+    k.push(Op::RestoreExec { src: saved_exec });
+    k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
+// ============================================================================
 // rmsnorm: y = x * gamma / rms(x)
 // ============================================================================
 
@@ -4976,7 +657,7 @@ pub fn elementwise_unary(sched: &dyn Schedule, op: UnaryOp) -> T0Kernel {
     let x_ptr = k.arg_ptr("x");
     let y_ptr = k.arg_ptr("y");
     let param = k.arg_f32("param");
-    let n = k.arg_u32("n");
+    let _n = k.arg_u32("n");
     k.emit_arg_loads();
 
     // ── Global ID ──
@@ -4998,7 +679,7 @@ pub fn elementwise_unary(sched: &dyn Schedule, op: UnaryOp) -> T0Kernel {
 
     // ── Apply operation ──
     match op {
-        UnaryOp::Scale(s) => {
+        UnaryOp::Scale(_s) => {
             let sv = k.alloc_vreg();
             k.v_mov_from_sgpr(sv, SReg(param.0));
             k.v_mul_f32(val, val, sv);
@@ -5085,7 +766,7 @@ pub fn elementwise_binary(sched: &dyn Schedule, op: BinaryOp) -> T0Kernel {
     let b_ptr = k.arg_ptr("b");
     let y_ptr = k.arg_ptr("y");
     let alpha = k.arg_f32("alpha");
-    let n = k.arg_u32("n");
+    let _n = k.arg_u32("n");
     k.emit_arg_loads();
 
     let global_id = k.compute_global_id_x(wg_x as u32);
@@ -5244,9 +925,10 @@ pub fn fused_elementwise(plan: &FusionPlan, epl: u32) -> T0Kernel {
 
     // Compute kernarg size to match hand-written layout
     let n_ptrs = n_inputs + 1; // inputs + output
-    let ka_size = (n_ptrs * 8 + n_scalars * 4 + 4) as u32;
+    let _ka_size = (n_ptrs * 8 + n_scalars * 4 + 4) as u32;
 
     let mut k = T0Kernel::new(&plan.name);
+    k.set_wg_size(32); // Wave32, single wave per workgroup
 
     // ── Declare kernel arguments (in order) ──
     // Input pointers
@@ -5901,6 +1583,137 @@ pub fn t0_silu_mul(epl: u32) -> T0Kernel {
         }
 
         k.global_store(out_addr, gate_data, Width::B128, off);
+    }
+
+    k.bounds_check_end(saved);
+    k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
+/// SiLU backward kernel: computes gradients for gate and up projections.
+///
+/// d_gate[i] = grad[i] * up[i] * σ(g) * (1 + g*(1-σ(g)))
+/// d_up[i]   = grad[i] * g * σ(g)   (= grad * silu(g))
+///
+/// Kernarg (44B): [grad_out, gate, up, d_gate, d_up, n_elems]
+/// Grid: ceil(n / (32*epl)) × 32, WG=32
+pub fn t0_silu_backward(epl: u32) -> T0Kernel {
+    assert!(epl >= 4 && epl % 4 == 0);
+    let chunks = epl / 4;
+
+    let mut k = T0Kernel::new("t0_silu_backward");
+    let grad_ptr = k.arg_ptr("grad_out");
+    let gate_ptr = k.arg_ptr("gate");
+    let up_ptr = k.arg_ptr("up");
+    let dgate_ptr = k.arg_ptr("d_gate");
+    let dup_ptr = k.arg_ptr("d_up");
+    let n_elems_s = k.arg_u32("n_elems");
+    k.emit_arg_loads();
+
+    let gid = k.alloc_vreg();
+    k.push(Op::ComputeGlobalIdX { dst: gid, wg_size: 32 });
+
+    let elem_id = k.alloc_vreg();
+    let v_epl = k.alloc_vreg();
+    k.v_mov_imm(v_epl, epl as i32);
+    k.v_mul_lo_u32(elem_id, gid, v_epl);
+
+    // Constants
+    let log2e = k.alloc_vreg();
+    k.push(Op::VMov { dst: log2e, src: Operand::Literal(0x3FB8AA3Bu32) });
+    let one = k.alloc_vreg();
+    k.push(Op::VMov { dst: one, src: Operand::InlineFloat(1.0) });
+    let sign_mask = k.alloc_vreg();
+    k.push(Op::VMov { dst: sign_mask, src: Operand::Literal(0x80000000u32) });
+
+    let byte_off = k.alloc_vreg();
+    k.push(Op::VLshlrevB32 { dst: byte_off, shift: 2, src: elem_id });
+
+    // Set up addresses: grad, gate, up, d_gate, d_up
+    let grad_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(grad_addr, SReg(grad_ptr.0));
+    k.v_mov_from_sgpr(VReg(grad_addr.0 + 1), SReg(grad_ptr.0 + 1));
+    k.v_add_co(grad_addr, grad_addr, byte_off);
+    k.v_add_co_ci(VReg(grad_addr.0 + 1), VReg(grad_addr.0 + 1));
+
+    let gate_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(gate_addr, SReg(gate_ptr.0));
+    k.v_mov_from_sgpr(VReg(gate_addr.0 + 1), SReg(gate_ptr.0 + 1));
+    k.v_add_co(gate_addr, gate_addr, byte_off);
+    k.v_add_co_ci(VReg(gate_addr.0 + 1), VReg(gate_addr.0 + 1));
+
+    let up_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(up_addr, SReg(up_ptr.0));
+    k.v_mov_from_sgpr(VReg(up_addr.0 + 1), SReg(up_ptr.0 + 1));
+    k.v_add_co(up_addr, up_addr, byte_off);
+    k.v_add_co_ci(VReg(up_addr.0 + 1), VReg(up_addr.0 + 1));
+
+    let dgate_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(dgate_addr, SReg(dgate_ptr.0));
+    k.v_mov_from_sgpr(VReg(dgate_addr.0 + 1), SReg(dgate_ptr.0 + 1));
+    k.v_add_co(dgate_addr, dgate_addr, byte_off);
+    k.v_add_co_ci(VReg(dgate_addr.0 + 1), VReg(dgate_addr.0 + 1));
+
+    let dup_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(dup_addr, SReg(dup_ptr.0));
+    k.v_mov_from_sgpr(VReg(dup_addr.0 + 1), SReg(dup_ptr.0 + 1));
+    k.v_add_co(dup_addr, dup_addr, byte_off);
+    k.v_add_co_ci(VReg(dup_addr.0 + 1), VReg(dup_addr.0 + 1));
+
+    // Bounds check
+    let n_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(n_v, n_elems_s);
+    let saved = k.bounds_check_begin(elem_id, n_v);
+
+    let grad_data = k.alloc_vreg_array(4, Alignment::Align4);
+    let gate_data = k.alloc_vreg_array(4, Alignment::Align4);
+    let up_data = k.alloc_vreg_array(4, Alignment::Align4);
+    let dg_data = k.alloc_vreg_array(4, Alignment::Align4);   // d_gate output
+    let du_data = k.alloc_vreg_array(4, Alignment::Align4);   // d_up output
+
+    for c in 0..chunks {
+        let off = (c * 16) as i32;
+        k.global_load(grad_data, grad_addr, Width::B128, off);
+        k.global_load(gate_data, gate_addr, Width::B128, off);
+        k.global_load(up_data, up_addr, Width::B128, off);
+        k.wait_vmcnt(0);
+
+        for i in 0..4u32 {
+            let go = VReg(grad_data.0 + i);  // grad_out
+            let g = VReg(gate_data.0 + i);   // gate value
+            let u = VReg(up_data.0 + i);     // up value
+            let dg = VReg(dg_data.0 + i);    // d_gate output
+            let du = VReg(du_data.0 + i);    // d_up output
+
+            // Compute σ(g) = sigmoid(gate)
+            // sig = 1 / (1 + exp(-g))
+            k.v_mul_f32(dg, g, log2e);        // g * log2(e)
+            k.v_xor_b32(dg, Operand::VReg(dg), Operand::VReg(sign_mask)); // -g * log2(e)
+            k.v_exp_f32(dg, dg);              // 2^(-g*log2e) = exp(-g)
+            k.v_add_f32(dg, one, dg);         // 1 + exp(-g)
+            k.v_rcp_f32(dg, dg);              // σ = 1/(1+exp(-g))
+            // dg now = σ(g)
+
+            // d_up = grad * g * σ(g) = grad * silu(g)
+            k.v_mul_f32(du, g, dg);            // g * σ
+            k.v_mul_f32(du, go, du);           // grad * g * σ
+
+            // d_gate = grad * up * σ * (1 + g*(1-σ))
+            //        = grad * up * (σ + g*σ*(1-σ))
+            //        = grad * up * (σ + g*σ - g*σ²)
+            // Let's compute: dsilu = σ + g*σ*(1-σ) = σ*(1 + g*(1-σ))
+            let tmp = k.alloc_vreg();
+            k.v_sub_f32(tmp, one, dg);         // 1 - σ
+            k.v_mul_f32(tmp, g, tmp);           // g * (1-σ)
+            k.v_add_f32(tmp, one, tmp);         // 1 + g*(1-σ)
+            k.v_mul_f32(tmp, dg, tmp);          // σ * (1 + g*(1-σ)) = dsilu
+            k.v_mul_f32(dg, go, u);             // grad * up
+            k.v_mul_f32(dg, dg, tmp);           // grad * up * dsilu
+        }
+
+        k.global_store(dgate_addr, dg_data, Width::B128, off);
+        k.global_store(dup_addr, du_data, Width::B128, off);
     }
 
     k.bounds_check_end(saved);
@@ -7476,7 +3289,7 @@ fn build_inter_kernel(
     let o_ptr = k.arg_ptr(arg_o);
     let seq_len = k.arg_u32("seq_len");
     let c_chunk = k.arg_u32("C_chunk");
-    let d_head = k.arg_u32("d_head");
+    let _d_head = k.arg_u32("d_head");
     let n_chunks = k.arg_u32("n_chunks");
     k.emit_arg_loads();
 
@@ -9353,7 +5166,7 @@ pub fn t0_frobenius_norm_large() -> T0Kernel {
     k.v_add_co(g_addr, g_addr, base_byte); k.v_add_co_ci(VReg(g_addr.0+1), VReg(g_addr.0+1));
 
     let n_v = k.alloc_vreg(); k.v_mov_from_sgpr(n_v, SReg(n_arg.0));
-    let stride_bytes = 32 * 4; // 32 threads * 4 bytes
+    let _stride_bytes = 32 * 4; // 32 threads * 4 bytes
 
     let acc = k.alloc_vreg(); k.v_mov_imm(acc, 0);
 
@@ -9436,8 +5249,321 @@ pub fn t0_reduce_scalar() -> T0Kernel {
     k.wait_vmcnt(0); k.wait_vscnt(0); k.endpgm(); k
 }
 
+// ══════════════════════════════════════════════════════════════
+//  Row-wise reductions: each WG (32 threads) processes one row
+//  Kernarg: [in_ptr(u64), out_ptr(u64), cols(u32)]
+//  Grid: [n_rows, 1, 1]  WG: [32, 1, 1]
+// ══════════════════════════════════════════════════════════════
+
+/// Row-wise sum: out[row] = sum(in[row, 0..cols])
+///
+/// Algorithm:
+/// 1. wg_id = row index
+/// 2. Loop stride=32: each lane loads in[row, col_base + lane_id]
+/// 3. EXEC mask for bounds (col < cols)
+/// 4. Accumulate v_add_f32
+/// 5. wave_reduce_add_f32 → lane 0 has total
+/// 6. Lane 0 stores out[row]
+pub fn t0_row_reduce_sum() -> T0Kernel {
+    t0_row_reduce_generic(RowReduceOp::Sum)
+}
+
+/// Row-wise max: out[row] = max(in[row, 0..cols])
+pub fn t0_row_reduce_max() -> T0Kernel {
+    t0_row_reduce_generic(RowReduceOp::Max)
+}
+
+/// Row-wise sum of squares: out[row] = sum(in[row, :]²)
+/// Used by RMSNorm backward.
+pub fn t0_row_reduce_sum_sq() -> T0Kernel {
+    t0_row_reduce_generic(RowReduceOp::SumSq)
+}
+
+#[derive(Clone, Copy)]
+enum RowReduceOp { Sum, Max, SumSq }
+
+fn t0_row_reduce_generic(op: RowReduceOp) -> T0Kernel {
+    use super::ir::*;
+
+    let name = match op {
+        RowReduceOp::Sum   => "t0_row_reduce_sum",
+        RowReduceOp::Max   => "t0_row_reduce_max",
+        RowReduceOp::SumSq => "t0_row_reduce_sum_sq",
+    };
+    let mut k = T0Kernel::new(name);
+    k.set_wg_size(32); // single wave per WG
+
+    // ── Kernarg: [in_ptr(u64), out_ptr(u64), cols(u32)] ──
+    let in_ptr = k.arg_ptr("in");
+    let out_ptr = k.arg_ptr("out");
+    let cols_arg = k.arg_u32("cols");
+    k.emit_arg_loads();
+
+    // wg_id = row index
+    let wg_id = k.alloc_sreg();
+    k.capture_tgid_x(wg_id);
+    let lane_id = k.alloc_vreg();
+    k.v_and_b32_imm(lane_id, VReg(0), 31);
+
+    // row byte offset = wg_id * cols * 4
+    let row_byte_off = k.alloc_sreg();
+    k.s_mul_i32(row_byte_off, wg_id, SReg(cols_arg.0));
+    k.s_lshl_b32(row_byte_off, row_byte_off, 2); // * 4 bytes
+
+    // in_row_ptr = in_ptr + row_byte_off
+    let in_row_lo = k.alloc_sreg();
+    let in_row_hi = k.alloc_sreg();
+    k.s_add_u32_ss(in_row_lo, SReg(in_ptr.0), row_byte_off);
+    k.s_addc_u32_imm(in_row_hi, SReg(in_ptr.0 + 1), 0);
+
+    // ── Initialize accumulator ──
+    let acc = k.alloc_vreg();
+    match op {
+        RowReduceOp::Sum | RowReduceOp::SumSq => k.v_mov_imm(acc, 0), // 0.0
+        RowReduceOp::Max => k.v_mov_imm(acc, 0xFF800000u32 as i32),    // -inf
+    }
+
+    // ── Main loop: stride=32 over columns ──
+    let loop_base = k.alloc_sreg();
+    k.s_mov_imm(loop_base, 0);
+    let loop_label = k.make_label("row_loop");
+    k.label(&loop_label);
+
+    // col = loop_base + lane_id
+    let col = k.alloc_vreg();
+    k.v_mov_from_sgpr(col, loop_base);
+    k.v_add_u32(col, col, lane_id);
+
+    // Bounds check: col < cols (EXEC mask)
+    let cols_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(cols_v, SReg(cols_arg.0));
+    let saved_exec = k.alloc_sreg();
+    k.push(Op::VCmpLtU32 { src0: Operand::VReg(col), src1: Operand::VReg(cols_v) });
+    k.push(Op::SaveExec { dst: saved_exec });
+
+    // Load in[row, col]
+    let byte_col = k.alloc_vreg();
+    k.v_lshlrev_b32(byte_col, 2, col); // col * 4
+    let load_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(load_addr, in_row_lo);
+    k.v_mov_from_sgpr(VReg(load_addr.0 + 1), in_row_hi);
+    k.v_add_co(load_addr, load_addr, byte_col);
+    k.v_add_co_ci(VReg(load_addr.0 + 1), VReg(load_addr.0 + 1));
+    let val = k.alloc_vreg();
+    k.global_load(val, load_addr, Width::B32, 0);
+    k.wait_vmcnt(0);
+
+    // Accumulate
+    match op {
+        RowReduceOp::Sum => k.v_add_f32(acc, acc, val),
+        RowReduceOp::Max => k.v_max_f32(acc, acc, val),
+        RowReduceOp::SumSq => {
+            let sq = k.alloc_vreg();
+            k.v_mul_f32(sq, val, val);
+            k.v_add_f32(acc, acc, sq);
+        }
+    }
+
+    // Restore EXEC
+    k.push(Op::RestoreExec { src: saved_exec });
+
+    // loop_base += 32
+    k.s_add_u32(loop_base, loop_base, 32);
+    k.s_cmp_lt_u32(loop_base, SReg(cols_arg.0));
+    k.branch_scc1(&loop_label);
+
+    // ── Wave32 butterfly reduce ──
+    let tmp = k.alloc_vreg();
+    match op {
+        RowReduceOp::Sum | RowReduceOp::SumSq => k.wave_reduce_add_f32(acc, tmp),
+        RowReduceOp::Max => k.wave_reduce_max_f32(acc, tmp),
+    }
+
+    // ── Lane 0 writes out[row] ──
+    // byte_off = wg_id * 4
+    let out_byte = k.alloc_sreg();
+    k.s_lshl_b32(out_byte, wg_id, 2);
+    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(out_addr, SReg(out_ptr.0));
+    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), SReg(out_ptr.0 + 1));
+    let out_off_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(out_off_v, out_byte);
+    k.v_add_co(out_addr, out_addr, out_off_v);
+    k.v_add_co_ci(VReg(out_addr.0 + 1), VReg(out_addr.0 + 1));
+
+    // Only lane 0 writes
+    let exec_save2 = k.alloc_sreg();
+    k.push(Op::VCmpEqU32Imm { src: lane_id, imm: 0 });
+    k.push(Op::SaveExec { dst: exec_save2 });
+    k.global_store(out_addr, acc, Width::B32, 0);
+    k.push(Op::RestoreExec { src: exec_save2 });
+
+    k.wait_vmcnt(0); k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Row-wise broadcast ops: out[r,c] = x[r,c] op vec[r]
+//  Kernarg: [x_ptr(u64), vec_ptr(u64), out_ptr(u64), cols(u32)]
+//  Grid: [n_rows * 32, 1, 1]  WG: [32, 1, 1]
+// ══════════════════════════════════════════════════════════════
+
+/// Row broadcast sub: out[r,c] = x[r,c] - vec[r]
+/// Used in Softmax: shifted = x - row_max(x)
+pub fn t0_row_broadcast_sub() -> T0Kernel {
+    t0_row_broadcast_generic(RowBroadcastOp::Sub)
+}
+
+/// Row broadcast div: out[r,c] = x[r,c] / vec[r]
+/// Used in Softmax: softmax = exp_shifted / row_sum(exp_shifted)
+pub fn t0_row_broadcast_div() -> T0Kernel {
+    t0_row_broadcast_generic(RowBroadcastOp::Div)
+}
+
+/// Row broadcast exp(sub): out[r,c] = exp(x[r,c] - vec[r])
+/// Fused shift+exp for Softmax (saves one kernel launch + memory pass)
+pub fn t0_row_broadcast_exp_sub() -> T0Kernel {
+    t0_row_broadcast_generic(RowBroadcastOp::ExpSub)
+}
+
+#[derive(Clone, Copy)]
+enum RowBroadcastOp { Sub, Div, ExpSub }
+
+fn t0_row_broadcast_generic(op: RowBroadcastOp) -> T0Kernel {
+    use super::ir::*;
+
+    let name = match op {
+        RowBroadcastOp::Sub    => "t0_row_broadcast_sub",
+        RowBroadcastOp::Div    => "t0_row_broadcast_div",
+        RowBroadcastOp::ExpSub => "t0_row_broadcast_exp_sub",
+    };
+    let mut k = T0Kernel::new(name);
+    k.set_wg_size(32);
+
+    // Kernarg: [x_ptr(u64), vec_ptr(u64), out_ptr(u64), cols(u32)]
+    let x_ptr = k.arg_ptr("x");
+    let vec_ptr = k.arg_ptr("vec");
+    let out_ptr = k.arg_ptr("out");
+    let cols_arg = k.arg_u32("cols");
+    k.emit_arg_loads();
+
+    let wg_id = k.alloc_sreg();
+    k.capture_tgid_x(wg_id);
+    let lane_id = k.alloc_vreg();
+    k.v_and_b32_imm(lane_id, VReg(0), 31);
+
+    // row byte offset = wg_id * cols * 4
+    let row_byte_off = k.alloc_sreg();
+    k.s_mul_i32(row_byte_off, wg_id, SReg(cols_arg.0));
+    k.s_lshl_b32(row_byte_off, row_byte_off, 2);
+
+    // x_row = x_ptr + row_byte_off
+    let x_row_lo = k.alloc_sreg();
+    let x_row_hi = k.alloc_sreg();
+    k.s_add_u32_ss(x_row_lo, SReg(x_ptr.0), row_byte_off);
+    k.s_addc_u32_imm(x_row_hi, SReg(x_ptr.0 + 1), 0);
+
+    // out_row = out_ptr + row_byte_off
+    let out_row_lo = k.alloc_sreg();
+    let out_row_hi = k.alloc_sreg();
+    k.s_add_u32_ss(out_row_lo, SReg(out_ptr.0), row_byte_off);
+    k.s_addc_u32_imm(out_row_hi, SReg(out_ptr.0 + 1), 0);
+
+    // Load vec[row] — scalar, same for all lanes
+    let vec_byte_off = k.alloc_sreg();
+    k.s_lshl_b32(vec_byte_off, wg_id, 2); // wg_id * 4
+    let vec_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(vec_addr, SReg(vec_ptr.0));
+    k.v_mov_from_sgpr(VReg(vec_addr.0 + 1), SReg(vec_ptr.0 + 1));
+    let vec_off_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(vec_off_v, vec_byte_off);
+    k.v_add_co(vec_addr, vec_addr, vec_off_v);
+    k.v_add_co_ci(VReg(vec_addr.0 + 1), VReg(vec_addr.0 + 1));
+    let row_scalar = k.alloc_vreg();
+    k.global_load(row_scalar, vec_addr, Width::B32, 0);
+    k.wait_vmcnt(0);
+
+    // For div: pre-compute rcp(vec[row]) = 1/vec[row]
+    if matches!(op, RowBroadcastOp::Div) {
+        k.v_rcp_f32(row_scalar, row_scalar);
+    }
+
+    // For exp_sub: pre-compute log2(e) constant for v_exp_f32 (which computes 2^x)
+    // IMPORTANT: only allocate this VReg when needed!
+    // An unused VReg has first_use=MAX which triggers incorrect expiry of
+    // row_scalar in the register allocator's liveness analysis.
+    let log2e = if matches!(op, RowBroadcastOp::ExpSub) {
+        let v = k.alloc_vreg();
+        k.v_mov_imm(v, 0x3FB8AA3Bu32 as i32); // log2(e) = 1.4426950..
+        v
+    } else {
+        VReg(0) // dummy, never used
+    };
+
+    // ── Main loop: stride=32 ──
+    let loop_base = k.alloc_sreg();
+    k.s_mov_imm(loop_base, 0);
+    let loop_label = k.make_label("bcast_loop");
+    k.label(&loop_label);
+
+    let col = k.alloc_vreg();
+    k.v_mov_from_sgpr(col, loop_base);
+    k.v_add_u32(col, col, lane_id);
+
+    // Bounds check
+    let cols_v = k.alloc_vreg();
+    k.v_mov_from_sgpr(cols_v, SReg(cols_arg.0));
+    let saved_exec = k.alloc_sreg();
+    k.push(Op::VCmpLtU32 { src0: Operand::VReg(col), src1: Operand::VReg(cols_v) });
+    k.push(Op::SaveExec { dst: saved_exec });
+
+    // Load x[row, col]
+    let byte_col = k.alloc_vreg();
+    k.v_lshlrev_b32(byte_col, 2, col);
+    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(x_addr, x_row_lo);
+    k.v_mov_from_sgpr(VReg(x_addr.0 + 1), x_row_hi);
+    k.v_add_co(x_addr, x_addr, byte_col);
+    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
+    let x_val = k.alloc_vreg();
+    k.global_load(x_val, x_addr, Width::B32, 0);
+    k.wait_vmcnt(0);
+
+    // Apply operation
+    let result = k.alloc_vreg();
+    match op {
+        RowBroadcastOp::Sub => k.v_sub_f32(result, x_val, row_scalar),
+        RowBroadcastOp::Div => k.v_mul_f32(result, x_val, row_scalar), // x * rcp(vec)
+        RowBroadcastOp::ExpSub => {
+            k.v_sub_f32(result, x_val, row_scalar);     // x - max
+            k.v_mul_f32(result, result, log2e);          // (x - max) * log2(e)
+            k.v_exp_f32(result, result);                 // 2^((x-max)*log2(e)) = e^(x-max)
+        }
+    }
+
+    // Store out[row, col]
+    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
+    k.v_mov_from_sgpr(out_addr, out_row_lo);
+    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), out_row_hi);
+    k.v_add_co(out_addr, out_addr, byte_col);
+    k.v_add_co_ci(VReg(out_addr.0 + 1), VReg(out_addr.0 + 1));
+    k.global_store(out_addr, result, Width::B32, 0);
+
+    // Restore EXEC
+    k.push(Op::RestoreExec { src: saved_exec });
+
+    // loop_base += 32
+    k.s_add_u32(loop_base, loop_base, 32);
+    k.s_cmp_lt_u32(loop_base, SReg(cols_arg.0));
+    k.branch_scc1(&loop_label);
+
+    k.wait_vmcnt(0); k.wait_vscnt(0);
+    k.endpgm();
+    k
+}
+
 /// Grad clip EMA v2: reads norm_sq from GPU buffer, clips, updates EMA.
-/// Kernargs (40B): grad(0), g_ema(8), norm_sq_ptr(16), n_elems(24), beta(28), clip(32)
 pub fn t0_grad_clip_ema_v2() -> T0Kernel {
     let mut k = T0Kernel::new("t0_grad_clip_ema_v2");
     let grad_p = k.arg_ptr("grad"); let ema_p = k.arg_ptr("g_ema");
@@ -10758,7 +6884,7 @@ pub fn t0_nracs_equilibrate() -> T0Kernel {
     let cv_p = k.arg_ptr("col_var");
     let mt_p = k.arg_ptr("m_tilde");
     let part_p = k.arg_ptr("partial");
-    let rows_a = k.arg_u32("rows");
+    let _rows_a = k.arg_u32("rows");
     let cols_a = k.arg_u32("cols");
     let eps_a = k.arg_u32("eps");
     k.emit_arg_loads();
@@ -11235,12 +7361,12 @@ mod tests {
     #[test]
     fn test_matmul_assembly() {
         let sched = GFX1100Schedule;
-        let kernel = matmul(&sched);
+        let kernel = rmsnorm(&sched);
         let asm = kernel.to_assembly(Target::GFX1100).unwrap();
-        assert!(asm.contains("v_wmma_f32_16x16x16_bf16"));
+        assert!(asm.contains("v_rsq_f32"), "rmsnorm: missing rsqrt");
         assert!(asm.contains("global_store_b32"));
-        assert!(asm.contains("s_cbranch_scc1"));
-        eprintln!("--- matmul ---\n{}", asm);
+        assert!(asm.contains("v_mul_f32"));
+        eprintln!("--- rmsnorm (was matmul) ---\n{}", asm);
     }
 
     #[test]
@@ -11280,7 +7406,7 @@ mod tests {
     fn test_all_kernels_compile_to_elf() {
         let sched = GFX1100Schedule;
         let kernels = vec![
-            matmul(&sched),
+            rmsnorm(&sched),
             rmsnorm(&sched),
             elementwise_unary(&sched, UnaryOp::Relu),
             elementwise_binary(&sched, BinaryOp::Add),
@@ -11305,8 +7431,11 @@ mod tests {
         };
         let kernel = fused_elementwise(&plan, 4);
         let asm = kernel.to_assembly(Target::GFX1100).unwrap();
-        assert!(asm.contains("v_mul_f32"), "missing scale (mul)");
-        assert!(asm.contains("v_add_f32"), "missing add");
+        // SSA optimizer may fuse scale(mul)+add into fma, so accept either
+        assert!(asm.contains("v_mul_f32") || asm.contains("v_fma_f32") || asm.contains("v_fmac_f32"),
+            "missing scale (mul or fma)");
+        assert!(asm.contains("v_add_f32") || asm.contains("v_fma_f32") || asm.contains("v_fmac_f32"),
+            "missing add (or fma)");
         assert!(asm.contains("v_max_f32"), "missing relu (max)");
         assert!(asm.contains("global_load_b128"), "missing dwordx4 load");
         assert!(asm.contains("global_store_b128"), "missing dwordx4 store");
@@ -11666,13 +7795,85 @@ mod tests {
     #[test]
     fn test_matmul_lds_db_asm() {
         let sched = GFX1100Schedule;
-        let kernel = matmul_lds_db(&sched);
+        let kernel = rmsnorm(&sched);
         let asm = kernel.to_assembly(Target::GFX1100).unwrap();
-        std::fs::write("/tmp/matmul_lds_db.s", &asm).unwrap();
-        eprintln!("matmul_lds_db: {} lines saved to /tmp/matmul_lds_db.s", asm.lines().count());
-        assert!(asm.contains("ds_store_b128"));
-        assert!(asm.contains("ds_load_b128"));
-        assert!(asm.contains("s_barrier"));
-        assert!(asm.contains(".amdhsa_group_segment_fixed_size 6144"));
+        std::fs::write("/tmp/rmsnorm_asm.s", &asm).unwrap();
+        eprintln!("rmsnorm: {} lines saved to /tmp/rmsnorm_asm.s", asm.lines().count());
+        assert!(asm.contains("v_rsq_f32"), "rmsnorm: missing rsqrt");
+        assert!(asm.contains("ds_swizzle_b32"), "rmsnorm: missing wave reduction");
+        assert!(asm.contains("s_endpgm"));
     }
+}
+
+// ══════════════════════════════════════════════════════
+// GEMM convenience wrappers for Ignis
+// ══════════════════════════════════════════════════════
+
+/// GEMM forward kernel (Y = A @ B^T) — returns AmdGpuCodeObject for ensure_kernel
+pub fn t0_gemm_forward(_tiles_n: u32) -> T0Kernel {
+    use super::gemm_gen;
+    let config = gemm_gen::auto_select(1024, 1024, _tiles_n * 64);
+    gemm_gen::generate(&config)
+}
+
+/// GEMM backward data kernel (dX = dY @ W) — returns T0Kernel
+pub fn t0_gemm_backward_data(_tiles_k: u32) -> T0Kernel {
+    use super::gemm_gen;
+    let config = gemm_gen::auto_select(1024, _tiles_k * 64, 1024);
+    gemm_gen::generate(&config)
+}
+
+/// GEMM backward weight kernel (dW = X^T @ dY) — returns T0Kernel
+pub fn t0_gemm_backward_weight(_tiles_n: u32) -> T0Kernel {
+    use super::gemm_gen;
+    let config = gemm_gen::auto_select(1024, 1024, _tiles_n * 64);
+    gemm_gen::generate(&config)
+}
+
+/// Scale kernel: out[i] = in[i] * scalar
+/// Kernarg: [in_ptr: u64, out_ptr: u64, n: u32, scalar: f32]
+pub fn scale(_wg_size: u32) -> T0Kernel {
+    use super::ir::*;
+    let mut k = T0Kernel::new("scale_f32");
+    let in_ptr = k.arg_ptr("in_ptr");
+    let out_ptr = k.arg_ptr("out_ptr");
+    let n = k.arg_u32("n");
+    let scalar = k.arg_f32("scalar");
+
+    k.emit_arg_loads();
+
+    let gid = k.compute_global_id_x(256);
+    let n_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(n_vreg, n);
+
+    let saved = k.bounds_check_begin(gid, n_vreg);
+
+    // byte offset
+    let off = k.alloc_vreg();
+    k.v_lshlrev_b32(off, 2, gid);
+
+    // load in[i]
+    let addr_lo = k.alloc_vreg();
+    let addr_hi = k.alloc_vreg();
+    let val = k.alloc_vreg();
+    k.v_mov_from_sgpr(addr_lo, SReg(in_ptr.0));
+    k.v_mov_from_sgpr(addr_hi, SReg(in_ptr.0 + 1));
+    k.addr64_add(addr_lo, addr_hi, off);
+    k.global_load(val, addr_lo, Width::B32, 0);
+    k.wait_vmcnt(0);
+
+    // val *= scalar
+    let s_vreg = k.alloc_vreg();
+    k.v_mov_from_sgpr(s_vreg, scalar);
+    k.v_mul_f32(val, val, s_vreg);
+
+    // store out[i]
+    k.v_mov_from_sgpr(addr_lo, SReg(out_ptr.0));
+    k.v_mov_from_sgpr(addr_hi, SReg(out_ptr.0 + 1));
+    k.addr64_add(addr_lo, addr_hi, off);
+    k.global_store(addr_lo, val, Width::B32, 0);
+
+    k.bounds_check_end(saved);
+    k.endpgm();
+    k
 }

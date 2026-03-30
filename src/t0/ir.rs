@@ -138,6 +138,8 @@ pub enum SOperand {
     InlineInt(i32),
     /// 32-bit literal
     Literal(u32),
+    /// VCC_LO register (read VCC as scalar)
+    Vcc,
 }
 
 // ============================================================================
@@ -162,7 +164,7 @@ impl Target {
 /// A single IR operation.
 #[derive(Clone, Debug)]
 pub enum Op {
-    // ── Global memory ──
+    // ── Global memory (flat addressing) ──
     GlobalLoad {
         dst: VReg,
         addr: VReg, // lo register of 64-bit addr pair (addr, addr+1)
@@ -174,6 +176,24 @@ pub enum Op {
         src: VReg,
         width: Width,
         offset: i32,
+    },
+
+    // ── Buffer memory (MUBUF: descriptor + offset addressing) ──
+    // Uses s[srsrc:srsrc+3] as buffer resource descriptor + VGPR offset.
+    // Better L2 cache behavior and coalescing than flat global_load.
+    BufferLoad {
+        dst: VReg,
+        voffset: VReg,   // per-thread byte offset in VGPR
+        srsrc: SReg,     // first of 4 SGPRs (buffer resource descriptor)
+        width: Width,
+        offset: u16,     // constant byte offset (12-bit, 0..4095)
+    },
+    BufferStore {
+        voffset: VReg,   // per-thread byte offset in VGPR
+        src: VReg,
+        srsrc: SReg,     // first of 4 SGPRs (buffer resource descriptor)
+        width: Width,
+        offset: u16,     // constant byte offset (12-bit, 0..4095)
     },
 
     // ── LDS (Local Data Share) ──
@@ -204,6 +224,7 @@ pub enum Op {
     VFmaF32 { dst: VReg, src0: Operand, src1: Operand, src2: Operand },
     VMaxF32 { dst: VReg, src0: Operand, src1: Operand },
     VMinF32 { dst: VReg, src0: Operand, src1: Operand },
+    VMinU32 { dst: VReg, src0: Operand, src1: Operand },
     VMov { dst: VReg, src: Operand },
     VMovFromSgpr { dst: VReg, src: SReg },
     VAddU32 { dst: VReg, src0: Operand, src1: Operand },
@@ -255,6 +276,8 @@ pub enum Op {
     WaitVscnt(u8),
     /// Clear VCC (s_mov_b32 vcc_lo, 0) — prevent carry residual from mask ops
     ClearVcc,
+    /// Move VCC_LO from SGPR: s_mov_b32 vcc_lo, src (restore saved mask)
+    SMovToVcc { src: SReg },
 
     // ── Program structure ──
     Endpgm,
@@ -282,6 +305,14 @@ pub enum Op {
     /// v_exp_f32: compute 2^x (NOT e^x!)
     /// For natural exp: v_mul_f32(x, log2e); v_exp_f32(x)
     VExpF32 { dst: VReg, src: VReg },
+
+    /// v_sin_f32: compute sin(2π·x)
+    /// For standard sin(x): v_mul_f32(x, 1/(2π)); v_sin_f32(x)
+    VSinF32 { dst: VReg, src: VReg },
+
+    /// v_cos_f32: compute cos(2π·x)
+    /// For standard cos(x): v_mul_f32(x, 1/(2π)); v_cos_f32(x)
+    VCosF32 { dst: VReg, src: VReg },
 
     /// v_rcp_f32: reciprocal (1/x)
     VRcpF32 { dst: VReg, src: VReg },
@@ -359,6 +390,10 @@ pub enum Op {
     /// Must be called after the conditional block to unmask all lanes
     RestoreExec { src: SReg },
 
+    /// s_xor_b32 exec_lo, exec_lo, saved — Flip EXEC for else branch
+    /// After if-body: exec = (original & cond); XOR saved (= original) gives: original & ~cond
+    XorExec { saved: SReg },
+
     // ── Additional branch variants ──
     /// s_cbranch_scc0 — branch if SCC == 0
     BranchScc0(String),
@@ -396,6 +431,8 @@ pub enum Op {
     // ── Global atomics ──
     /// global_atomic_add_f32 (no return) — fire-and-forget atomic float add
     GlobalAtomicAddF32 { addr: VReg, src: VReg, offset: i32 },
+    /// global_atomic_add_u32 with return — dst = old value, addr[0:1]+offset atomically += src
+    GlobalAtomicAddU32Rtn { dst: VReg, addr: VReg, src: VReg },
 
     // ── SMEM scalar load ──
     /// s_load_dword dst, s[base_lo:base_hi], offset
@@ -404,6 +441,12 @@ pub enum Op {
     // ── Wave reduction (max) ──
     /// Wave32 max reduction via ds_swizzle XOR patterns
     WaveReduceMaxF32 { val: VReg, tmp: VReg },
+
+    // ── Hardware performance counters ──
+    /// Read HW_REG_SHADER_CYCLES into a VGPR (GFX1100 only).
+    /// Emits: s_getreg_b32 s2, hwreg(HW_REG_SHADER_CYCLES); v_mov_b32 vDst, s2
+    /// Uses s2 as scratch (safe after kernarg loads / TGID capture).
+    ReadShaderCycles { dst: VReg },
 
     // ── Raw assembly passthrough (escape hatch) ──
     RawAsm(String),
@@ -435,6 +478,18 @@ impl Op {
                 v.push(*addr); v.push(VReg(addr.0 + 1));
                 v
             }
+            Op::BufferLoad { dst, voffset, width, .. } => {
+                let n = width.vreg_count();
+                let mut v: Vec<VReg> = (0..n).map(|i| VReg(dst.0 + i as u32)).collect();
+                v.push(*voffset);
+                v
+            }
+            Op::BufferStore { voffset, src, width, .. } => {
+                let n = width.vreg_count();
+                let mut v: Vec<VReg> = (0..n).map(|i| VReg(src.0 + i as u32)).collect();
+                v.push(*voffset);
+                v
+            }
 
             // LDS
             Op::LdsLoad { dst, addr, width, .. } => {
@@ -458,6 +513,7 @@ impl Op {
             Op::VMulF32 { dst, src0, src1 } |
             Op::VMaxF32 { dst, src0, src1 } |
             Op::VMinF32 { dst, src0, src1 } |
+            Op::VMinU32 { dst, src0, src1 } |
             Op::VAddU32 { dst, src0, src1 } |
             Op::VAndB32 { dst, src0, src1 } |
             Op::VXorB32 { dst, src0, src1 } |
@@ -521,7 +577,7 @@ impl Op {
 
             // Sync (no VGPRs)
             Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) | Op::ClearVcc
-            | Op::SMemLoadDword { .. } => vec![],
+            | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } => vec![],
             Op::Endpgm => vec![],
 
             // Hardware
@@ -534,6 +590,8 @@ impl Op {
             // Special math
             Op::VRsqF32 { dst, src } |
             Op::VExpF32 { dst, src } |
+            Op::VSinF32 { dst, src } |
+            Op::VCosF32 { dst, src } |
             Op::VRcpF32 { dst, src } |
             Op::VCvtF32U32 { dst, src } |
             Op::VCvtU32F32 { dst, src } => vec![*dst, *src],
@@ -578,7 +636,7 @@ impl Op {
             }
 
             // EXEC mask (no VGPRs)
-            Op::SaveExec { .. } | Op::RestoreExec { .. } => vec![],
+            Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } => vec![],
 
             // Additional branch variants (no VGPRs)
             Op::BranchScc0(_) | Op::BranchVccz(_) => vec![],
@@ -592,6 +650,7 @@ impl Op {
             }
             Op::VSqrtF32 { dst, src } => vec![*dst, *src],
             Op::VLog2F32 { dst, src } => vec![*dst, *src],
+            Op::ReadShaderCycles { dst } => vec![*dst],
             Op::VCmpGtU32Imm { src, .. } | Op::VCmpEqU32Imm { src, .. } => vec![*src],
             Op::VCmpGeI32 { src0, src1 } => vec![*src0, *src1],
 
@@ -607,6 +666,9 @@ impl Op {
             Op::GlobalAtomicAddF32 { addr, src, .. } => {
                 vec![*addr, VReg(addr.0 + 1), *src]
             }
+            Op::GlobalAtomicAddU32Rtn { dst, addr, src } => {
+                vec![*dst, *addr, VReg(addr.0 + 1), *src]
+            }
 
             // Wave reduce
             Op::WaveReduceAddF32 { val, tmp } => vec![*val, *tmp],
@@ -616,8 +678,423 @@ impl Op {
             Op::RawAsm(_) => vec![],
         }
     }
-}
 
+    /// Return VRegs defined (written) by this instruction.
+    /// Used by DCE to determine if an instruction's result is used.
+    pub fn vreg_defs(&self) -> Vec<VReg> {
+        match self {
+            // Memory loads define dst
+            Op::GlobalLoad { dst, width, .. } | Op::BufferLoad { dst, width, .. } => {
+                (0..width.vreg_count()).map(|i| VReg(dst.0 + i)).collect()
+            }
+            Op::LdsLoad { dst, width, .. } => {
+                (0..width.vreg_count()).map(|i| VReg(dst.0 + i)).collect()
+            }
+            Op::DsLoadB32 { dst, .. } | Op::DsLoadU16 { dst, .. } |
+            Op::DsLoadU16D16 { dst, .. } | Op::DsLoadU16D16Hi { dst, .. } => vec![*dst],
+            Op::DsLoadB64 { dst, .. } => vec![*dst, VReg(dst.0 + 1)],
+            Op::DsLoadB128 { dst, .. } => (0..4).map(|i| VReg(dst.0 + i)).collect(),
+
+            // VALU ops define dst
+            Op::VAddF32 { dst, .. } | Op::VMulF32 { dst, .. } |
+            Op::VFmaF32 { dst, .. } | Op::VMaxF32 { dst, .. } |
+            Op::VMinF32 { dst, .. } | Op::VMinU32 { dst, .. } | Op::VMov { dst, .. } |
+            Op::VMovFromSgpr { dst, .. } | Op::VAddU32 { dst, .. } |
+            Op::VMulLoU32 { dst, .. } | Op::VLshlrevB32 { dst, .. } |
+            Op::VLshrrevB32 { dst, .. } | Op::VAndB32 { dst, .. } |
+            Op::VXorB32 { dst, .. } | Op::VSubF32 { dst, .. } |
+            Op::VSubU32 { dst, .. } | Op::VOrB32 { dst, .. } |
+            Op::VRsqF32 { dst, .. } | Op::VExpF32 { dst, .. } |
+            Op::VSinF32 { dst, .. } | Op::VCosF32 { dst, .. } |
+            Op::VRcpF32 { dst, .. } | Op::VSqrtF32 { dst, .. } |
+            Op::VLog2F32 { dst, .. } | Op::VCvtF32U32 { dst, .. } |
+            Op::VCvtU32F32 { dst, .. } | Op::VCndmaskB32 { dst, .. } |
+            Op::VAddCo { dst, .. } | Op::VAddCoCi { dst, .. } |
+            Op::VAddCOU32 { dst, .. } | Op::VAddCCU32 { dst, .. } |
+            Op::CvtPkBf16F32 { dst, .. } | Op::VAndOrB32 { dst, .. } |
+            Op::VPermlanex16B32 { dst, .. } | Op::DsSwizzle { dst, .. } |
+            Op::ComputeGlobalIdX { dst, .. } |
+            Op::ReadShaderCycles { dst, .. } => vec![*dst],
+
+            // WMMA defines 8 consecutive dst VGPRs
+            Op::Wmma { dst, .. } => (0..8).map(|i| VReg(dst.0 + i)).collect(),
+
+            // Wave reductions modify val in-place
+            Op::WaveReduceAddF32 { val, .. } | Op::WaveReduceMaxF32 { val, .. } => vec![*val],
+
+            // Everything else defines nothing (stores, branches, barriers, compares, etc.)
+            _ => vec![],
+        }
+    }
+
+    /// Return VRegs that are READ (used as sources) by this instruction.
+    /// Unlike `vreg_refs() - vreg_defs()`, this correctly handles instructions
+    /// where dst == src (e.g. `VAddCo { dst: v4, src0: v4, src1: v3 }`).
+    pub fn vreg_uses(&self) -> Vec<VReg> {
+        match self {
+            // ── Memory: addr (+ addr+1 for global) and store sources are uses ──
+            Op::GlobalLoad { addr, .. } => vec![*addr, VReg(addr.0 + 1)],
+            Op::GlobalStore { addr, src, width, .. } => {
+                let mut v: Vec<VReg> = (0..width.vreg_count()).map(|i| VReg(src.0 + i)).collect();
+                v.push(*addr); v.push(VReg(addr.0 + 1));
+                v
+            }
+            Op::BufferLoad { voffset, .. } => vec![*voffset],
+            Op::BufferStore { voffset, src, width, .. } => {
+                let mut v: Vec<VReg> = (0..width.vreg_count()).map(|i| VReg(src.0 + i)).collect();
+                v.push(*voffset);
+                v
+            }
+            Op::LdsLoad { addr, .. } => vec![*addr],
+            Op::LdsStore { addr, src, width, .. } => {
+                let mut v: Vec<VReg> = (0..width.vreg_count()).map(|i| VReg(src.0 + i)).collect();
+                v.push(*addr);
+                v
+            }
+            Op::ScalarLoad { .. } => vec![],
+
+            // ── VALU 2-src: sources are uses ──
+            Op::VAddF32 { src0, src1, .. } |
+            Op::VMulF32 { src0, src1, .. } |
+            Op::VMaxF32 { src0, src1, .. } |
+            Op::VMinF32 { src0, src1, .. } |
+            Op::VMinU32 { src0, src1, .. } |
+            Op::VAddU32 { src0, src1, .. } |
+            Op::VAndB32 { src0, src1, .. } |
+            Op::VXorB32 { src0, src1, .. } |
+            Op::VSubF32 { src0, src1, .. } |
+            Op::VSubU32 { src0, src1, .. } |
+            Op::VOrB32 { src0, src1, .. } => {
+                let mut v = vec![];
+                v.extend(operand_vregs(src0));
+                v.extend(operand_vregs(src1));
+                v
+            }
+
+            // ── VALU 3-src ──
+            Op::VFmaF32 { src0, src1, src2, .. } => {
+                let mut v = vec![];
+                v.extend(operand_vregs(src0));
+                v.extend(operand_vregs(src1));
+                v.extend(operand_vregs(src2));
+                v
+            }
+
+            // ── Moves ──
+            Op::VMov { src, .. } => operand_vregs(src).into_iter().collect(),
+            Op::VMovFromSgpr { .. } => vec![], // source is SReg, no VReg use
+
+            // ── Integer ops ──
+            Op::VMulLoU32 { src0, src1, .. } => vec![*src0, *src1],
+            Op::VLshlrevB32 { src, .. } |
+            Op::VLshrrevB32 { src, .. } => vec![*src],
+            Op::VReadfirstlane { src, .. } => vec![*src],
+
+            // ── 64-bit address arithmetic (CRITICAL: src0/src1 are READS even if == dst) ──
+            Op::VAddCo { src0, src1, .. } => vec![*src0, *src1],
+            Op::VAddCoCi { src, .. } => vec![*src],
+            Op::VAddCOU32 { src0, src1, .. } => vec![*src0, *src1],
+            Op::VAddCCU32 { src, .. } => vec![*src],
+
+            // ── Scalar ALU: no VGPRs ──
+            Op::SAddU32 { .. } | Op::SAddcU32 { .. } | Op::SSubU32 { .. } | Op::SAndB32 { .. } |
+            Op::SMulI32 { .. } | Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+            Op::SMov { .. } | Op::SCmpLtU32 { .. } |
+            Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } => vec![],
+
+            // ── WMMA: a, b, c are reads; dst is write only ──
+            Op::Wmma { a, b, c, .. } => {
+                let mut v = Vec::with_capacity(24);
+                for i in 0..8u32 {
+                    v.push(VReg(a.0 + i));
+                    v.push(VReg(b.0 + i));
+                    v.push(VReg(c.0 + i));
+                }
+                v
+            }
+
+            // ── Control flow, sync ──
+            Op::Label(_) | Op::BranchScc1(_) | Op::Branch(_) |
+            Op::BranchScc0(_) | Op::BranchVccz(_) |
+            Op::Barrier | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+            Op::ClearVcc | Op::SMovToVcc { .. } | Op::SMemLoadDword { .. } |
+            Op::Endpgm | Op::SBarrier => vec![],
+
+            // ── Hardware ──
+            Op::CaptureTgid { .. } => vec![],
+            Op::ComputeGlobalIdX { .. } => vec![], // uses v0 implicitly, but not tracked as VReg
+
+            // ── Cross-lane ──
+            Op::DsSwizzle { src, .. } => vec![*src],
+
+            // ── Special math ──
+            Op::VRsqF32 { src, .. } |
+            Op::VExpF32 { src, .. } |
+            Op::VSinF32 { src, .. } |
+            Op::VCosF32 { src, .. } |
+            Op::VRcpF32 { src, .. } |
+            Op::VSqrtF32 { src, .. } |
+            Op::VLog2F32 { src, .. } |
+            Op::VCvtF32U32 { src, .. } |
+            Op::VCvtU32F32 { src, .. } => vec![*src],
+
+            // ── Data conversion ──
+            Op::CvtPkBf16F32 { src0, src1, .. } => vec![*src0, *src1],
+
+            // ── LDS ops ──
+            Op::DsStoreB16 { vaddr, src, .. } |
+            Op::DsStoreB32 { vaddr, src, .. } => vec![*vaddr, *src],
+            Op::DsStoreB64 { vaddr, src, .. } => vec![*vaddr, *src, VReg(src.0 + 1)],
+            Op::DsStoreB128 { vaddr, src, .. } => {
+                vec![*vaddr, *src, VReg(src.0 + 1), VReg(src.0 + 2), VReg(src.0 + 3)]
+            }
+            Op::DsLoadB32 { vaddr, .. } |
+            Op::DsLoadU16 { vaddr, .. } |
+            Op::DsLoadU16D16 { vaddr, .. } |
+            Op::DsLoadU16D16Hi { vaddr, .. } |
+            Op::DsLoadB64 { vaddr, .. } |
+            Op::DsLoadB128 { vaddr, .. } => vec![*vaddr],
+
+            // ── Comparisons ──
+            Op::VCmpLtU32 { src0, src1 } |
+            Op::VCmpGeU32 { src0, src1 } => {
+                let mut v = vec![];
+                v.extend(operand_vregs(src0));
+                v.extend(operand_vregs(src1));
+                v
+            }
+            Op::VCmpGtF32Imm0 { src } => vec![*src],
+            Op::VCmpGtU32Imm { src, .. } | Op::VCmpEqU32Imm { src, .. } => vec![*src],
+            Op::VCmpGeI32 { src0, src1 } => vec![*src0, *src1],
+
+            Op::VCndmaskB32 { src_false, src_true, .. } => {
+                let mut v = vec![];
+                v.extend(operand_vregs(src_false));
+                v.extend(operand_vregs(src_true));
+                v
+            }
+
+            // ── EXEC mask ──
+            Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } => vec![],
+
+            // ── Lane permute ──
+            Op::VPermlanex16B32 { src, .. } => vec![*src],
+            // ── VOP3 three-source ──
+            Op::VAndOrB32 { src0, src2, .. } => vec![*src0, *src2],
+
+            // ── Atomics ──
+            Op::GlobalAtomicAddF32 { addr, src, .. } => vec![*addr, VReg(addr.0 + 1), *src],
+            Op::GlobalAtomicAddU32Rtn { addr, src, .. } => vec![*addr, VReg(addr.0 + 1), *src],
+
+            // ── Wave reduce (val is both read and written — include as use) ──
+            Op::WaveReduceAddF32 { val, tmp } |
+            Op::WaveReduceMaxF32 { val, tmp } => vec![*val, *tmp],
+
+            // ── Performance counters ──
+            Op::ReadShaderCycles { .. } => vec![],
+
+            // ── Raw asm ──
+            Op::RawAsm(_) => vec![],
+        }
+    }
+
+    /// Return SRegs defined (written) by this instruction.
+    /// Used by SSA lift to track scalar register data flow for LICM.
+    pub fn sreg_defs(&self) -> Vec<SReg> {
+        match self {
+            Op::SAddU32 { dst, .. } | Op::SAddcU32 { dst, .. } |
+            Op::SSubU32 { dst, .. } | Op::SAndB32 { dst, .. } |
+            Op::SMulI32 { dst, .. } | Op::SLshlB32 { dst, .. } |
+            Op::SLshrB32 { dst, .. } | Op::SMov { dst, .. } => vec![*dst],
+            Op::SaveExec { dst, .. } => vec![*dst],
+            Op::CaptureTgid { dst, .. } => vec![*dst],
+            Op::VReadfirstlane { dst, .. } => vec![*dst],
+            Op::SMemLoadDword { dst, .. } => vec![*dst],
+            // ScalarLoad defines dst..dst+N depending on width
+            Op::ScalarLoad { dst, width, .. } => {
+                let n = width.vreg_count(); // reuse count logic
+                (0..n as u32).map(|i| SReg(dst.0 + i)).collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Return SRegs that are READ (used as sources) by this instruction.
+    /// Used by SSA lift to track scalar register data flow for LICM.
+    pub fn sreg_uses(&self) -> Vec<SReg> {
+        match self {
+            Op::SAddU32 { src0, src1, .. } => {
+                let mut v = vec![*src0];
+                if let SOperand::SReg(s) = src1 { v.push(*s); }
+                v
+            }
+            Op::SAddcU32 { src0, src1, .. } => {
+                let mut v = vec![*src0];
+                if let SOperand::SReg(s) = src1 { v.push(*s); }
+                v
+            }
+            Op::SSubU32 { src0, src1, .. } => {
+                let mut v = vec![*src0];
+                if let SOperand::SReg(s) = src1 { v.push(*s); }
+                v
+            }
+            Op::SAndB32 { src0, src1, .. } => {
+                let mut v = vec![*src0];
+                if let SOperand::SReg(s) = src1 { v.push(*s); }
+                v
+            }
+            Op::SMulI32 { src0, src1, .. } => vec![*src0, *src1],
+            Op::SLshlB32 { src, .. } | Op::SLshrB32 { src, .. } => vec![*src],
+            Op::SMov { src, .. } => {
+                if let SOperand::SReg(s) = src { vec![*s] } else { vec![] }
+            }
+            Op::SCmpLtU32 { src0, src1 } | Op::SCmpGeU32 { src0, src1 } => vec![*src0, *src1],
+            Op::SCmpEqU32 { src0, src1 } => {
+                let mut v = vec![*src0];
+                if let SOperand::SReg(s) = src1 { v.push(*s); }
+                v
+            }
+            // VMovFromSgpr reads an SReg as source
+            Op::VMovFromSgpr { src, .. } => vec![*src],
+            // RestoreExec reads saved SReg
+            Op::RestoreExec { src } => vec![*src],
+            // XorExec reads saved SReg
+            Op::XorExec { saved } => vec![*saved],
+            // SMovToVcc reads SReg
+            Op::SMovToVcc { src } => vec![*src],
+            // ScalarLoad uses base pair
+            Op::ScalarLoad { base, .. } => vec![SReg(base.0), SReg(base.0 + 1)],
+            Op::SMemLoadDword { base_lo, base_hi, .. } => vec![*base_lo, *base_hi],
+            _ => vec![],
+        }
+    }
+
+    /// Does this instruction have side effects? (store, atomic, branch, barrier, etc.)
+    /// Side-effecting ops must NOT be removed by DCE.
+    ///
+    /// Also includes ops that are read-modify-write (WaveReduce modifies val in-place),
+    /// memory loads (removing loads changes waitcnt semantics), and cross-lane ops.
+    pub fn has_side_effects(&self) -> bool {
+        matches!(self,
+            Op::GlobalStore { .. } | Op::LdsStore { .. } |
+            Op::BufferLoad { .. } | Op::BufferStore { .. } |
+            Op::DsStoreB16 { .. } | Op::DsStoreB32 { .. } |
+            Op::DsStoreB64 { .. } | Op::DsStoreB128 { .. } |
+            Op::GlobalAtomicAddF32 { .. } |
+            Op::GlobalAtomicAddU32Rtn { .. } |
+            // Memory loads: removing changes waitcnt counters
+            Op::GlobalLoad { .. } | Op::LdsLoad { .. } |
+            Op::DsLoadB32 { .. } | Op::DsLoadB64 { .. } | Op::DsLoadB128 { .. } |
+            Op::DsLoadU16 { .. } | Op::DsLoadU16D16 { .. } | Op::DsLoadU16D16Hi { .. } |
+            // Cross-lane ops (read-modify-write / side channel)
+            Op::WaveReduceAddF32 { .. } | Op::WaveReduceMaxF32 { .. } |
+            Op::DsSwizzle { .. } | Op::VPermlanex16B32 { .. } |
+            // Control flow and sync
+            Op::Label(_) | Op::BranchScc1(_) | Op::BranchScc0(_) |
+            Op::Branch(_) | Op::BranchVccz(_) |
+            Op::Barrier | Op::SBarrier |
+            Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_) |
+            Op::ClearVcc | Op::SMovToVcc { .. } |
+            Op::SaveExec { .. } | Op::RestoreExec { .. } | Op::XorExec { .. } |
+            Op::Endpgm | Op::RawAsm(_) |
+            // VCC-writing comparisons (affect cndmask, branches)
+            Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
+            Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
+            Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
+            // SCC-writing comparisons
+            Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. } |
+            // Scalar ops (affect SCC, manage state)
+            Op::CaptureTgid { .. } | Op::ScalarLoad { .. } | Op::SMemLoadDword { .. } |
+            Op::SAddU32 { .. } | Op::SAddcU32 { .. } | Op::SSubU32 { .. } |
+            Op::SAndB32 { .. } | Op::SMulI32 { .. } | Op::SLshlB32 { .. } |
+            Op::SLshrB32 { .. } | Op::SMov { .. } |
+            Op::VReadfirstlane { .. } |
+            // WMMA (complex multi-register side effects)
+            Op::Wmma { .. } |
+            // ComputeGlobalIdX (clobbers s2)
+            Op::ComputeGlobalIdX { .. } |
+            // ReadShaderCycles (clobbers s2, timing side-effect)
+            Op::ReadShaderCycles { .. } |
+            // VCC-writing ops (implicit side effect: modify VCC register)
+            Op::VAddCo { .. } | Op::VAddCoCi { .. } |
+            Op::VAddCOU32 { .. } | Op::VAddCCU32 { .. } |
+            // VCC-reading ops (depend on implicit VCC state)
+            Op::VCndmaskB32 { .. } |
+            // bf16 pack (multi-instruction expansion, should not be removed)
+            Op::CvtPkBf16F32 { .. }
+        )
+    }
+
+    /// Is this a pure VALU instruction with no side effects?
+    pub fn is_pure_valu(&self) -> bool {
+        !self.vreg_defs().is_empty() && !self.has_side_effects()
+    }
+
+    // ── Implicit state (VCC / SCC) dependency tracking ──
+    //
+    // GFX1100 has two implicit condition registers:
+    // - VCC (Vector Condition Code): written by v_cmp_*, v_add_co_*; read by v_cndmask, branches
+    // - SCC (Scalar Condition Code): written by s_add/s_sub/s_cmp/s_and; read by s_cbranch_scc*, s_addc
+    //
+    // The instruction scheduler must not reorder across VCC/SCC def-use boundaries.
+
+    /// Does this instruction implicitly write VCC?
+    pub fn writes_vcc(&self) -> bool {
+        matches!(self,
+            // Vector comparisons → VCC
+            Op::VCmpLtU32 { .. } | Op::VCmpGeU32 { .. } |
+            Op::VCmpGtF32Imm0 { .. } | Op::VCmpGtU32Imm { .. } |
+            Op::VCmpEqU32Imm { .. } | Op::VCmpGeI32 { .. } |
+            // 64-bit carry-out → VCC
+            Op::VAddCo { .. } | Op::VAddCOU32 { .. } |
+            // ClearVcc / SMovToVcc explicitly write VCC
+            Op::ClearVcc | Op::SMovToVcc { .. }
+        )
+    }
+
+    /// Does this instruction implicitly read VCC?
+    pub fn reads_vcc(&self) -> bool {
+        matches!(self,
+            // Conditional select reads VCC
+            Op::VCndmaskB32 { .. } |
+            // 64-bit carry-in reads VCC
+            Op::VAddCoCi { .. } | Op::VAddCCU32 { .. } |
+            // EXEC mask from VCC
+            Op::SaveExec { .. } |
+            // Branch on VCC
+            Op::BranchVccz(_)
+        )
+    }
+
+    /// Does this instruction implicitly write SCC?
+    pub fn writes_scc(&self) -> bool {
+        matches!(self,
+            // Scalar arithmetic → SCC (carry/borrow)
+            Op::SAddU32 { .. } | Op::SSubU32 { .. } | Op::SAddcU32 { .. } |
+            Op::SAndB32 { .. } | Op::SMulI32 { .. } |
+            Op::SLshlB32 { .. } | Op::SLshrB32 { .. } |
+            // Scalar comparisons → SCC
+            Op::SCmpLtU32 { .. } | Op::SCmpEqU32 { .. } | Op::SCmpGeU32 { .. }
+        )
+    }
+
+    /// Does this instruction implicitly read SCC?
+    pub fn reads_scc(&self) -> bool {
+        matches!(self,
+            // Carry-in from previous s_add_u32
+            Op::SAddcU32 { .. } |
+            // Conditional branches on SCC
+            Op::BranchScc0(_) | Op::BranchScc1(_)
+        )
+    }
+
+    /// Does this instruction touch any implicit state register (VCC or SCC)?
+    /// Used by the instruction scheduler to prevent reordering across implicit
+    /// state boundaries.
+    pub fn touches_implicit_state(&self) -> bool {
+        self.writes_vcc() || self.reads_vcc() || self.writes_scc() || self.reads_scc()
+    }
+}
 // ============================================================================
 // Kernel argument metadata
 // ============================================================================

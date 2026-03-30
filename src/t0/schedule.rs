@@ -158,16 +158,16 @@ pub fn build_elementwise_scale(sched: &dyn Schedule) -> T0Kernel {
 /// Kernargs: X_ptr(0), WT_ptr(8), Y_ptr(16), K(24:u32), N(28:u32)
 pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
     let mut k = T0Kernel::new("t0_gemm_forward");
-    let (tile_m, tile_n) = sched.gemm_tile_mn();
+    let (_tile_m, _tile_n) = sched.gemm_tile_mn();
     let tile_k = sched.gemm_tile_k();
     let n_tiles = sched.gemm_n_wmma_tiles();  // tile_n / 16
 
     // ── Args ──
     let x_ptr = k.arg_ptr("X");
     let wt_ptr = k.arg_ptr("WT");
-    let y_ptr = k.arg_ptr("Y");
+    let _y_ptr = k.arg_ptr("Y");
     let k_dim = k.arg_u32("K");
-    let n_dim = k.arg_u32("N");
+    let _n_dim = k.arg_u32("N");
     k.emit_arg_loads();
 
     // ── Capture TGIDs ──
@@ -311,6 +311,104 @@ pub fn build_gemm_forward(sched: &dyn Schedule) -> T0Kernel {
 }
 
 // ============================================================================
+// AutoGemmSchedule — auto-selected tile parameters from cost_model
+// ============================================================================
+
+/// Schedule derived from `cost_model::auto_schedule_gemm()`.
+///
+/// Bridges the cost model → Schedule trait → build_gemm_forward() pipeline.
+/// Instead of hand-tuning tile parameters, use this to let the auto-scheduler
+/// select optimal values based on problem size (M, N, K).
+///
+/// # Usage
+/// ```rust
+/// let sched = AutoGemmSchedule::for_problem(4096, 4096, 512);
+/// let kernel = build_gemm_forward(&sched); // uses auto-selected tiles
+/// let elf = kernel.compile(Target::GFX1100).unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct AutoGemmSchedule {
+    pub tile_m: usize,
+    pub tile_n: usize,
+    pub tile_k: usize,
+    pub waves: u32,
+    pub use_lds: bool,
+    pub estimated_tflops: f64,
+    pub bottleneck: String,
+}
+
+impl AutoGemmSchedule {
+    /// Auto-select optimal GEMM tile parameters for the given problem size.
+    /// Uses exhaustive search over the tile space.
+    pub fn for_problem(m: u32, n: u32, k: u32) -> Self {
+        use super::cost_model::{self, DataFormat};
+
+        let cost = cost_model::best_gemm_config(m, n, k, DataFormat::BF16)
+            .expect("no feasible GEMM tile configuration found");
+
+        let sched = AutoGemmSchedule {
+            tile_m: cost.config.tile_m as usize,
+            tile_n: cost.config.tile_n as usize,
+            tile_k: cost.config.tile_k as usize,
+            waves: cost.config.waves_per_wg,
+            use_lds: cost.config.use_lds,
+            estimated_tflops: cost.score,
+            bottleneck: cost.bottleneck.to_string(),
+        };
+
+        eprintln!(
+            "[AutoSchedule] M={} N={} K={} → tile={}×{}×{} waves={} {:.1}T ({}) VGPRs={}",
+            m, n, k, sched.tile_m, sched.tile_n, sched.tile_k,
+            sched.waves, sched.estimated_tflops, sched.bottleneck, cost.vgprs
+        );
+
+        sched
+    }
+
+    /// Create from explicit tile parameters (for testing or override).
+    pub fn with_tiles(tile_m: usize, tile_n: usize, tile_k: usize, waves: u32) -> Self {
+        AutoGemmSchedule {
+            tile_m, tile_n, tile_k, waves,
+            use_lds: false,
+            estimated_tflops: 0.0,
+            bottleneck: "manual".into(),
+        }
+    }
+}
+
+impl Schedule for AutoGemmSchedule {
+    fn name(&self) -> &'static str { "GFX1100 (Auto)" }
+    fn gemm_tile_mn(&self) -> (usize, usize) { (self.tile_m, self.tile_n) }
+    fn gemm_tile_k(&self) -> usize { self.tile_k }
+    fn use_wmma(&self) -> bool { true }
+    fn wmma_format(&self) -> WmmaFormat { WmmaFormat::BF16_F32 }
+    fn a_load_strategy(&self) -> TileLoadStrategy {
+        if self.use_lds { TileLoadStrategy::ViaLds } else { TileLoadStrategy::DirectGlobal }
+    }
+    fn b_load_strategy(&self) -> TileLoadStrategy {
+        if self.use_lds { TileLoadStrategy::ViaLds } else { TileLoadStrategy::DirectGlobal }
+    }
+    fn workgroup_size(&self) -> (u16, u16, u16) {
+        ((self.waves * 32) as u16, 1, 1)
+    }
+    fn elems_per_thread(&self) -> usize { 4 }
+    fn lds_budget(&self) -> u32 { 65536 }
+    fn target(&self) -> Target { Target::GFX1100 }
+}
+
+/// One-call entry point: auto-select tiles → build GEMM kernel → return T0Kernel.
+///
+/// # Example
+/// ```rust
+/// let kernel = auto_build_gemm(4096, 4096, 512);
+/// let elf = kernel.compile(Target::GFX1100).unwrap();
+/// ```
+pub fn auto_build_gemm(m: u32, n: u32, k: u32) -> T0Kernel {
+    let sched = AutoGemmSchedule::for_problem(m, n, k);
+    build_gemm_forward(&sched)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -373,4 +471,60 @@ mod tests {
         assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
         eprintln!("GEMM Forward ELF: {} bytes", elf.len());
     }
+
+    // ── Auto-scheduling integration tests ──
+
+    #[test]
+    fn test_auto_schedule_implements_schedule() {
+        let sched = AutoGemmSchedule::for_problem(4096, 4096, 512);
+        // Must satisfy Schedule trait
+        assert!(sched.use_wmma());
+        let (tm, tn) = sched.gemm_tile_mn();
+        assert!(tm >= 16 && tn >= 16);
+        assert!(sched.gemm_tile_k() >= 8);
+        assert!(sched.waves_per_wg() >= 1);
+        eprintln!("AutoSchedule: {}×{} k={} {}w {:.1}T ({})",
+            tm, tn, sched.gemm_tile_k(), sched.waves_per_wg(),
+            sched.estimated_tflops, sched.bottleneck);
+    }
+
+    #[test]
+    fn test_auto_build_gemm_generates_asm() {
+        // Full pipeline: auto-select tiles → build kernel → generate assembly
+        let kernel = auto_build_gemm(2048, 2048, 256);
+        let asm = kernel.to_assembly(Target::GFX1100).unwrap();
+        assert!(asm.contains("v_wmma_f32_16x16x16_bf16"), "should contain WMMA");
+        assert!(asm.contains("s_cbranch_scc1"), "should contain K-loop branch");
+        assert!(asm.contains("s_endpgm"), "should contain endpgm");
+        eprintln!("--- Auto GEMM (2048×2048×256) ---");
+        eprintln!("{} lines of assembly", asm.lines().count());
+    }
+
+    #[test]
+    fn test_auto_vs_manual_schedule_both_compile() {
+        // Manual schedule
+        let manual_kernel = build_gemm_forward(&GFX1100Schedule);
+        let manual_asm = manual_kernel.to_assembly(Target::GFX1100).unwrap();
+
+        // Auto schedule
+        let auto_kernel = auto_build_gemm(4096, 4096, 512);
+        let auto_asm = auto_kernel.to_assembly(Target::GFX1100).unwrap();
+
+        // Both should produce valid assembly
+        assert!(manual_asm.contains("v_wmma"));
+        assert!(auto_asm.contains("v_wmma"));
+        eprintln!("Manual: {} lines, Auto: {} lines",
+            manual_asm.lines().count(), auto_asm.lines().count());
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_auto_build_gemm_elf() {
+        let kernel = auto_build_gemm(4096, 4096, 512);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
+        eprintln!("Auto GEMM ELF: {} bytes", elf.len());
+    }
 }
+

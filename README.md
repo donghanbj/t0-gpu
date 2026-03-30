@@ -93,45 +93,37 @@ cargo run --example bench_gemm_sweep --features rocm --release
 cargo run --example hello_gemm_gen --features rocm --release
 ```
 
-### 示例：4 行代码完成 GEMM / Example: GEMM in 4 Lines
+### 示例：DSL API / Example: DSL API
 
 ```rust
-use t0_gpu::t0::{Target, auto_select, compute_grid_auto, build_kernargs};
-use t0_gpu::t0::gemm_gen::generate;
-use t0_gpu::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+use t0_gpu::prelude::*;
 
 fn main() -> Result<(), String> {
-    // 1. 自动选择最优内核配置
-    //    Auto-select optimal kernel config for this matrix size
-    let (m, k, n) = (1024u32, 1024, 4096);
-    let cfg = auto_select(m, k, n);  // → 128×64_k16 + WGP + split_k=2
+    // 1. 声明 GEMM（自动选择最优 tile/split-K 配置）
+    //    Declare GEMM (auto-selects optimal tile/split-K config)
+    let kernel = gemm(1024, 1024, 4096).compile()?;
+    // → 128×64_k16 + WGP + split_k=2, 58.8 TFLOPS 🏆
 
-    // 2. 编译内核（一次编译，多次复用）
-    //    Compile kernel (compile once, reuse many times)
-    let kernel_ir = generate(&cfg);
-    let elf = kernel_ir.compile(Target::GFX1100)?;
+    // 2. 融合操作 — SiLU-gate 激活 + 逐元素乘法
+    //    Fused ops — SiLU-gate activation + elementwise multiply
+    let silu_mul = KernelBuilder::new(Target::GFX1100)
+        .op(Op::SiLU)
+        .op(Op::Mul)
+        .compile()?;
 
-    // 3. 加载到 GPU 并调度
+    // 3. 完整 OCPA 注意力管线
+    //    Complete OCPA attention pipeline
+    let fwd_intra = ocpa_forward_intra(256, 64).compile()?;
+
+    // 4. 加载到 GPU 并调度
     //    Load to GPU and dispatch
     let device = KfdDevice::open()?;
-    let gpu_kernel = GpuKernel::load(&device, &elf, &KernelLoadConfig {
-        workgroup_size: [cfg.wg_size, 1, 1],
-        lds_size: cfg.lds_total(),
+    let gpu_kernel = GpuKernel::load(&device, &kernel.elf, &KernelLoadConfig {
+        workgroup_size: kernel.workgroup_size,
+        lds_size: kernel.lds_size as usize,
     })?;
-
     let queue = device.create_queue()?;
-    let pool = DispatchPool::new(&device, 4)?;
-
-    let x = device.alloc_vram((m * k * 2) as usize)?;  // bf16
-    let w = device.alloc_vram((n * k * 2) as usize)?;
-    let sk = cfg.split_k.unwrap_or(1);
-    let y = device.alloc_vram((m * n * 4 * sk) as usize)?;  // f32
-
-    let ka = build_kernargs(x.gpu_addr(), w.gpu_addr(), y.gpu_addr(), k, n, m, &cfg);
-    let (gx, gy) = compute_grid_auto(&cfg, m, n);
-    queue.submit(&gpu_kernel, [gx, gy, 1], pool.write_kernargs(0, &ka));
-    queue.wait_idle()?;
-    // → 58.8 TFLOPS, 197% of rocBLAS 🏆
+    // ... submit and execute
 
     Ok(())
 }
@@ -153,15 +145,18 @@ t0-gpu/
 │   └── bench_gemm_sweep.rs  # 多配置扫描对比 / Multi-config sweep benchmark
 └── src/
     ├── lib.rs                # Crate 入口 / Crate root
+    ├── prelude.rs            # 便捷导入 / Convenience re-exports
     ├── rdna3_asm.rs          # ISA 编码器 / ISA encoder (~3500 LOC)
     ├── rdna3_code_object.rs  # ELF 生成器 / ELF generator (~1300 LOC)
     ├── t0/                   # T0 编译器 / T0 compiler
+    │   ├── dsl.rs            #   ⭐ DSL 前端 / DSL frontend (Op enum + KernelBuilder)
+    │   ├── dsl_lower.rs      #   ⭐ DSL 降级 / DSL lowering (Op → T0Kernel)
     │   ├── ir.rs             #   中间表示 / Intermediate representation
     │   ├── compile.rs        #   编译主逻辑 / Compilation logic
     │   ├── asm_emitter.rs    #   ISA 发射器 / ISA emitter
     │   ├── regalloc.rs       #   寄存器分配 / Register allocation
     │   ├── schedule.rs       #   指令调度 / Instruction scheduling
-    │   ├── math.rs           #   数学内核库 / Math kernel library (~11K LOC)
+    │   ├── math.rs           #   数学内核库 / Math kernel library (~7K LOC)
     │   └── gemm_gen.rs       #   参数化 GEMM 生成器 / Parameterized GEMM generator
     └── kfd/
         └── mod.rs            # KFD 运行时 / KFD runtime (~2600 LOC)

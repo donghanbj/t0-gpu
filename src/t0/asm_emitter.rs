@@ -11,6 +11,16 @@ use super::regalloc::RegAlloc;
 pub struct AsmEmitter {
     buf: String,
     indent: &'static str,
+    // Waitcnt tracking: count outstanding memory ops to avoid redundant waits
+    outstanding_vmcnt: u32,   // pending global loads
+    outstanding_lgkmcnt: u32, // pending LDS / scalar loads
+    outstanding_vscnt: u32,   // pending global stores
+    waits_emitted: u32,       // total wait instructions emitted
+    waits_elided: u32,        // waits skipped (already at 0)
+    // s_delay_alu tracking: auto-inject VALU dependency hints
+    valu_count: u32,                // monotonic VALU instruction counter (1-based; 0 = never written)
+    last_writer: [u32; 257],        // last VALU that wrote each phys VGPR (0..255) + VCC (256)
+    delay_alu_emitted: u32,         // stats: total s_delay_alu emitted
 }
 
 impl AsmEmitter {
@@ -18,6 +28,14 @@ impl AsmEmitter {
         Self {
             buf: String::with_capacity(8192),
             indent: "  ",
+            outstanding_vmcnt: 0,
+            outstanding_lgkmcnt: 0,
+            outstanding_vscnt: 0,
+            waits_emitted: 0,
+            waits_elided: 0,
+            valu_count: 1,
+            last_writer: [0; 257],
+            delay_alu_emitted: 0,
         }
     }
 
@@ -82,6 +100,89 @@ impl AsmEmitter {
 
     /// Emit a single IR operation as assembly text.
     fn emit_op(&mut self, op: &Op, a: &RegAlloc) {
+        // ── s_delay_alu auto-injection ──
+        // Track VALU writes to physical VGPRs and inject delay hints for RAW deps.
+        // On control flow / sync, reset tracking (conservative but correct).
+        if matches!(op, Op::Label(_) | Op::Branch(_) | Op::BranchScc0(_) | Op::BranchScc1(_)
+            | Op::BranchVccz(_) | Op::Barrier | Op::SBarrier
+            | Op::WaitVmcnt(_) | Op::WaitLgkmcnt(_) | Op::WaitVscnt(_)) {
+            self.last_writer.fill(0);
+        }
+
+        if !matches!(op, Op::RawAsm(_)) {
+            let lat = super::latency_model::op_latency(op);
+            let is_valu = matches!(lat.pipeline,
+                super::latency_model::Pipeline::VALU |
+                super::latency_model::Pipeline::WMMA |
+                super::latency_model::Pipeline::TRANS
+            );
+
+            if is_valu && !std::env::var("T0_SKIP_DELAY_ALU").is_ok() {
+                // Check VGPR read dependencies
+                let mut min_dep = 5u32; // > 4 means no dep
+                for v in op.vreg_uses() {
+                    let phys = a.phys_v(v) as usize;
+                    if phys < 256 {
+                        let last = self.last_writer[phys];
+                        if last > 0 {
+                            let dist = self.valu_count - last;
+                            if dist >= 1 && dist <= 4 && dist < min_dep {
+                                min_dep = dist;
+                            }
+                        }
+                    }
+                }
+                // Also check multi-VGPR sources (WMMA uses v[N:N+7])
+                if let Op::Wmma { a: va, b: vb, c: vc, .. } = op {
+                    for base_vreg in [va, vb, vc] {
+                        let base_phys = a.phys_v(*base_vreg) as usize;
+                        for off in 0..8usize {
+                            let p = base_phys + off;
+                            if p < 256 {
+                                let last = self.last_writer[p];
+                                if last > 0 {
+                                    let dist = self.valu_count - last;
+                                    if dist >= 1 && dist <= 4 && dist < min_dep {
+                                        min_dep = dist;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if min_dep <= 4 {
+                    writeln!(self.buf, "{}s_delay_alu instid0(VALU_DEP_{})",
+                        self.indent, min_dep).unwrap();
+                    self.delay_alu_emitted += 1;
+                }
+
+                // Record this instruction's VGPR writes
+                for v in op.vreg_defs() {
+                    let phys = a.phys_v(v) as usize;
+                    if phys < 256 {
+                        self.last_writer[phys] = self.valu_count;
+                    }
+                }
+                // Multi-VGPR defs (WMMA writes v[dst:dst+7])
+                if let Op::Wmma { dst, .. } = op {
+                    let base_phys = a.phys_v(*dst) as usize;
+                    for off in 0..8usize {
+                        let p = base_phys + off;
+                        if p < 256 {
+                            self.last_writer[p] = self.valu_count;
+                        }
+                    }
+                }
+                // CvtPkBf16F32 emits 2 instructions (lshr + and_or), so mark as 2 ops
+                if matches!(op, Op::CvtPkBf16F32 { .. }) {
+                    self.valu_count += 2;
+                } else {
+                    self.valu_count += 1;
+                }
+            }
+        }
+
         match op {
             // ── Global Memory ──
             Op::GlobalLoad { dst, addr, width, offset } => {
@@ -100,6 +201,49 @@ impl AsmEmitter {
                 } else {
                     writeln!(self.buf, "{}{} {}, {}, off offset:{}", self.indent, instr, dst_str, addr_str, offset).unwrap();
                 }
+                self.outstanding_vmcnt += 1;
+            }
+
+            Op::BufferLoad { dst, voffset, srsrc, width, offset } => {
+                let vd = a.phys_v(*dst);
+                let vo = a.phys_v(*voffset);
+                let sr = a.phys_s(SReg(srsrc.0));
+                let instr = match width {
+                    Width::B16 => "buffer_load_u16",
+                    Width::B32 => "buffer_load_b32",
+                    Width::B64 => "buffer_load_b64",
+                    Width::B128 => "buffer_load_b128",
+                };
+                let dst_str = vreg_range_str(vd, width.vreg_count());
+                if *offset == 0 {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen",
+                        self.indent, instr, dst_str, vo, sr, sr + 3).unwrap();
+                } else {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen offset:{}",
+                        self.indent, instr, dst_str, vo, sr, sr + 3, offset).unwrap();
+                }
+                self.outstanding_vmcnt += 1;
+            }
+
+            Op::BufferStore { voffset, src, srsrc, width, offset } => {
+                let vo = a.phys_v(*voffset);
+                let vs = a.phys_v(*src);
+                let sr = a.phys_s(SReg(srsrc.0));
+                let instr = match width {
+                    Width::B16 => "buffer_store_b16",
+                    Width::B32 => "buffer_store_b32",
+                    Width::B64 => "buffer_store_b64",
+                    Width::B128 => "buffer_store_b128",
+                };
+                let src_str = vreg_range_str(vs, width.vreg_count());
+                if *offset == 0 {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen",
+                        self.indent, instr, src_str, vo, sr, sr + 3).unwrap();
+                } else {
+                    writeln!(self.buf, "{}{} {}, v{}, s[{}:{}], 0 offen offset:{}",
+                        self.indent, instr, src_str, vo, sr, sr + 3, offset).unwrap();
+                }
+                self.outstanding_vscnt += 1;
             }
 
             Op::GlobalStore { addr, src, width, offset } => {
@@ -118,6 +262,7 @@ impl AsmEmitter {
                 } else {
                     writeln!(self.buf, "{}{} {}, {}, off offset:{}", self.indent, instr, addr_str, src_str, offset).unwrap();
                 }
+                self.outstanding_vscnt += 1;
             }
 
             // ── LDS ──
@@ -136,6 +281,7 @@ impl AsmEmitter {
                 } else {
                     writeln!(self.buf, "{}{} {}, v{} offset:{}", self.indent, instr, dst_str, va, offset).unwrap();
                 }
+                self.outstanding_lgkmcnt += 1;  // LDS loads use lgkmcnt
             }
 
             Op::LdsStore { addr, src, width, offset } => {
@@ -158,8 +304,8 @@ impl AsmEmitter {
             // ── Scalar Memory ──
             Op::ScalarLoad { dst, base, offset, width } => {
                 let sd = a.phys_s(SReg(dst.0));
-                // Kernarg base sentinel: SRegPair(u32::MAX - 10) = hardware s[0:1]
-                let sb = if base.0 >= u32::MAX - 100 {
+                // Sentinel detection: KERNARG_BASE_SENTINEL → hardware s[0:1]
+                let sb = if base.0 >= super::compile::T0Kernel::KERNARG_BASE_SENTINEL - 100 {
                     0u8  // s[0:1] = kernarg_segment_ptr (hardware)
                 } else {
                     a.phys_s(SReg(base.0))
@@ -173,6 +319,7 @@ impl AsmEmitter {
                 let dst_str = sreg_range_str(sd, width.vreg_count());
                 writeln!(self.buf, "{}{} {}, s[{}:{}], {:#x}",
                     self.indent, instr, dst_str, sb, sb + 1, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;  // scalar loads use lgkmcnt
             }
 
             // ── Vector ALU ──
@@ -200,6 +347,11 @@ impl AsmEmitter {
             Op::VMinF32 { dst, src0, src1 } => {
                 let vd = a.phys_v(*dst);
                 writeln!(self.buf, "{}v_min_f32 v{}, {}, {}",
+                    self.indent, vd, operand_str(src0, a), operand_str(src1, a)).unwrap();
+            }
+            Op::VMinU32 { dst, src0, src1 } => {
+                let vd = a.phys_v(*dst);
+                writeln!(self.buf, "{}v_min_u32 v{}, {}, {}",
                     self.indent, vd, operand_str(src0, a), operand_str(src1, a)).unwrap();
             }
             Op::VMov { dst, src } => {
@@ -316,6 +468,9 @@ impl AsmEmitter {
                     SOperand::Literal(v) => {
                         writeln!(self.buf, "{}s_cmp_eq_u32 s{}, 0x{:x}", self.indent, s0, v).unwrap();
                     }
+                    SOperand::Vcc => {
+                        writeln!(self.buf, "{}s_cmp_eq_u32 s{}, vcc_lo", self.indent, s0).unwrap();
+                    }
                 }
             }
             Op::SCmpGeU32 { src0, src1 } => {
@@ -356,16 +511,41 @@ impl AsmEmitter {
                 writeln!(self.buf, "{}s_barrier", self.indent).unwrap();
             }
             Op::WaitVmcnt(n) => {
-                writeln!(self.buf, "{}s_waitcnt vmcnt({})", self.indent, n).unwrap();
+                if self.outstanding_vmcnt > 0 || *n > 0 {
+                    let actual = (*n as u32).min(self.outstanding_vmcnt);
+                    writeln!(self.buf, "{}s_waitcnt vmcnt({})", self.indent, actual).unwrap();
+                    self.outstanding_vmcnt = actual;
+                    self.waits_emitted += 1;
+                } else {
+                    self.waits_elided += 1;
+                }
             }
             Op::WaitLgkmcnt(n) => {
-                writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, n).unwrap();
+                if self.outstanding_lgkmcnt > 0 || *n > 0 {
+                    let actual = (*n as u32).min(self.outstanding_lgkmcnt);
+                    writeln!(self.buf, "{}s_waitcnt lgkmcnt({})", self.indent, actual).unwrap();
+                    self.outstanding_lgkmcnt = actual;
+                    self.waits_emitted += 1;
+                } else {
+                    self.waits_elided += 1;
+                }
             }
             Op::WaitVscnt(n) => {
-                writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, n).unwrap();
+                if self.outstanding_vscnt > 0 || *n > 0 {
+                    let actual = (*n as u32).min(self.outstanding_vscnt);
+                    writeln!(self.buf, "{}s_waitcnt_vscnt null, {:#x}", self.indent, actual).unwrap();
+                    self.outstanding_vscnt = actual;
+                    self.waits_emitted += 1;
+                } else {
+                    self.waits_elided += 1;
+                }
             }
             Op::ClearVcc => {
                 writeln!(self.buf, "{}s_mov_b32 vcc_lo, 0", self.indent).unwrap();
+            }
+            Op::SMovToVcc { src } => {
+                let ss = a.phys_s(*src);
+                writeln!(self.buf, "{}s_mov_b32 vcc_lo, s{}", self.indent, ss).unwrap();
             }
 
             // ── Program structure ──
@@ -412,6 +592,18 @@ impl AsmEmitter {
                 let vs = a.phys_v(*src);
                 // GFX11: v_exp_f32 computes 2^x (NOT e^x!)
                 writeln!(self.buf, "{}v_exp_f32 v{}, v{}", self.indent, vd, vs).unwrap();
+            }
+            Op::VSinF32 { dst, src } => {
+                let vd = a.phys_v(*dst);
+                let vs = a.phys_v(*src);
+                // GFX11: v_sin_f32 computes sin(2π·x)
+                writeln!(self.buf, "{}v_sin_f32 v{}, v{}", self.indent, vd, vs).unwrap();
+            }
+            Op::VCosF32 { dst, src } => {
+                let vd = a.phys_v(*dst);
+                let vs = a.phys_v(*src);
+                // GFX11: v_cos_f32 computes cos(2π·x)
+                writeln!(self.buf, "{}v_cos_f32 v{}, v{}", self.indent, vd, vs).unwrap();
             }
             Op::VRcpF32 { dst, src } => {
                 let vd = a.phys_v(*dst);
@@ -520,42 +712,49 @@ impl AsmEmitter {
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}ds_store_b16 v{}, v{} offset:{}",
                     self.indent, va, vs, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;  // ds_store uses lgkmcnt!
             }
             Op::DsStoreB32 { vaddr, src, offset } => {
                 let va = a.phys_v(*vaddr);
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}ds_store_b32 v{}, v{} offset:{}",
                     self.indent, va, vs, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;  // ds_store uses lgkmcnt!
             }
             Op::DsStoreB64 { vaddr, src, offset } => {
                 let va = a.phys_v(*vaddr);
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}ds_store_b64 v{}, v[{}:{}] offset:{}",
                     self.indent, va, vs, vs + 1, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;  // ds_store uses lgkmcnt!
             }
             Op::DsStoreB128 { vaddr, src, offset } => {
                 let va = a.phys_v(*vaddr);
                 let vs = a.phys_v(*src);
                 writeln!(self.buf, "{}ds_store_b128 v{}, v[{}:{}] offset:{}",
                     self.indent, va, vs, vs + 3, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;  // ds_store uses lgkmcnt!
             }
             Op::DsLoadB32 { dst, vaddr, offset } => {
                 let vd = a.phys_v(*dst);
                 let va = a.phys_v(*vaddr);
                 writeln!(self.buf, "{}ds_load_b32 v{}, v{} offset:{}",
                     self.indent, vd, va, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;
             }
             Op::DsLoadB64 { dst, vaddr, offset } => {
                 let vd = a.phys_v(*dst);
                 let va = a.phys_v(*vaddr);
                 writeln!(self.buf, "{}ds_load_b64 v[{}:{}], v{} offset:{}",
                     self.indent, vd, vd + 1, va, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;
             }
             Op::DsLoadB128 { dst, vaddr, offset } => {
                 let vd = a.phys_v(*dst);
                 let va = a.phys_v(*vaddr);
                 writeln!(self.buf, "{}ds_load_b128 v[{}:{}], v{} offset:{}",
                     self.indent, vd, vd + 3, va, offset).unwrap();
+                self.outstanding_lgkmcnt += 1;
             }
             Op::DsLoadU16 { dst, vaddr, offset } => {
                 let vd = a.phys_v(*dst);
@@ -616,6 +815,13 @@ impl AsmEmitter {
                 writeln!(self.buf, "{}s_mov_b32 exec_lo, s{}",
                     self.indent, ss).unwrap();
             }
+            Op::XorExec { saved } => {
+                let ss = a.phys_s(*saved);
+                // SOP2: s_xor_b32 exec_lo, exec_lo, s_saved
+                // Flips EXEC to else-branch lanes: (original & cond) XOR original = original & ~cond
+                writeln!(self.buf, "{}s_xor_b32 exec_lo, exec_lo, s{}",
+                    self.indent, ss).unwrap();
+            }
             // ── Additional branch variants ──
             Op::BranchScc0(target) => {
                 writeln!(self.buf, "{}s_cbranch_scc0 .L{}", self.indent, target).unwrap();
@@ -665,6 +871,14 @@ impl AsmEmitter {
                     writeln!(self.buf, "{}global_atomic_add_f32 v[{}:{}], v{}, off offset:{}",
                         self.indent, va, va + 1, vs, offset).unwrap();
                 }
+            }
+
+            Op::GlobalAtomicAddU32Rtn { dst, addr, src } => {
+                let vd = a.phys_v(*dst);
+                let va = a.phys_v(*addr);
+                let vs = a.phys_v(*src);
+                writeln!(self.buf, "{}global_atomic_add_u32 v{}, v[{}:{}], v{}, off glc",
+                    self.indent, vd, va, va + 1, vs).unwrap();
             }
 
             // ── SMEM scalar load ──
@@ -724,6 +938,16 @@ impl AsmEmitter {
                     self.indent, d, s0, literal, s2).unwrap();
             }
 
+            // ── Hardware performance counter ──
+            Op::ReadShaderCycles { dst } => {
+                let vd = a.phys_v(*dst);
+                // Read 32-bit shader cycle counter into s2 (scratch), then move to VGPR
+                // LLVM verified: encoding [0x1d,0xf8,0x80,0xb8]
+                writeln!(self.buf, "{}s_getreg_b32 s2, hwreg(HW_REG_SHADER_CYCLES)  ; GPU cycle counter",
+                    self.indent).unwrap();
+                writeln!(self.buf, "{}v_mov_b32 v{}, s2", self.indent, vd).unwrap();
+            }
+
             // ── Raw assembly passthrough ──
             Op::RawAsm(text) => {
                 writeln!(self.buf, "{}{}", self.indent, text).unwrap();
@@ -733,6 +957,12 @@ impl AsmEmitter {
 
     /// Get the generated assembly text.
     pub fn finish(self) -> String {
+        if self.waits_elided > 0 {
+            eprintln!(
+                "[T0 AsmEmitter] Waitcnt stats: {} emitted, {} elided (redundant)",
+                self.waits_emitted, self.waits_elided
+            );
+        }
         self.buf
     }
 }
@@ -787,5 +1017,6 @@ fn soperand_str(op: &SOperand, a: &RegAlloc) -> String {
         SOperand::SReg(s) => format!("s{}", a.phys_s(*s)),
         SOperand::InlineInt(n) => format!("{}", n),
         SOperand::Literal(v) => format!("{:#x}", v),
+        SOperand::Vcc => "vcc_lo".to_string(),
     }
 }

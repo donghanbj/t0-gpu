@@ -13,3 +13,7 @@ rocm = []  # Enable KFD runtime (requires /dev/kfd)
 
 [dependencies]
 # No external dependencies — pure Rust
+
+[[bin]]
+name = "isa_probe"
+path = "src/bin/isa_probe.rs"

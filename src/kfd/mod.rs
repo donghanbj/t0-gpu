@@ -16,6 +16,20 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 // =============================================================================
+// SIGPIPE defense — prevent pipe-broken signals from killing the process
+// =============================================================================
+
+/// Ignore SIGPIPE so that `cargo test ... | head -N` doesn't kill the process
+/// before Drop handlers can run (DESTROY_QUEUE, close fd, etc.).
+/// Without this, piped commands leave GPU queues active with buggy kernels,
+/// triggering KFD MODE1 reset and causing the next run to hard-hang.
+fn ignore_sigpipe() {
+    // SIG_IGN = 1, SIGPIPE = 13 on Linux x86_64
+    extern "C" { fn signal(sig: i32, handler: usize) -> usize; }
+    unsafe { signal(13, 1); }
+}
+
+// =============================================================================
 // KFD IOCTL numbers (Linux _IOC encoding, type='K'=0x4B)
 // =============================================================================
 
@@ -51,7 +65,9 @@ const HSA_PACKET_TYPE_VENDOR_SPECIFIC: u16 = 0x0;
 const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 0x2;
 
 // Fence scopes
-const HSA_FENCE_SCOPE_SYSTEM: u16 = 2;
+#[allow(dead_code)]
+const HSA_FENCE_SCOPE_AGENT: u16 = 1;   // GPU-internal only (no PCIe sync)
+const HSA_FENCE_SCOPE_SYSTEM: u16 = 2;  // Full system coherency (PCIe writeback)
 
 // PM4-in-AQL constants
 const PACKET3_INDIRECT_BUFFER: u32 = 0x3F;
@@ -244,20 +260,58 @@ pub struct KfdDevice {
     pub gpu_id: u32,
     /// Base VA for user allocations (auto-incremented, 2MB aligned)
     next_va: std::sync::atomic::AtomicU64,
+    /// Event page handle for cleanup (allocated during open)
+    event_page_handle: u64,
+    /// Event page VA for munmap during cleanup
+    event_page_va: u64,
 }
 
+/// Global singleton: KFD driver only allows one ACQUIRE_VM per process.
+/// All callers of KfdDevice::open() get the same Arc<KfdDevice>.
+static GLOBAL_KFD_DEVICE: std::sync::OnceLock<Arc<KfdDevice>> = std::sync::OnceLock::new();
+
 impl KfdDevice {
-    /// Open the GPU device and acquire VM
+    /// Open the GPU device and acquire VM.
+    /// Returns a cached global singleton — KFD only allows one ACQUIRE_VM per process.
     pub fn open() -> Result<Arc<Self>, String> {
         Self::open_with_gpu_id(0) // auto-detect
     }
 
+    /// Force a fresh device open (bypasses singleton cache).
+    /// Use only when you know the previous device has been fully dropped.
+    pub fn open_fresh() -> Result<Arc<Self>, String> {
+        Self::open_fresh_with_gpu_id(0)
+    }
+
+    fn open_fresh_with_gpu_id(gpu_id_override: u32) -> Result<Arc<Self>, String> {
+        Self::open_device_impl(gpu_id_override)
+    }
+
     pub fn open_with_gpu_id(gpu_id_override: u32) -> Result<Arc<Self>, String> {
-        // Open /dev/kfd
-        let kfd_fd = unsafe { open(b"/dev/kfd\0".as_ptr(), 2 /* O_RDWR */) };
-        if kfd_fd < 0 {
-            return Err(format!("Failed to open /dev/kfd: {}", std::io::Error::last_os_error()));
+        // Return cached singleton if it exists (KFD only allows one ACQUIRE_VM per process)
+        if let Some(dev) = GLOBAL_KFD_DEVICE.get() {
+            return Ok(Arc::clone(dev));
         }
+        let dev = Self::open_device_impl(gpu_id_override)?;
+        // Try to store into OnceLock; if another thread raced us, use theirs
+        match GLOBAL_KFD_DEVICE.set(Arc::clone(&dev)) {
+            Ok(()) => Ok(dev),
+            Err(_) => Ok(Arc::clone(GLOBAL_KFD_DEVICE.get().unwrap())),
+        }
+    }
+
+    /// Internal: actual device open + VM acquire (called once per process)
+    fn open_device_impl(gpu_id_override: u32) -> Result<Arc<Self>, String> {
+        // CRITICAL: ignore SIGPIPE before any GPU work.
+        // When running under `cargo test ... | grep ... | head -N`, the `head`
+        // command closes its stdin after reading enough lines, sending SIGPIPE
+        // up the pipe chain. Without this, our process dies instantly and
+        // Drop handlers (DESTROY_QUEUE, close fd) never run, leaving the GPU
+        // executing buggy kernels → KFD MODE1 reset → next run hard-hangs.
+        ignore_sigpipe();
+
+        // Open /dev/kfd (with retry for GPU recovery after MODE1 reset)
+        let kfd_fd = Self::open_kfd_with_retry()?;
 
         // Get KFD version
         let mut ver = KfdGetVersionArgs::default();
@@ -381,12 +435,80 @@ impl KfdDevice {
             .map_err(|e| format!("CREATE_EVENT failed: {}", e))?;
         eprintln!("[KFD] Event page created (event_id={}, slot={})", ev.event_id, ev.event_slot_index);
 
-        Ok(Arc::new(Self {
+        let device = Arc::new(Self {
             kfd_fd,
             drm_fd,
             gpu_id,
             next_va: std::sync::atomic::AtomicU64::new(0x1_0000_0000),
-        }))
+            event_page_handle: event_page,
+            event_page_va: 0, // VA is managed by kernel, not tracked for munmap
+        });
+
+        // GPU health probe: allocate a small buffer, write, read-back, verify.
+        // If the GPU just recovered from MODE1 reset, VRAM may be unstable.
+        // This catches it early instead of hanging on the first kernel dispatch.
+        Self::gpu_health_probe(&device)?;
+
+        Ok(device)
+    }
+
+    /// Open /dev/kfd with retry logic for GPU recovery after MODE1 reset.
+    /// KFD driver may temporarily refuse open() while GPU is resetting.
+    fn open_kfd_with_retry() -> Result<RawFd, String> {
+        for attempt in 0..5 {
+            let fd = unsafe { open(b"/dev/kfd\0".as_ptr(), 2 /* O_RDWR */) };
+            if fd >= 0 {
+                return Ok(fd);
+            }
+            let err = std::io::Error::last_os_error();
+            if attempt < 4 {
+                eprintln!("[KFD] /dev/kfd open failed (attempt {}): {} — GPU may be recovering from reset, retrying in 1s...",
+                    attempt + 1, err);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            } else {
+                return Err(format!("Failed to open /dev/kfd after 5 attempts: {}", err));
+            }
+        }
+        unreachable!()
+    }
+
+    /// GPU health probe: allocate tiny GTT buffer, write pattern, read back.
+    /// Catches post-MODE1-reset VRAM instability before any real work.
+    fn gpu_health_probe(device: &Arc<Self>) -> Result<(), String> {
+        for attempt in 0..3 {
+            match Self::health_probe_once(device) {
+                Ok(()) => {
+                    eprintln!("[KFD] GPU health check PASSED");
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt < 2 {
+                        eprintln!("[KFD] GPU health check FAILED (attempt {}): {} — retrying in 2s...",
+                            attempt + 1, e);
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    } else {
+                        return Err(format!("GPU health check failed after 3 attempts: {}", e));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    fn health_probe_once(device: &Arc<Self>) -> Result<(), String> {
+        // Allocate a small GTT buffer (coherent, visible to both CPU and GPU)
+        let probe_buf = device.alloc_gtt(4096)?;
+        // Write a known pattern
+        let pattern: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        probe_buf.write_val::<u64>(0, pattern);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        // Read it back
+        let readback: u64 = probe_buf.read_val(0);
+        if readback != pattern {
+            return Err(format!("GPU memory readback mismatch: wrote 0x{:X}, read 0x{:X}", pattern, readback));
+        }
+        // Buffer dropped here → RAII cleanup
+        Ok(())
     }
 
     fn detect_gpu_id() -> Result<u32, String> {
@@ -793,6 +915,23 @@ impl KfdDevice {
 
 impl Drop for KfdDevice {
     fn drop(&mut self) {
+        // Release event page memory (allocated during open)
+        if self.event_page_handle != 0 {
+            // Unmap from GPU
+            let mut gpu_ids = [self.gpu_id];
+            let mut unmap = KfdUnmapMemoryArgs {
+                handle: self.event_page_handle,
+                device_ids_array_ptr: gpu_ids.as_mut_ptr() as u64,
+                n_devices: 1,
+                n_success: 0,
+            };
+            let _ = ioctl_safe(self.kfd_fd, AMDKFD_IOC_UNMAP_MEMORY,
+                &mut unmap as *mut _ as *mut u8);
+            // Free GPU memory
+            let mut free = KfdFreeMemoryArgs { handle: self.event_page_handle };
+            let _ = ioctl_safe(self.kfd_fd, AMDKFD_IOC_FREE_MEMORY,
+                &mut free as *mut _ as *mut u8);
+        }
         unsafe {
             close(self.drm_fd);
             close(self.kfd_fd);
@@ -938,6 +1077,59 @@ impl Drop for GpuBuffer {
         let mut free = KfdFreeMemoryArgs { handle: self.handle };
         let _ = ioctl_safe(self.device.kfd_fd, AMDKFD_IOC_FREE_MEMORY,
             &mut free as *mut _ as *mut u8);
+    }
+}
+
+// =============================================================================
+// Pre-dispatch kernarg validation (debug builds)
+// =============================================================================
+
+/// Scan kernarg bytes for obviously invalid GPU pointers.
+///
+/// Heuristic: every 8-byte aligned value > 0xFFFF is tested as a potential
+/// GPU VA. Values that are NULL (0), unaligned pointers, or obviously out of
+/// the 48-bit VA space are flagged.
+///
+/// This catches the most common hard-hang root causes:
+/// - Host pointers passed instead of gpu_addr()
+/// - Uninitialized kernarg fields (0x0 for pointer args)
+/// - Use-after-free (GPU buffer dropped, same VA reused with different mapping)
+///
+/// Only active in debug builds via `#[cfg(debug_assertions)]` callers.
+#[cfg(debug_assertions)]
+fn validate_kernargs_bytes(ka: &[u8], ka_size: usize) {
+    let mut offset = 0;
+    while offset + 8 <= ka_size {
+        let val = u64::from_le_bytes(ka[offset..offset + 8].try_into().unwrap());
+
+        // Skip small values (likely u32 params padded to 8 bytes)
+        if val <= 0xFFFF {
+            offset += 8;
+            continue;
+        }
+
+        // NULL pointer check (exact zero is caught above, this catches near-NULL)
+        if val > 0xFFFF && val < 0x1000_0000 {
+            // Suspicious: too large for a scalar, too small for a valid GPU VA
+            // GPU VAs from mmap are typically > 0x1_0000_0000
+            eprintln!(
+                "[KFD VALIDATE] Warning: kernarg offset {} has value 0x{:016X} \
+                 — suspicious (too small for GPU VA, too large for u32 param)",
+                offset, val
+            );
+        }
+
+        // 48-bit VA space check
+        if val > 0x0000_FFFF_FFFF_FFFF {
+            panic!(
+                "[KFD SAFETY] Kernarg offset {} contains 0x{:016X} — \
+                 outside 48-bit VA space. Likely a host pointer or uninitialized memory!\n\
+                 This WILL cause a GPU page fault and hard hang.",
+                offset, val
+            );
+        }
+
+        offset += 8;
     }
 }
 
@@ -1101,6 +1293,17 @@ impl AqlQueue {
         grid: [u32; 3],
         kernargs: &GpuBuffer,
     ) {
+        // Pre-dispatch kernarg validation (debug builds only — zero cost in release)
+        // Catches NULL pointers and invalid GPU VAs BEFORE they reach the GPU.
+        #[cfg(debug_assertions)]
+        {
+            let ka_size = (kernel.kernarg_size as usize).min(kernargs.size);
+            if ka_size >= 8 {
+                let ka_bytes = kernargs.read_bytes(0, ka_size);
+                validate_kernargs_bytes(&ka_bytes, ka_size);
+            }
+        }
+
         self.ensure_ring_space();
         let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
         let ring_mask = (self.ring_size as u64 / 64) - 1;
@@ -1324,6 +1527,8 @@ impl AqlQueue {
     /// packet. With a 4MB ring (65536 slots), this effectively never triggers
     /// under normal workloads, but prevents hard hangs if thousands of kernels
     /// are submitted faster than the GPU can consume them.
+    ///
+    /// On timeout (5s): panics instead of exit(99) so callers can catch_unwind.
     fn ensure_ring_space(&self) {
         let ring_slots = self.ring_size as u64 / 64;
         // Leave 64 slots of headroom to avoid overwriting in-flight packets
@@ -1337,8 +1542,8 @@ impl AqlQueue {
                 return;
             }
             let elapsed_s = start.elapsed().as_secs();
-            // Periodic progress log every 5s so we can see if GPU is still alive
-            if elapsed_s >= last_log + 5 {
+            // Periodic progress log every 2s so we can see if GPU is still alive
+            if elapsed_s >= last_log + 2 {
                 last_log = elapsed_s;
                 eprintln!(
                     "[KFD] ensure_ring_space: waiting {elapsed_s}s — \
@@ -1346,17 +1551,18 @@ impl AqlQueue {
                     write_idx.wrapping_sub(read_idx)
                 );
             }
-            // Timeout after 20 seconds — if GPU is truly hung, staying longer
-            // risks triggering a system-level hard hang / forced reboot.
-            if elapsed_s >= 20 {
-                eprintln!(
-                    "[KFD] ensure_ring_space TIMEOUT (20s): GPU likely hung!\n\
+            // Timeout after 5 seconds — panic (catchable) instead of exit(99)
+            // to avoid leaving GPU in hung state after process death.
+            if elapsed_s >= 5 {
+                let msg = format!(
+                    "[KFD] ensure_ring_space TIMEOUT (5s): GPU likely hung!\n\
                      write_idx={} read_idx={} inflight={} ring_slots={} max_inflight={}\n\
                      This indicates a GPU page fault or kernel hang.",
                     write_idx, read_idx, write_idx.wrapping_sub(read_idx),
                     ring_slots, max_inflight
                 );
-                std::process::exit(99);
+                eprintln!("{}", msg);
+                panic!("{}", msg);
             }
             std::hint::spin_loop();
         }
@@ -1396,9 +1602,10 @@ impl AqlQueue {
         }
     }
 
-    /// Fallback: wait by polling read pointer
+    /// Fallback: wait by polling read pointer.
+    /// Returns Err on timeout (5s) instead of exit(99) to allow graceful recovery.
     fn wait_read_ptr(&self, target: u64) -> Result<(), String> {
-        let timeout_ns: u64 = 10_000_000_000;  // 10s: shorter timeout for faster hang detection
+        let timeout_ns: u64 = 5_000_000_000;  // 5s: fast fail to prevent system hang
         let start = std::time::Instant::now();
         let mut last_log_s = 0u64;
         loop {
@@ -1408,7 +1615,7 @@ impl AqlQueue {
             }
             let elapsed = start.elapsed();
             let elapsed_s = elapsed.as_secs();
-            // Progress log every 3s so we can see if GPU is making progress
+            // Progress log every 1s so we can see if GPU is making progress
             if elapsed_s >= last_log_s + 1 {
                 last_log_s = elapsed_s;
                 let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
@@ -1420,13 +1627,15 @@ impl AqlQueue {
             }
             if elapsed.as_nanos() as u64 > timeout_ns {
                 let write_idx = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
-                eprintln!(
-                    "[KFD] wait_read_ptr TIMEOUT (10s): GPU hung!\n\
-                     read={}, target={}, write={}, pending={}\n\
-                     Forcing process exit to prevent system reboot.",
+                let msg = format!(
+                    "[KFD] wait_read_ptr TIMEOUT (5s): GPU hung! \
+                     read={}, target={}, write={}, pending={}",
                     read_idx, target, write_idx, write_idx.wrapping_sub(read_idx)
                 );
-                std::process::exit(99);
+                eprintln!("{}", msg);
+                // Return Err instead of exit(99) so tests can continue
+                // and GPU resources can potentially be reclaimed by KFD driver.
+                return Err(msg);
             }
             std::hint::spin_loop();
         }
@@ -1456,12 +1665,13 @@ impl AqlQueue {
         let slot_idx = write_idx & ring_mask;
         let pkt_offset = (slot_idx * 64) as usize;
 
-        // AQL header: dispatch packet + barrier + system fences
+        // AQL header: dispatch + barrier + AGENT fences (GPU-internal only, no PCIe sync)
+        // AGENT scope saves ~10-20μs per dispatch vs SYSTEM scope by avoiding L2 writeback.
         let header: u16 =
             (HSA_PACKET_TYPE_KERNEL_DISPATCH as u16) |
             (1 << 8) |
-            ((HSA_FENCE_SCOPE_SYSTEM as u16) << 9) |
-            ((HSA_FENCE_SCOPE_SYSTEM as u16) << 11);
+            ((HSA_FENCE_SCOPE_AGENT as u16) << 9) |
+            ((HSA_FENCE_SCOPE_AGENT as u16) << 11);
 
         unsafe {
             let base = self.ring_buffer.host_ptr.add(pkt_offset);
@@ -2072,6 +2282,22 @@ impl Pm4CmdBuilder {
 
 impl Drop for AqlQueue {
     fn drop(&mut self) {
+        // Drain queue: wait for all in-flight dispatches to complete (500ms timeout)
+        // This prevents DESTROY_QUEUE from killing active GPU work, which can
+        // leave the KFD driver in a dirty state for the next KfdDevice::open().
+        let target = unsafe { std::ptr::read_volatile(self.write_ptr_host) };
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(500);
+        loop {
+            let read_idx = unsafe { std::ptr::read_volatile(self.read_ptr_host) };
+            if read_idx >= target { break; }
+            if start.elapsed() > timeout {
+                eprintln!("[KFD] WARNING: AqlQueue {} drain timeout (read={} target={})",
+                    self.queue_id, read_idx, target);
+                break;
+            }
+            std::hint::spin_loop();
+        }
         let mut args = KfdDestroyQueueArgs { queue_id: self.queue_id, pad: 0 };
         let _ = ioctl_safe(self.device.kfd_fd, AMDKFD_IOC_DESTROY_QUEUE,
             &mut args as *mut _ as *mut u8);
@@ -2283,6 +2509,22 @@ impl Pm4Queue {
 
 impl Drop for Pm4Queue {
     fn drop(&mut self) {
+        // Drain queue: wait for read_ptr to catch up with write_ptr (500ms timeout)
+        let target_bytes = self.write_offset;
+        if target_bytes > 0 {
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_millis(500);
+            loop {
+                let rp = unsafe { std::ptr::read_volatile(self.read_ptr_host) };
+                if rp >= target_bytes as u64 { break; }
+                if start.elapsed() > timeout {
+                    eprintln!("[KFD] WARNING: Pm4Queue {} drain timeout (read={} target={})",
+                        self.queue_id, rp, target_bytes);
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
         let mut args = KfdDestroyQueueArgs { queue_id: self.queue_id, pad: 0 };
         let _ = ioctl_safe(self.device.kfd_fd, AMDKFD_IOC_DESTROY_QUEUE,
             &mut args as *mut _ as *mut u8);
@@ -2461,7 +2703,7 @@ impl ElfParser {
 
         let mut text_offset = 0usize;
         let mut text_size = 0usize;
-        let mut text_vaddr = 0u64;
+        let mut _text_vaddr = 0u64;
         let mut symtab_off = 0usize;
         let mut symtab_size = 0usize;
         let mut symtab_entsize = 0usize;
@@ -2483,7 +2725,7 @@ impl ElfParser {
             if name == ".text" {
                 text_offset = sh_off;
                 text_size = sh_size;
-                text_vaddr = sh_addr;
+                _text_vaddr = sh_addr;
             } else if sh_type == 2 { // SHT_SYMTAB
                 symtab_off = sh_off;
                 symtab_size = sh_size;
@@ -2593,8 +2835,8 @@ impl KfdDevice {
 pub struct DispatchPool {
     /// Single reusable signal buffer
     pub signal: GpuBuffer,
-    /// Auto-growing ring of kernargs buffers (RefCell for interior mutability)
-    kernargs_ring: std::cell::RefCell<Vec<GpuBuffer>>,
+    /// Auto-growing ring of kernargs buffers (Mutex for thread-safe interior mutability)
+    kernargs_ring: std::sync::Mutex<Vec<GpuBuffer>>,
     /// Device reference for on-demand allocation
     device: Arc<KfdDevice>,
 }
@@ -2612,14 +2854,14 @@ impl DispatchPool {
         }
         Ok(Self {
             signal,
-            kernargs_ring: std::cell::RefCell::new(ring),
+            kernargs_ring: std::sync::Mutex::new(ring),
             device: Arc::clone(device),
         })
     }
 
     /// Ensure slot `idx` exists, growing the pool if necessary.
     fn ensure_slot(&self, idx: usize) {
-        let mut ring = self.kernargs_ring.borrow_mut();
+        let mut ring = self.kernargs_ring.lock().unwrap();
         while idx >= ring.len() {
             // Allocate new slot on demand
             match self.device.alloc_uncached(256) {
@@ -2632,7 +2874,7 @@ impl DispatchPool {
     /// Get kernargs buffer for slot `idx`. Auto-allocates if slot doesn't exist.
     pub fn get_kernargs(&self, idx: usize) -> &GpuBuffer {
         self.ensure_slot(idx);
-        let ring = self.kernargs_ring.borrow();
+        let ring = self.kernargs_ring.lock().unwrap();
         // Safety: buffer lives as long as the pool (never removed from Vec)
         unsafe { &*(ring.get(idx).unwrap() as *const GpuBuffer) }
     }
@@ -2641,7 +2883,7 @@ impl DispatchPool {
     /// Auto-allocates if slot doesn't exist yet.
     pub fn write_kernargs(&self, idx: usize, data: &[u8]) -> &GpuBuffer {
         self.ensure_slot(idx);
-        let ring = self.kernargs_ring.borrow();
+        let ring = self.kernargs_ring.lock().unwrap();
         let buf = unsafe { &*(ring.get(idx).unwrap() as *const GpuBuffer) };
         buf.write(data);
         buf
@@ -2663,10 +2905,10 @@ impl DispatchPool {
     }
 
     /// Current number of allocated slots.
-    pub fn len(&self) -> usize { self.kernargs_ring.borrow().len() }
+    pub fn len(&self) -> usize { self.kernargs_ring.lock().unwrap().len() }
 
     /// Capacity in slots (same as len since auto-growing).
-    pub fn capacity(&self) -> usize { self.kernargs_ring.borrow().capacity() }
+    pub fn capacity(&self) -> usize { self.kernargs_ring.lock().unwrap().capacity() }
 }
 
 // =============================================================================

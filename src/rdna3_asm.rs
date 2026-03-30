@@ -38,7 +38,6 @@
 //!   - etc.
 //! ```
 
-use std::io::Write;
 
 /// RDNA3 GFX11 instruction encoding constants
 pub mod gfx11 {
@@ -1978,7 +1977,7 @@ impl Rdna3Assembler {
     /// addr = v[vaddr:vaddr+1] + v[voffset]
     /// GFX11 encoding: saddr=0x7C (off), offset comes from instruction field
     /// For VGPR offset, we need to use SADDR mode differently
-    pub fn global_load_dwordx4_voffset(&mut self, vdst: u8, vaddr: u8, voffset: u8) {
+    pub fn global_load_dwordx4_voffset(&mut self, vdst: u8, vaddr: u8, _voffset: u8) {
         // GFX11 global_load with VADDR + VOFFSET:
         // Use the TFE bit or different encoding
         // Simpler approach: add voffset to vaddr before load
@@ -2595,7 +2594,7 @@ impl Rdna3Assembler {
                 //
                 // This isn't a simple compile-time offset. We need to compute the XOR per lane.
                 // Use a temp VGPR to compute the swizzled address for each row.
-                let mask = ((row & 7) << 4) as u16;
+                let _mask = ((row & 7) << 4) as u16;
                 let row_base = (row * 128) as u16;
                 // We need: lds_base + row_base + (col_byte ^ mask)
                 // addr_reg has: lds_base + col_byte
