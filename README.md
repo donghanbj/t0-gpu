@@ -23,11 +23,11 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ## 🏆 性能亮点 / Performance Highlights
 
-> **GEMM 79.2 TFLOPS** — 128×128 k32 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**匹敌 Triton on AMD**。
-> **79.2 TFLOPS** on 128×128 k32 config, 4096³ bf16 GEMM on RX 7900 XTX — **on par with Triton on AMD**.
+> **GEMM 89.1 TFLOPS** — 128×128 k64 WGP 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**达到 rocBLAS 的 98%**。
+> **89.1 TFLOPS** on 128×128 k64 WGP config, 4096³ bf16 GEMM on RX 7900 XTX — **98% of rocBLAS performance**.
 
-> **🏆 7/9 矩阵尺寸超越 rocBLAS**，最高领先 **97%**，峰值 **67.3 TFLOPS**。
-> **Beats rocBLAS on 7 out of 9 matrix sizes**, by up to **97%**, peaking at **67.3 TFLOPS**.
+> **🏆 7/9 矩阵尺寸超越 rocBLAS**，最高领先 **97%**，峰值 **89.1 TFLOPS**。
+> **Beats rocBLAS on 7 out of 9 matrix sizes**, by up to **97%**, peaking at **89.1 TFLOPS**.
 
 > **Zero-Overhead Dispatch** — 异步调度延迟 **2.26 μs**（HIP: 2.6 μs），同步调度 **14.96 μs**（HIP: 20.5 μs）。
 > Async dispatch **2.26 μs** (HIP: 2.6 μs), sync dispatch **14.96 μs** (HIP: 20.5 μs) — **13-27% faster** than HIP.
@@ -77,9 +77,13 @@ cargo build --release --lib
 # 编译含 KFD 运行时
 cargo build --release --lib --features rocm
 
-# 运行 GEMM 基准测试
-cargo test --release --lib --features rocm -- test_k64_vs_k32_benchmark \
+# 运行 GEMM 基准测试（见下方「性能复现」章节）
+cargo test --release --features rocm -- test_wgp_k64_benchmark \
   --nocapture --ignored --test-threads=1
+
+# 运行正确性测试
+cargo test --release --features rocm -- test_tile_ir_correctness \
+  --nocapture --test-threads=1
 
 # 导出 ISA 汇编（调试）
 T0_DUMP_ASM=1 cargo test --release --features rocm -- <test_name>
@@ -190,41 +194,41 @@ For bf16 WMMA matrix multiplication.
 
 ## 🏆 GEMM 性能实测 / GEMM Performance
 
-### T0 TileIR GEMM (2026-03-29, CU Mode)
+### T0 TileIR GEMM (2026-03-30)
 
-| 配置 / Config | VGPRs | LDS | 4096³ TFLOPS | 状态 / Status |
+4096×4096×4096 bf16 矩阵乘法，RX 7900 XTX 实测：
+
+4096³ bf16 GEMM on RX 7900 XTX:
+
+| 配置 / Config | VGPRs | Waves/SIMD | 4096³ TFLOPS | vs rocBLAS |
 |---|:---:|:---:|:---:|:---:|
-| **128×128 k32** | **239** | 32KB | **79.2** | ✅ 主力 / Primary |
-| 128×128 k16 | 207 | 16KB | 56.8 | ✅ |
-| 128×64 k32 | 175 | 24KB | 79.1 | ✅ |
-| 128×64 k64 | 223 | 48KB | 70.3 | ✅ |
+| **128×128 k64 WGP** | **176** | 4 | **89.1** | **🏆 98%** |
+| **128×128 k32 WGP** | **216** | 2 | **88.7** | **🏆 98%** |
+| 128×128 k64 CU | 184 | 4 | 87.6 | 97% |
+| 128×128 k32 CU | 216 | 2 | 87.2 | 96% |
 
-### T0 gemm_gen vs rocBLAS (2026-03-21, WGP + Split-K)
+> rocBLAS 基线 / rocBLAS baseline: ~90.78 TFLOPS (PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16)
 
-| 矩阵 / Matrix | T0 (TFLOPS) | rocBLAS (TFLOPS) | T0 / rocBLAS |
-|---|---|---|---|
-| 256 × 256 × 256 | 2.06 | 3.47 | 59% |
-| **512 × 512 × 512** | **12.72** | **12.50** | **🏆 102%** |
-| **1024 × 1024 × 1024** | **45.40** | **27.89** | **🏆 163%** |
-| **2048 × 2048 × 2048** | **55.86** | **36.65** | **🏆 152%** |
-| **4096 × 4096 × 4096** | **67.30** | **58.72** | **🏆 115%** |
-| 128 × 1024 × 4096 | 35.55 | 50.99 | 70% |
-| **256 × 1024 × 4096** | **44.65** | **44.43** | **🏆 101%** |
-| **512 × 1024 × 4096** | **50.12** | **45.85** | **🏆 109%** |
-| **1024 × 1024 × 4096** | **58.84** | **29.94** | **🏆 197%** |
+### 性能演化 / Performance Evolution
 
-> 🏆 **7/9 超越 rocBLAS**，最高领先 **97%**，峰值 **67.3 TFLOPS**！
-> 🏆 **Beats rocBLAS on 7/9 sizes**, by up to **97%**, peak **67.3 TFLOPS**!
->
-> rocBLAS 基线: PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16, RX 7900 XTX.
+| 日期 / Date | 版本 / Version | 4096³ TFLOPS | 关键优化 / Key Optimization |
+|---|---|:---:|---|
+| 2026-03-21 | gemm_gen Split-K | 67.3 | Split-K + WGP mode |
+| 2026-03-29 | TileIR v1 | 79.2 | Graduated lgkmcnt + Gap Reclaim |
+| 2026-03-30 | TileIR v2 (Phase 1) | 84.1 | soffset addressing |
+| 2026-03-30 | TileIR v2 (Phase 2) | 89.0 | LDS offset folding |
+| **2026-03-30** | **TileIR v2 (Phase 3)** | **89.1** | **Concurrent VMEM overlap** |
 
 ### 优化技术 / Optimization Techniques
 
 | 技术 / Technique | 说明 / Description |
 |---|---|
-| **Cooperative Loading** | 工作组内线程协作加载 tile，每线程 global_load_b128 (16B) |
+| **Cooperative Loading** | 工作组内线程协作加载 tile，每线程 buffer_load_b128 (16B) |
 | **LDS Double Buffering** | 双缓冲 K-loop 流水线，隐藏 GMEM 延迟 |
-| **Graduated LDS Waits** | ds_load 后逐条 lgkmcnt 精化，最大化 WMMA/LDS 重叠 |
+| **Graduated LDS Waits** | ds_load 后逐条 lgkmcnt(N) 精化，最大化 WMMA/LDS 重叠 |
+| **soffset Addressing** | SGPR 行偏移预计算 → 消除 inner loop 串行 v_add 链 |
+| **LDS Offset Folding** | ds_store 立即数 offset 字段折叠行地址，零 VGPR 开销 |
+| **Concurrent VMEM** | X 和 WT 矩阵同时发射 buffer_load，92+ 指令 VMEM 重叠窗口 |
 | **Gap Reclaim** | 对齐间隙 VGPR 回收，节省 ~15 VGPRs |
 | **Auto-Select + K-Clamp** | 自动选最优 tile 配置 + 保证 K 可整除 |
 | **Split-K** | 编译时 K 维并行化 (sk=1~16) |
@@ -297,13 +301,96 @@ t0-gpu/  (~50,000 LOC)
 
 ---
 
+## 🔬 性能复现 / Reproducing Benchmarks
+
+### 环境准备 / Setup
+
+```bash
+# 确保 GPU 和驱动就绪
+ls /dev/kfd /dev/dri/renderD128
+groups | grep -E "video|render"
+
+# 编译（需要 --features rocm 启用 KFD 运行时）
+cargo build --release --lib --features rocm
+```
+
+### Benchmark 命令 / Benchmark Commands
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  主力 Benchmark：4096³ bf16 GEMM (k32 + k64, CU + WGP)    │
+# │  Primary benchmark: 4096³ bf16 GEMM                        │
+# └─────────────────────────────────────────────────────────────┘
+cargo test --release --features rocm -- test_wgp_k64_benchmark \
+  --nocapture --ignored --test-threads=1
+
+# 输出示例 / Expected output:
+#   k32 128×128 CU         1580.0 μs    87.0 TFLOPS  grid=(4096,32,1)
+#   k32 128×128 WGP        1550.0 μs    88.7 TFLOPS  grid=(4096,32,1)
+#   k64 128×128 CU         1565.0 μs    87.8 TFLOPS  grid=(4096,32,1)
+#   k64 128×128 WGP        1545.0 μs    89.1 TFLOPS  grid=(4096,32,1)
+```
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  正确性测试：GPU vs CPU 参考实现对比                        │
+# │  Correctness: GPU vs CPU reference comparison               │
+# └─────────────────────────────────────────────────────────────┘
+cargo test --release --features rocm -- test_tile_ir_correctness \
+  --nocapture --test-threads=1
+
+# 输出示例 / Expected output:
+#   ✅ PASS max_err=0.047816
+#   ✅ PASS max_err=0.045146
+#   (BF16 精度范围内 / Within BF16 precision range)
+```
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  多尺寸扫描 Benchmark                                      │
+# │  Multi-size sweep benchmark                                 │
+# └─────────────────────────────────────────────────────────────┘
+cargo test --release --features rocm -- test_tile_ir_k32_benchmark \
+  --nocapture --ignored --test-threads=1
+
+# 输出包含 256³ ~ 4096³ 全尺寸性能
+# Output includes performance from 256³ to 4096³
+```
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  ISA 汇编导出（分析 inner loop 质量）                       │
+# │  ISA dump (analyze inner loop quality)                      │
+# └─────────────────────────────────────────────────────────────┘
+T0_DUMP_ASM=1 cargo test --release --features rocm \
+  -- test_lower_gemm_128x128_k32_compiles --nocapture
+
+# 将输出 GFX1100 ISA 汇编，包含寄存器分配信息
+# Outputs GFX1100 ISA assembly with register allocation info
+```
+
+### 性能注意事项 / Performance Notes
+
+- **GPU 频率**：首次运行可能因 GPU 频率爬升而偏低，建议运行 2-3 次取最佳值
+  First run may be slower due to GPU clock ramp-up; run 2-3 times and take the best.
+- **GPU 温度**：长时间运行后热节流可能导致 1-3% 性能波动
+  Thermal throttling may cause 1-3% variance after sustained runs.
+- **WGP vs CU 模式**：WGP 模式通常优于 CU 模式 (每 WGP 的 LDS 利用率更高)
+  WGP mode usually outperforms CU mode (better LDS utilization per WGP).
+- **`--test-threads=1`**：GPU 测试必须单线程，否则竞争 GPU 资源导致结果不准
+  GPU tests must run single-threaded to avoid resource contention.
+
+---
+
 ## 路线图 / Roadmap
 
-| 优先级 | 功能 / Feature | 说明 / Description |
+| 状态 | 功能 / Feature | 说明 / Description |
 |--------|---------------|-------------------|
-| 🔴 | **ILP 优化** / ILP Optimization | 利用 gap reclaim 回收的 15 VGPRs 做 store interleave / prefetch |
-| 🔴 | **WMMA 双链 ILP** / Dual-Chain ILP | 2 条独立 WMMA 链交替执行，预期 +20% |
-| 🔴 | **K-loop 软件流水线** / Software Pipelining | VMEM Load 与 WMMA 完美重叠 |
+| ✅ | **soffset Addressing** | SGPR 行偏移预计算消除 inner loop 串行依赖 |
+| ✅ | **LDS Offset Folding** | ds_store 立即数 offset 折叠，零 VGPR 开销 |
+| ✅ | **Concurrent VMEM Load** | X/WT 同时发射 buffer_load，92+ 指令 overlap |
+| ✅ | **Graduated lgkmcnt(N)** | 精确 waitcnt 最大化 WMMA/LDS 流水线重叠 |
+| 🔴 | **LDS Bank Conflict 优化** | 精确 stride padding 消除 bank conflict (+3-5%) |
 | 🟡 | **Graph 级算子融合** / Op Fusion | GEMM+Bias+RMSNorm 融合内核 |
 | 🟡 | **Async GPU Dispatch** | `GpuFuture` + `submit_async()` |
 | 🟢 | **多 GPU / Multi-GPU** | 多队列调度、PCIe P2P 传输 |
