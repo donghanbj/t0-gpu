@@ -1,6 +1,6 @@
 [package]
 name = "t0-gpu"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "T0 — RDNA3 裸金属 GPU 内核编译器 & KFD 运行时"
 authors = ["GeisYaO <q1179671016@gmail.com>"]
