@@ -1362,11 +1362,14 @@ mod tests {
             .expect("GpuRuntime::new");
 
         let sizes: Vec<(u32, u32, u32)> = vec![
+            // Square matrices (power-of-2)
             (256, 256, 256),
             (512, 512, 512),
             (1024, 1024, 1024),
             (2048, 2048, 2048),
             (4096, 4096, 4096),
+            (8192, 8192, 8192),
+            // Non-square (typical transformer shapes)
             (128, 4096, 1024),
             (256, 4096, 1024),
             (512, 4096, 1024),
