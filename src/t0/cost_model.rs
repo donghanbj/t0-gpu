@@ -925,26 +925,31 @@ pub fn tune_tile_ir(
 
     for spec in &candidates {
         let spec_clone = spec.clone();
-        let compile_result = std::panic::catch_unwind(move || {
+        let compile_result = std::panic::catch_unwind(move || -> Result<(Vec<u8>, u32, u32), String> {
             let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
-            let elf = kernel_ir.compile(super::ir::Target::GFX1100);
-            let lds_size = kernel_ir.lds_size();
-            (elf, lds_size)
+            let base_lds = kernel_ir.lds_size();
+            let (elf, final_lds) = kernel_ir.compile_with_info(super::ir::Target::GFX1100)?;
+            Ok((elf, base_lds, final_lds))
         });
-        let (elf_result, lds_size) = match compile_result {
-            Ok((elf, lds)) => (elf, lds),
+        let (elf, base_lds, final_lds) = match compile_result {
+            Ok(Ok((elf, base, fin))) => (elf, base, fin),
+            Ok(Err(e)) => {
+                eprintln!("[tile_tune]   {} → FAIL: {}", spec.name(), e);
+                continue;
+            }
             Err(_) => {
                 eprintln!("[tile_tune]   {} → FAIL: compilation panic", spec.name());
                 continue;
             }
         };
-        let elf = match elf_result {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[tile_tune]   {} → FAIL: {}", spec.name(), e);
-                continue;
-            }
-        };
+        // Skip spilled kernels: LDS spill region means final_lds > base_lds.
+        // Spilled kernels are 40-50x slower (confirmed: 64x128_k64 = 2.3 TF vs 90+ TF).
+        if final_lds > base_lds {
+            eprintln!("[tile_tune]   {} → SKIP: VGPR spill detected (LDS {} → {})",
+                spec.name(), base_lds, final_lds);
+            continue;
+        }
+        let lds_size = final_lds;
         match GpuKernel::load(
             &rt.device, &elf,
             &KernelLoadConfig {

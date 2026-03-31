@@ -87,9 +87,12 @@ impl AsmEmitter {
         writeln!(self.buf, "  .amdhsa_system_sgpr_workgroup_id_z 1").unwrap();
         writeln!(self.buf, "  .amdhsa_float_denorm_mode_32 3").unwrap();
         writeln!(self.buf, "  .amdhsa_float_denorm_mode_16_64 3").unwrap();
-        if wgp_mode {
-            writeln!(self.buf, "  .amdhsa_workgroup_processor_mode 1").unwrap();
-        }
+        // CRITICAL: LLVM defaults .amdhsa_workgroup_processor_mode to 1 on GFX11!
+        // We MUST emit this directive explicitly regardless of the desired value,
+        // otherwise all kernels silently get WGP mode even when wgp_mode=false.
+        // (Confirmed via llvm-objdump: KCP=0x0408 = bit10 set = WGP enabled by default)
+        writeln!(self.buf, "  .amdhsa_workgroup_processor_mode {}",
+            if wgp_mode { 1 } else { 0 }).unwrap();
         writeln!(self.buf, ".end_amdhsa_kernel").unwrap();
         writeln!(self.buf).unwrap();
 
