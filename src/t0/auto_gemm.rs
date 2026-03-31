@@ -129,50 +129,12 @@ impl GemmTuner {
             }
         }
 
-        // 4b. Benchmark tile_ir candidates — use proven presets directly.
-        // Cost_model's waves_per_wg doesn't match tile_ir's derived n_waves=tile_m/32,
-        // so we inject known-good tile_ir configs instead of filtering cost_model output.
-        use super::tile_ir::TileGemm;
-        let tile_ir_presets = [
-            TileGemm::tile_128x128_k16(),
-            TileGemm::tile_128x128_k32(),
-            TileGemm::tile_128x64_k16(),
-            TileGemm::tile_128x64_k32(),
-        ];
-        let tile_ir_candidates: Vec<TileGemm> = tile_ir_presets.to_vec();
-        // NOTE: k64 candidates removed — they push LDS to exactly 64KB boundary
-        // and cause GPU hangs when dispatched after other kernels in the autotune queue.
-        // k32 achieves 67+ TF on 4096³ which is sufficient for production.
-
-        for spec in &tile_ir_candidates {
-            // Skip if LDS exceeds limit
-            if spec.lds_total() > 65536 { continue; }
-            // Skip if matrix dimensions don't align
-            if k % spec.tile_k != 0 { continue; }
-
-            match self.benchmark_tile_ir(rt, spec, m, n, k) {
-                Ok(tflops) => {
-                    eprintln!("[autotune]   tile_ir:{} → {:.1} TFLOPS", spec.name(), tflops);
-                    // Convert to GemmConfig for uniform storage
-                    let cfg = GemmConfig {
-                        tile_m: spec.tile_m, tile_n: spec.tile_n, tile_k: spec.tile_k,
-                        wg_size: spec.wg_size(),
-                        use_lds: true, double_buffer: true,
-                        split_k: if spec.split_k > 1 { Some(spec.split_k) } else { None },
-                        lds_pad: 0,
-                        n_col_passes: 1, // tile_ir handles natively
-                        swap_grid: spec.swap_grid,
-                        wgp_mode: spec.wgp_mode,
-                        transpose: super::gemm_gen::GemmTranspose::NT,
-                        epilogue: super::gemm_gen::EpilogueOp::StoreF32,
-                    };
-                    results.push((cfg, tflops));
-                }
-                Err(e) => {
-                    eprintln!("[autotune]   tile_ir:{} → FAILED: {}", spec.name(), e);
-                }
-            }
-        }
+        // 4b. tile_ir candidates DISABLED in auto_gemm.
+        // Root cause: tile_ir kernels hang when dispatched after gemm_gen kernels
+        // in the same queue session (confirmed 2026-03-30, two GPU hard hangs).
+        // tile_ir config selection is handled by tile_auto_select() instead,
+        // which uses static heuristics based on problem dimensions.
+        // TODO: investigate queue state incompatibility between gemm_gen and tile_ir paths.
 
         if results.is_empty() {
             return Err("autotune: all candidates failed".into());
