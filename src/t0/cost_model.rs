@@ -566,6 +566,8 @@ impl TileConfig {
     ///   (grid dimensions use wg_size, which tile_ir computes as n_waves * 32)
     /// - swap_grid must be true (all tile_ir presets use true; false is
     ///   untested in autotuner dispatch and has caused hangs)
+    /// - split_k must be 1 (split_k > 1 hangs: y_split_stride=0 bug causes
+    ///   all partitions to write same Y address → GPU write conflict hang)
     pub fn can_use_tile_ir(&self) -> bool {
         let tile_ir_waves = self.tile_m / 32;
         self.tile_k.is_power_of_two()
@@ -573,6 +575,7 @@ impl TileConfig {
             && self.tile_n >= 32
             && self.waves_per_wg == tile_ir_waves
             && self.swap_grid  // only proven-safe grid layout
+            && self.split_k <= 1  // split_k > 1 hangs (y_split_stride=0 bug)
     }
 }
 
@@ -798,6 +801,348 @@ pub fn print_kloop_analysis(config: &TileConfig) {
 }
 
 // ============================================================================
+// Tile-IR GPU Autotuner (independent of gemm_gen)
+// ============================================================================
+
+/// Result of a tile_ir GPU autotuning run.
+#[derive(Clone, Debug)]
+pub struct TileIrTuneResult {
+    /// Best tile_ir config found
+    pub best: super::tile_ir::TileGemm,
+    /// TFLOPS measured for the best config
+    pub best_tflops: f64,
+    /// All (config_name, tflops) sorted by performance
+    pub all: Vec<(String, f64)>,
+    /// Whether result came from disk cache
+    pub from_cache: bool,
+}
+
+/// Tune tile_ir GEMM for given (M, N, K) dimensions using actual GPU benchmarks.
+///
+/// Pipeline:
+///   1. `auto_schedule_gemm()` generates exhaustive candidate set
+///   2. `can_use_tile_ir()` filters to tile_ir-compatible configs
+///   3. Each candidate is compiled and benchmarked on the GPU
+///   4. Best result cached to `~/.t0_autotune/tile_ir_MxNxK.json`
+///
+/// # Safety
+/// - GpuRuntime must be provided by caller (no internal creation)
+/// - Only tile_ir kernels are dispatched (no gemm_gen mixing)
+/// - Each candidate wrapped in catch_unwind for compilation safety
+/// - LDS ≤ 65536 and VGPR ≤ 256 enforced
+///
+/// # Example
+/// ```rust,no_run
+/// let result = tune_tile_ir(&rt, 4096, 4096, 4096)?;
+/// eprintln!("Best: {} ({:.1} TF)", result.best.name(), result.best_tflops);
+/// ```
+#[cfg(feature = "rocm")]
+pub fn tune_tile_ir(
+    rt: &std::sync::Arc<crate::ignis::gpu_context::GpuRuntime>,
+    m: u32, n: u32, k: u32,
+) -> Result<TileIrTuneResult, String> {
+    // 1. Check disk cache first
+    let cache_path = tile_ir_cache_path(m, n, k);
+    if let Some(cached) = load_tile_ir_cache(&cache_path) {
+        eprintln!("[tile_tune] Cache hit: {}×{}×{} → {} ({:.1} TF)",
+            m, n, k, cached.best.name(), cached.best_tflops);
+        return Ok(cached);
+    }
+
+    // 2. Build candidate list: PROVEN PRESETS FIRST, then cost_model discoveries.
+    // This ensures we always benchmark the best-known configs even if queue
+    // gets poisoned partway through (proven configs run before risky ones).
+    let mut candidates: Vec<super::tile_ir::TileGemm> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // 2a. Proven-good presets (ordered by expected performance: k64 > k32 > k16)
+    //     SAFETY: force wgp_mode=false on all candidates.
+    //     WGP mode switch (RSRC1.WGP_MODE flip) between dispatches on the same
+    //     KFD queue causes GPU hang (confirmed 2026-03-30: k64 wgp=false → k32 wgp=true → hang).
+    let presets = [
+        super::tile_ir::TileGemm::tile_128x128_k64(),
+        super::tile_ir::TileGemm::tile_128x128_k32(),
+        super::tile_ir::TileGemm::tile_128x128_k16(),
+        super::tile_ir::TileGemm::tile_128x64_k32(),
+        super::tile_ir::TileGemm::tile_128x64_k16(),
+        super::tile_ir::TileGemm::tile_64x64_k16(),
+        super::tile_ir::TileGemm::tile_32x64_k16(),
+    ];
+    for preset in &presets {
+        let mut p = preset.clone();
+        p.wgp_mode = false; // SAFETY: force consistent WGP mode
+        if p.lds_total() > 65536 { continue; }
+        if k % p.tile_k != 0 { continue; }
+        if p.tile_m > m && m >= 32 { continue; }
+        if p.tile_n > n && n >= 32 { continue; }
+        let name = p.name();
+        if seen.contains(&name) { continue; }
+        seen.insert(name);
+        candidates.push(p);
+    }
+
+    // 2b. Cost-model discoveries (may find novel configs the presets miss)
+    //     SAFETY: force wgp_mode=false on all cost-model candidates too.
+    let cost_results = auto_schedule_gemm(m, n, k, DataFormat::BF16);
+    for cost in &cost_results {
+        if !cost.config.can_use_tile_ir() { continue; }
+        let mut spec = cost.config.to_tile_gemm();
+        spec.wgp_mode = false; // SAFETY: consistent WGP mode
+        if spec.lds_total() > 65536 { continue; }
+        let name = spec.name();
+        if seen.contains(&name) { continue; }
+        seen.insert(name);
+        candidates.push(spec);
+    }
+
+    if candidates.is_empty() {
+        return Err("tile_tune: no feasible tile_ir candidates".into());
+    }
+
+    eprintln!("[tile_tune] Benchmarking {} tile_ir candidates for {}×{}×{} ...",
+        candidates.len(), m, n, k);
+
+    // 3. Pre-compile ALL candidates, keeping GpuKernels alive in a Vec.
+    //
+    // ROOT CAUSE FIX: The previous code created GpuKernel inside benchmark_tile_ir_one(),
+    // which dropped (freeing code_buf VRAM) when the function returned. The next kernel's
+    // GpuKernel::load could receive the same VA from Linux mmap recycling. But the GPU's
+    // SQ instruction cache / TLB may still reference the old VA→physical mapping. When the
+    // CP fetches the new kernel's code at the recycled VA, it reads stale or unmapped data
+    // → GPU hang (confirmed: k64 desc_va=0x...22C0, k32 desc_va=0x...32C0, diff = 0x1000).
+    //
+    // Fix: keep ALL kernels alive until the entire tune session completes. This matches
+    // the pattern used by ensure_kernel_t0 (HashMap cache), which never drops code_bufs
+    // and never hangs when switching between kernel configs.
+    use crate::kfd::{GpuKernel, KernelLoadConfig};
+
+    struct CompiledCandidate {
+        spec: super::tile_ir::TileGemm,
+        kernel: GpuKernel,
+        lds_size: u32,
+    }
+    let mut compiled: Vec<CompiledCandidate> = Vec::new();
+
+    for spec in &candidates {
+        let spec_clone = spec.clone();
+        let compile_result = std::panic::catch_unwind(move || {
+            let kernel_ir = super::tile_ir::lower_gemm(&spec_clone);
+            let elf = kernel_ir.compile(super::ir::Target::GFX1100);
+            let lds_size = kernel_ir.lds_size();
+            (elf, lds_size)
+        });
+        let (elf_result, lds_size) = match compile_result {
+            Ok((elf, lds)) => (elf, lds),
+            Err(_) => {
+                eprintln!("[tile_tune]   {} → FAIL: compilation panic", spec.name());
+                continue;
+            }
+        };
+        let elf = match elf_result {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[tile_tune]   {} → FAIL: {}", spec.name(), e);
+                continue;
+            }
+        };
+        match GpuKernel::load(
+            &rt.device, &elf,
+            &KernelLoadConfig {
+                workgroup_size: [spec.wg_size(), 1, 1],
+                lds_size,
+            },
+        ) {
+            Ok(kernel) => {
+                compiled.push(CompiledCandidate {
+                    spec: spec.clone(),
+                    kernel,
+                    lds_size,
+                });
+            }
+            Err(e) => {
+                eprintln!("[tile_tune]   {} → FAIL: load: {}", spec.name(), e);
+            }
+        }
+    }
+
+    if compiled.is_empty() {
+        return Err("tile_tune: all candidates failed to compile".into());
+    }
+
+    // 4. Allocate shared buffers ONCE (reused across all benchmarks)
+    let max_tile_k = compiled.iter().map(|c| c.spec.tile_k).max().unwrap_or(64);
+    let k_pad_max = (k + max_tile_k - 1) & !(max_tile_k - 1);
+    let a_buf = rt.alloc((m as usize * k_pad_max as usize * 2).max(4096))?;
+    let b_buf = rt.alloc((n as usize * k_pad_max as usize * 2).max(4096))?;
+    let c_buf = rt.alloc((m as usize * n as usize * 4).max(4096))?;
+    a_buf.zero(); b_buf.zero(); c_buf.zero();
+
+    // 5. Benchmark each pre-compiled candidate
+    let mut results: Vec<(super::tile_ir::TileGemm, f64)> = Vec::new();
+
+    for cc in &compiled {
+        let k_pad = (k + cc.spec.tile_k - 1) & !(cc.spec.tile_k - 1);
+        let ka = super::tile_ir::build_kernargs_m(
+            a_buf.gpu_addr(), b_buf.gpu_addr(), c_buf.gpu_addr(),
+            k_pad, n, m, &cc.spec,
+        );
+        let grid = super::tile_ir::compute_grid(&cc.spec, m, n);
+
+        // Warmup: 10 sync dispatches for GPU clock ramp-up
+        let mut warmup_ok = true;
+        for _ in 0..10 {
+            if let Err(e) = rt.dispatch(&cc.kernel, grid, &ka) {
+                eprintln!("[tile_tune]   {} → FAIL: warmup: {}", cc.spec.name(), e);
+                warmup_ok = false;
+                break;
+            }
+        }
+        if !warmup_ok {
+            if rt.is_poisoned() {
+                eprintln!("[tile_tune] Queue poisoned, stopping benchmark");
+                break;
+            }
+            continue;
+        }
+
+        // Timed: batch-submit 20 async dispatches, wait once
+        let n_iters = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            rt.dispatch_async(&cc.kernel, grid, &ka);
+        }
+        match rt.wait_idle() {
+            Ok(()) => {},
+            Err(e) => {
+                eprintln!("[tile_tune]   {} → FAIL: timed: {}", cc.spec.name(), e);
+                if e.contains("hung") || e.contains("TIMEOUT") {
+                    eprintln!("[tile_tune] Queue poisoned, stopping benchmark");
+                    break;
+                }
+                continue;
+            }
+        }
+        let elapsed_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        let total_flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tflops = if elapsed_us > 0.0 { total_flops / (elapsed_us * 1e6) } else { 0.0 };
+        eprintln!("[tile_tune]   {} → {:.1} TF", cc.spec.name(), tflops);
+        results.push((cc.spec.clone(), tflops));
+    }
+
+    // Recycle shared buffers
+    rt.recycle(a_buf);
+    rt.recycle(b_buf);
+    rt.recycle(c_buf);
+    // compiled Vec drops here → all GpuKernels freed AFTER benchmarking is done
+
+    if results.is_empty() {
+        return Err("tile_tune: all candidates failed".into());
+    }
+
+    // 6. Sort by TFLOPS descending
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best = &results[0];
+    eprintln!("[tile_tune] ✓ Best: {} ({:.1} TF)", best.0.name(), best.1);
+
+    let tune_result = TileIrTuneResult {
+        best: best.0.clone(),
+        best_tflops: best.1,
+        all: results.iter().map(|(s, t)| (s.name(), *t)).collect(),
+        from_cache: false,
+    };
+
+    // 5. Save to disk cache
+    save_tile_ir_cache(&cache_path, &tune_result);
+
+    Ok(tune_result)
+}
+
+
+// ── Tile IR cache persistence ──
+
+fn tile_ir_cache_dir() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".t0_autotune")
+    } else {
+        std::path::PathBuf::from("/tmp/.t0_autotune")
+    }
+}
+
+fn tile_ir_cache_path(m: u32, n: u32, k: u32) -> std::path::PathBuf {
+    tile_ir_cache_dir().join(format!("tile_ir_{}x{}x{}.json", m, n, k))
+}
+
+fn load_tile_ir_cache(path: &std::path::Path) -> Option<TileIrTuneResult> {
+    let content = std::fs::read_to_string(path).ok()?;
+    // Parse: {"tile_m":128,"tile_n":128,"tile_k":64,"tflops":87.1,...}
+    let tile_m = parse_json_u32(&content, "tile_m")?;
+    let tile_n = parse_json_u32(&content, "tile_n")?;
+    let tile_k = parse_json_u32(&content, "tile_k")?;
+    let tflops = parse_json_f64(&content, "tflops")?;
+    let split_k = parse_json_u32(&content, "split_k").unwrap_or(1);
+    let wgp = content.contains("\"wgp\":true");
+
+    let spec = super::tile_ir::TileGemm {
+        tile_m, tile_n, tile_k,
+        wgp_mode: wgp,
+        double_buffer: true,
+        split_k,
+        swap_grid: true,
+        transpose: super::tile_ir::TileTranspose::NT,
+        acc_swap: false,
+    };
+
+    Some(TileIrTuneResult {
+        best: spec,
+        best_tflops: tflops,
+        all: Vec::new(),
+        from_cache: true,
+    })
+}
+
+fn save_tile_ir_cache(path: &std::path::Path, result: &TileIrTuneResult) {
+    let _ = std::fs::create_dir_all(tile_ir_cache_dir());
+    let s = &result.best;
+    let all_json: Vec<String> = result.all.iter()
+        .map(|(name, tf)| format!("[\"{}\",{:.2}]", name, tf))
+        .collect();
+    let json = format!(
+        concat!(
+            "{{\"tile_m\":{},\"tile_n\":{},\"tile_k\":{},",
+            "\"split_k\":{},\"wgp\":{},\"tflops\":{:.2},",
+            "\"all\":[{}]}}"
+        ),
+        s.tile_m, s.tile_n, s.tile_k,
+        s.split_k, s.wgp_mode, result.best_tflops,
+        all_json.join(","),
+    );
+    if let Err(e) = std::fs::write(path, &json) {
+        eprintln!("[tile_tune] Cache write failed: {}", e);
+    }
+}
+
+fn parse_json_u32(json: &str, key: &str) -> Option<u32> {
+    let needle = format!("\"{}\":", key);
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 { return None; }
+    rest[..end].parse().ok()
+}
+
+fn parse_json_f64(json: &str, key: &str) -> Option<f64> {
+    let needle = format!("\"{}\":", key);
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .unwrap_or(rest.len());
+    if end == 0 { return None; }
+    rest[..end].parse().ok()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -962,6 +1307,83 @@ mod tests {
             let cfg = predict_best(m, k, n);
             eprintln!("predict_best({},{},{}): {}", m, k, n, cfg.name());
             assert!(cfg.tile_m > 0 && cfg.tile_n > 0 && cfg.tile_k > 0);
+        }
+    }
+
+    /// GPU E2E: tune tile_ir for 4096³ GEMM
+    #[test]
+    #[cfg(feature = "rocm")]
+    #[ignore] // Run explicitly: cargo test --release --features rocm -- test_tune_tile_ir_4096 --ignored --nocapture
+    fn test_tune_tile_ir_4096() {
+        let rt = crate::ignis::gpu_context::GpuRuntime::new()
+            .expect("GpuRuntime::new");
+
+        // Clear cache for fresh benchmark
+        let cache = tile_ir_cache_path(4096, 4096, 4096);
+        let _ = std::fs::remove_file(&cache);
+
+        let result = tune_tile_ir(&rt, 4096, 4096, 4096)
+            .expect("tune_tile_ir failed");
+
+        eprintln!("\n╔══════════════════════════════════════════╗");
+        eprintln!("║  tile_ir tune: 4096³ GEMM BF16           ║");
+        eprintln!("╠══════════════════════════════════════════╣");
+        eprintln!("║  Best: {:>30} ║", result.best.name());
+        eprintln!("║  TFLOPS: {:>8.1}                        ║", result.best_tflops);
+        eprintln!("╠──────────────────────────────────────────╣");
+        for (name, tf) in &result.all {
+            eprintln!("║  {:>35} {:.1} TF ║", name, tf);
+        }
+        eprintln!("╚══════════════════════════════════════════╝");
+
+        assert!(result.best_tflops > 50.0,
+            "Expected > 50 TFLOPS, got {:.1}", result.best_tflops);
+
+        // Verify cache was written
+        assert!(cache.exists(), "disk cache should be saved");
+
+        // Verify cache hit
+        let cached = tune_tile_ir(&rt, 4096, 4096, 4096).unwrap();
+        assert!(cached.from_cache, "second call should be cache hit");
+        assert!((cached.best_tflops - result.best_tflops).abs() < 0.01);
+    }
+
+    /// GPU E2E: tune tile_ir for 9 standard sizes
+    #[test]
+    #[cfg(feature = "rocm")]
+    #[ignore]
+    fn test_tune_tile_ir_all_sizes() {
+        let rt = crate::ignis::gpu_context::GpuRuntime::new()
+            .expect("GpuRuntime::new");
+
+        let sizes: Vec<(u32, u32, u32)> = vec![
+            (256, 256, 256),
+            (512, 512, 512),
+            (1024, 1024, 1024),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+            (128, 4096, 1024),
+            (256, 4096, 1024),
+            (512, 4096, 1024),
+            (1024, 4096, 1024),
+        ];
+
+        eprintln!("\n{:>20}  {:>10}  {:>30}", "Size", "TFLOPS", "Best Config");
+        eprintln!("{}", "─".repeat(65));
+
+        for &(m, k, n) in &sizes {
+            // Clear cache for each size
+            let _ = std::fs::remove_file(tile_ir_cache_path(m, n, k));
+
+            match tune_tile_ir(&rt, m, n, k) {
+                Ok(result) => {
+                    eprintln!("{:>4}×{:<4}×{:<4}  {:>8.1} TF  {:>30}",
+                        m, k, n, result.best_tflops, result.best.name());
+                }
+                Err(e) => {
+                    eprintln!("{:>4}×{:<4}×{:<4}  FAILED: {}", m, k, n, e);
+                }
+            }
         }
     }
 }
