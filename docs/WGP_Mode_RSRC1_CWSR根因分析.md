@@ -1,55 +1,84 @@
-# WGP Mode 完整根因分析 — RSRC1 修复 + CWSR 64KB 限制
+# KCP bit10 / RSRC1 WGP Mode 根因分析
 
 ## 日期
-2026-03-30
+2026-03-31
 
 ## 目标
-找到 WGP mode 下 >64KB LDS hang 的根因并修复
+调查为什么 `.amdhsa_workgroup_processor_mode 0` 没有改变 KCP bit 10，以及 KFD loader 对 RSRC1 的 WGP bit 使用了错误的位号。
 
-## 方法与发现
+## 方法
 
-### 第一层：地址对连续性 Bug
-- GlobalStore 的 v[addr_lo:addr_lo+1] 假设连续物理寄存器
-- alloc_addr_pair() 修复后 CU mode 彻底稳定
+### 受控 LLVM 实验
+使用最小汇编文件，分别测试三种情况：
+1. 无 `.amdhsa_workgroup_processor_mode` 行（LLVM 默认）
+2. `.amdhsa_workgroup_processor_mode 1`
+3. `.amdhsa_workgroup_processor_mode 0`
 
-### 第二层：RSRC1 WGP_MODE 未设置
-- LLVM .amdhsa_workgroup_processor_mode 只设 KCP bit 10，不设 RSRC1 bit 27
-- Triton 也是同样的行为（RSRC1 WGP=0, KCP WGP=1）
-- KFD runtime 需要手动从 KCP 传播到 RSRC1
-- 修复后 rsrc1=0xE8BF0000 (bit 27=1)
+对比生成的 ELF 中 KD（Kernel Descriptor）的关键字段。
 
-### 第三层：128KB LDS — KFD 内核模块硬限制
-
-#### 证据链
-1. `/sys/class/kfd/.../properties` 报告 `lds_size_in_kb 64`
-2. `kfd_queue.c` 中 `kfd_get_lds_size_per_cu()` 硬编码 0x10000 (64KB)
-3. GFX1100 不在动态 LDS 列表中（只有 GFX905x 和 GFX1250x）
-4. CWSR save area = 96 CU × (VGPR + SGPR + LDS_64KB + misc)
-5. CWSR size 必须精确匹配驱动计算值（ctl_stack_size != 则 EINVAL）
-6. 增大 CWSR buffer → CREATE_QUEUE EINVAL
-7. dmesg: "Freeing queue vital buffer, queue evicted"
-
-#### 根因
-当内核请求 >64KB LDS 时，CWSR 无法保存完整 LDS 状态。
-当系统调度器触发 preemption 时，save 失败，队列被 evict。
+### KD 布局确认
+```
+0x00: GROUP_SEGMENT_FIXED_SIZE       (u32)
+0x04: PRIVATE_SEGMENT_FIXED_SIZE     (u32)
+0x08: KERNARG_SIZE                   (u32)
+0x0C: reserved
+0x10: KERNEL_CODE_ENTRY_BYTE_OFFSET  (i64)
+0x18-0x2B: reserved
+0x2C: COMPUTE_PGM_RSRC3              (u32)
+0x30: COMPUTE_PGM_RSRC1              (u32)  ← WGP 在这里
+0x34: COMPUTE_PGM_RSRC2              (u32)
+0x38: KERNEL_CODE_PROPERTIES          (u16) ← KCP
+0x3A: KERNARG_PRELOAD_LENGTH          (u16)
+0x3C: reserved
+```
 
 ## 结果
 
-| 阶段 | 配置 | 状态 |
-|------|------|------|
-| Stage 1 | CU + barrier | ✅ PASS（地址对修复） |
-| Stage 2 | WGP, no LDS | ✅ PASS（RSRC1 修复） |
-| Stage 3 | WGP, 4KB LDS | ✅ PASS |
-| Stage 4 | WGP, 80KB LDS | ❌ CWSR 限制（KFD 内核模块） |
+### COMPUTE_PGM_RSRC1 bit 映射（GFX10+ 正确值）
+| bit | 字段 | 说明 |
+|-----|------|------|
+| [5:0] | VGPR_GRANULATED | VGPR 数量编码 |
+| [9:6] | SGPR_GRANULATED | SGPR 数量编码 |
+| [11:10] | PRIORITY | 队列优先级 |
+| [19:12] | FLOAT_MODE | 浮点模式 |
+| 20 | PRIV | KFD 需要（CWSR） |
+| **29** | **ENABLE_WGP_MODE** | **WGP 模式** |
+| 30 | MEM_ORDERED | 内存有序 |
+| 31 | FWD_PROGRESS | 前向进度保证 |
+
+### KERNEL_CODE_PROPERTIES bit 映射（Code Object V5）
+| bit | 字段 |
+|-----|------|
+| 3 | ENABLE_SGPR_KERNARG_SEGMENT_PTR |
+| 9 | ENABLE_WAVEFRONT_SIZE32 |
+| **10** | **USES_DYNAMIC_STACK**（不是 WGP！） |
+
+### 实验数据
+| Case | RSRC1@0x30 | bit29(WGP) | KCP@0x38 | KCP bit10 |
+|------|-----------|-----------|---------|-----------|
+| Default | 0xE0AF0000 | **1** | 0x0400 | 1 (dyn_stack) |
+| WGP=1 | 0xE0AF0000 | **1** | 0x0400 | 1 |
+| WGP=0 | 0xC0AF0000 | **0** | 0x0400 | 1 |
+
+## 结论
+
+### Bug 1: KFD loader 读取了错误的 KCP bit
+KFD loader 读取 KCP bit 10 作为 WGP mode，但实际上 KCP bit 10 是 `USES_DYNAMIC_STACK`（Code Object V5）。WGP mode 不在 KCP 中——它由 LLVM 直接写入 RSRC1 bit 29。
+
+### Bug 2: KFD loader patch 了错误的 RSRC1 bit
+KFD 将 WGP flag 写入 RSRC1 bit 27（无效 bit），应该是 bit 29。但实际上根本不需要 KFD 来 patch——LLVM 已经正确设置了 RSRC1 bit 29。
+
+### 修复
+1. **移除** KCP→RSRC1 WGP 传播逻辑
+2. **保留** RSRC1 bit 20（PRIV）patch（KFD CWSR 需要）
+3. **信任** LLVM 的 `.amdhsa_workgroup_processor_mode` 指令
+
+### 性能影响
+修复前 RSRC1=0xC8BF..（bit27 被错误设置），修复后 RSRC1=0xC0BF..（干净）。
+性能无变化：103.4 TF vs 103.7 TF（正常波动）。
 
 ## 铁律
 
-1. **WGP mode + LDS ≤ 64KB 安全可用** — 立即可在 tile_ir 中启用
-2. **128KB LDS 不可用** — 需要 KFD 内核模块补丁
-3. **LLVM GFX11 不设 RSRC1.WGP_MODE** — runtime 必须从 KCP 传播
-4. **Triton 也不用 >64KB LDS** — 这不是我们的特有限制
+> **COMPUTE_PGM_RSRC1 bit 映射铁律（GFX10+）**：WGP_MODE=bit29，MEM_ORDERED=bit30，FWD_PROGRESS=bit31。不是 bit 27/28/29。LLVM SIDefines.h 是唯一权威来源。
 
-## 后续
-- [ ] 在 tile_ir 生产路径启用 WGP mode
-- [ ] 提交 upstream KFD 补丁（添加 GFX1100 到动态 LDS 列表）
-- [ ] 测试 WGP mode 对 GEMM 性能的实际影响
+> **KCP 不含 WGP 铁律**：`.amdhsa_workgroup_processor_mode` 直接设置 RSRC1 bit 29，不通过 KERNEL_CODE_PROPERTIES 中转。KCP bit 10 是 USES_DYNAMIC_STACK（V5）。

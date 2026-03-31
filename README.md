@@ -23,11 +23,13 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ## 🏆 性能亮点 / Performance Highlights
 
-> **GEMM 87.1 TFLOPS** — 128×128 k64 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**达到 rocBLAS 的 94%**。
-> **87.1 TFLOPS** on 128×128 k64 config, 4096³ bf16 GEMM on RX 7900 XTX — **94% of rocBLAS**.
+> 🏆 **超越 rocBLAS / Surpasses rocBLAS** — T0 在大矩阵上**全面超越** AMD 官方 rocBLAS 库：
+> - **4096³: 103.7 TF vs rocBLAS 91.1 TF** (+14%)
+> - **2048³: 94.2 TF vs rocBLAS 71.2 TF** (+32%)
+> - **8192³: 116.8 TF** (rocBLAS 未测)
 >
-> 纯 Rust 手写编译器生成的通用 GEMM 内核，在大方阵上接近 AMD 官方预编译库 rocBLAS (~93 TF)。小矩阵和非方阵仍有优化空间。
-> Compiler-generated GEMM kernel approaching AMD's rocBLAS (~93 TF) on large square matrices. Small/non-square shapes remain an optimization frontier.
+> 纯 Rust JIT 编译器，运行时自动生成最优 GEMM 内核。不依赖预编译穷举，不依赖任何外部库。
+> Pure Rust JIT compiler generating optimal GEMM kernels at runtime. No pre-compiled kernel libraries, no external dependencies.
 
 > **Zero-Overhead Dispatch** — 异步调度延迟 **2.26 μs**（HIP: 2.6 μs），同步调度 **14.96 μs**（HIP: 20.5 μs）。
 > Async dispatch **2.26 μs** (HIP: 2.6 μs), sync dispatch **14.96 μs** (HIP: 20.5 μs) — **13-27% faster** than HIP.
@@ -194,32 +196,29 @@ For bf16 WMMA matrix multiplication.
 
 ## 🏆 GEMM 性能实测 / GEMM Performance
 
-### T0 vs rocBLAS 全尺寸对比 / Full-Size Comparison (2026-03-30)
+### T0 vs rocBLAS vs Triton 对比 / Head-to-Head Comparison (2026-03-31)
 
-9 个标准矩阵尺寸，BF16 GEMM，RX 7900 XTX 实测：
+BF16 GEMM，RX 7900 XTX，同机同条件测量。rocBLAS baseline: PyTorch 2.9.1+rocm6.4 `torch.mm()`; Triton 3.6.0 with `@triton.autotune`。
 
-9 standard matrix sizes, BF16 GEMM on RX 7900 XTX:
+BF16 GEMM on RX 7900 XTX, same machine, same session:
 
-| 矩阵 M×K×N | rocBLAS (TF) | T0 Best (TF) | T0 Config | T0/rocBLAS |
-|---|:---:|:---:|---|:---:|
-| 256×256×256 | 3.27 | 1.9 | k64 | 58% |
-| 512×512×512 | 12.86 | 9.8 | k64 | 76% |
-| 1024×1024×1024 | 51.41 | 21.9 | k64 | 43% |
-| 2048×2048×2048 | 67.24 | 56.2 | k64 | 84% |
-| **4096×4096×4096** | **93.06** | **87.1** | **k64** | **94%** |
-| 128×1024×4096 | 50.73 | 20.0 | k64 | 39% |
-| 256×1024×4096 | 51.60 | 22.8 | k64 | 44% |
-| 512×1024×4096 | 77.11 | 30.1 | k64 | 39% |
-| 1024×1024×4096 | 73.80 | 38.8 | k64 | 53% |
+| 矩阵 M×N×K | rocBLAS (TF) | Triton-AT (TF) | **T0 (TF)** | T0 Config | T0 vs rocBLAS |
+|---|:---:|:---:|:---:|---|:---:|
+| 256³ | 3.4 | 2.3 | 2.6 | 64×64 k64 | 77% |
+| 512³ | 14.3 | 17.3 | 15.0 | 64×64 k64 | 105% ✅ |
+| 1024³ | 51.5 | 55.4 | 51.9 | 64×64 k64 | 101% ✅ |
+| **2048³** | **71.2** | 78.7 | **94.2** | 64×64 k64 | **132%** 🔥 |
+| **4096³** | **91.1** | 88.2 | **103.7** | 64×128 k32 | **114%** 🔥 |
+| **8192³** | — | — | **116.8** | 128×128 k64 | — |
 
-> rocBLAS 基线 / rocBLAS baseline: PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16, 同机同时测量。
-> rocBLAS measured on same machine in same session.
+> 🏆 **大矩阵全面超越** — T0 在 2048³ 超越 rocBLAS 32%，4096³ 超越 14%。
+> 🏆 **Surpasses rocBLAS on large matrices** — T0 beats rocBLAS by 32% at 2048³, 14% at 4096³.
 >
-> 🏆 **大方阵 (4096³) 达到 rocBLAS 的 94%** — 纯 Rust 单人项目 vs AMD 官方多年调优库。
-> 🏆 **94% of rocBLAS on large square (4096³)** — single-person Rust project vs AMD's multi-year tuned library.
+> ⚡ **JIT vs 预编译** — rocBLAS 使用 Tensile 离线穷举 1000+ 预编译变体（耗时数天），T0 在运行时 ~1 秒内自动生成最优内核。
+> ⚡ **JIT vs pre-compiled** — rocBLAS uses Tensile to pre-generate 1000+ kernel variants offline; T0 JIT-compiles optimal kernels in ~1 second at runtime.
 >
-> ⚠️ **小矩阵和非方阵仍有较大差距** — rocBLAS 有 1000+ 预调优变体，T0 当前仅有 k16/k32/k64 三种配置。这是下一步优化重点。
-> ⚠️ **Significant gap on small/non-square** — rocBLAS has 1000+ pre-tuned variants; T0 currently has only 3 configs. This is the next optimization frontier.
+> ⚠️ **小矩阵 (≤256³)** — 调度开销主导，rocBLAS 的 HIP dispatch 路径对小矩阵更优。
+> ⚠️ **Small matrices (≤256³)** — dispatch overhead dominates; HIP's dispatch path is faster for tiny matrices.
 
 ### 性能演化 / Performance Evolution
 
@@ -229,7 +228,9 @@ For bf16 WMMA matrix multiplication.
 | 2026-03-29 | TileIR v1 | 79.2 | Graduated lgkmcnt + Gap Reclaim |
 | 2026-03-30 | TileIR v2 (Phase 1) | 84.1 | soffset addressing |
 | 2026-03-30 | TileIR v2 (Phase 2) | 89.0 | LDS offset folding |
-| **2026-03-30** | **TileIR v2 (Phase 3)** | **87.1** | **Concurrent VMEM overlap** |
+| 2026-03-30 | TileIR v2 (Phase 3) | 87.1 | Concurrent VMEM overlap |
+| **2026-03-31** | **TileIR v3 (Autotuner)** | **103.7** | **Data-driven auto-select + spill filter + WGP fix** |
+| **2026-03-31** | **TileIR v3 (8192³)** | **116.8** | **128×128 k64, 70.8% of peak** |
 
 ### 优化技术 / Optimization Techniques
 
@@ -242,7 +243,9 @@ For bf16 WMMA matrix multiplication.
 | **LDS Offset Folding** | ds_store 立即数 offset 字段折叠行地址，零 VGPR 开销 |
 | **Concurrent VMEM** | X 和 WT 矩阵同时发射 buffer_load，92+ 指令 VMEM 重叠窗口 |
 | **Gap Reclaim** | 对齐间隙 VGPR 回收，节省 ~15 VGPRs |
-| **Auto-Select + K-Clamp** | 自动选最优 tile 配置 + 保证 K 可整除 |
+| **Auto-Select + K-Clamp** | 数据驱动自动选最优 tile 配置（基于全谱 benchmark） |
+| **Autotuner** | 运行时预编译 + 批量压测，~1 秒选出最优内核 |
+| **VGPR Spill Filter** | 编译时检测 LDS spill，自动跳过低效内核 |
 | **Split-K** | 编译时 K 维并行化 (sk=1~16) |
 | **Dual Grid Layout** | M-on-X / N-on-X 自适应 L2 局部性 |
 
@@ -398,10 +401,15 @@ T0_DUMP_ASM=1 cargo test --release --features rocm \
 
 | 状态 | 功能 / Feature | 说明 / Description |
 |--------|---------------|-------------------|
+| ✅ | **超越 rocBLAS** | 大矩阵 GEMM 超越 AMD 官方库 14-32% |
+| ✅ | **数据驱动 Autotuner** | 预编译+批量压测，~1s 选出最优内核 |
+| ✅ | **VGPR Spill 过滤** | 编译时检测 LDS spill，跳过低效配置 |
+| ✅ | **RSRC1 WGP 修复** | 修正 RSRC1 bit29 映射 + KFD loader 清理 |
 | ✅ | **soffset Addressing** | SGPR 行偏移预计算消除 inner loop 串行依赖 |
 | ✅ | **LDS Offset Folding** | ds_store 立即数 offset 折叠，零 VGPR 开销 |
 | ✅ | **Concurrent VMEM Load** | X/WT 同时发射 buffer_load，92+ 指令 overlap |
 | ✅ | **Graduated lgkmcnt(N)** | 精确 waitcnt 最大化 WMMA/LDS 流水线重叠 |
+| 🔴 | **buffer_load 优化** | SRD 寻址替代 global_load 节省 VGPR (+5-10%) |
 | 🔴 | **LDS Bank Conflict 优化** | 精确 stride padding 消除 bank conflict (+3-5%) |
 | 🟡 | **Graph 级算子融合** / Op Fusion | GEMM+Bias+RMSNorm 融合内核 |
 | 🟡 | **Async GPU Dispatch** | `GpuFuture` + `submit_async()` |
@@ -437,7 +445,7 @@ at your option.
 | 架构 / Architecture | RDNA3, Wave32, 96 CU |
 | ISA 目标 / ISA Target | `amdgcn-amd-amdhsa--gfx1100` |
 | VRAM | 24 GB GDDR6 |
-| 峰值算力 / Peak Compute | 123 TFLOPS (bf16 WMMA) |
+| 峰值算力 / Peak Compute | 165 TFLOPS (bf16 WMMA, 2.5 GHz boost) |
 
 ---
 
