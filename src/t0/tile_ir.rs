@@ -19,6 +19,49 @@ use super::compile::T0Kernel;
 use super::ir::*;
 
 // ============================================================================
+// EpilogueOp — Fused post-GEMM element-wise operations
+// ============================================================================
+
+/// Element-wise operation applied to each GEMM accumulator value before store.
+///
+/// Operations are applied in order: Y' = epilogue[n]( ... epilogue[1]( epilogue[0]( Y ) ) ... )
+///
+/// All epilogue ops operate on f32 values in VGPRs, executing in the store phase
+/// with zero additional memory bandwidth (data stays in registers).
+///
+/// # Example: GEMM + Bias + SiLU
+/// ```ignore
+/// let mut spec = TileGemm::tile_128x64_k16();
+/// spec.add_epilogue(EpilogueOp::BiasAdd);
+/// spec.add_epilogue(EpilogueOp::SiLU);
+/// let kernel = lower_gemm(&spec);
+/// // kernargs: [X, WT, Y, K, N, split_k_shift, y_split_stride, M, bias_ptr]
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub enum EpilogueOp {
+    /// Y[i] += bias[col_index]
+    /// Requires extra kernarg: bias_ptr (u64, pointer to [N] f32 vector)
+    BiasAdd,
+    /// Y[i] *= scale (scalar)
+    /// Requires extra kernarg: scale (f32)
+    Scale,
+    /// Y[i] = max(Y[i], 0.0)
+    ReLU,
+    /// Y[i] = Y[i] * sigmoid(Y[i])
+    SiLU,
+    /// Y[i] = 0.5 * Y[i] * (1 + tanh(sqrt(2/π) * (Y[i] + 0.044715 * Y[i]³)))
+    /// Uses the fast tanh approximation.
+    GELU,
+    /// Y[i] = |Y[i]|
+    Abs,
+    /// Y[i] = -Y[i]
+    Neg,
+    /// Y[i] = clamp(Y[i], min, max)
+    /// Requires extra kernargs: clamp_min (f32), clamp_max (f32)
+    Clamp,
+}
+
+// ============================================================================
 // TileTranspose — GEMM layout mode
 // ============================================================================
 
@@ -67,6 +110,10 @@ pub struct TileGemm {
     /// swap others to/from LDS between row_block passes.
     /// Reduces VGPR pressure at cost of extra LDS traffic.
     pub acc_swap: bool,
+    /// Epilogue operations: fused element-wise ops applied to each acc value before store.
+    /// Empty = no epilogue (plain GEMM output).
+    /// Operations are applied in order: result = epilogue[n](...(epilogue[0](acc))...)
+    pub epilogue: Vec<EpilogueOp>,
 }
 
 impl TileGemm {
@@ -78,6 +125,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -89,6 +137,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -100,6 +149,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -111,6 +161,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -122,6 +173,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -133,6 +185,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -146,6 +199,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -157,6 +211,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -170,6 +225,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -185,6 +241,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -198,6 +255,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -211,6 +269,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true,
+            epilogue: vec![],
         }
     }
 
@@ -225,6 +284,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: true,
+            epilogue: vec![],
         }
     }
 
@@ -240,6 +300,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -255,6 +316,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -271,6 +333,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -285,6 +348,7 @@ impl TileGemm {
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -349,42 +413,80 @@ impl TileGemm {
         let mg = if !self.swap_grid { "_mg" } else { "" };
         let tr = match self.transpose { TileTranspose::NN => "_nn", TileTranspose::NT => "" };
         let sw = if self.acc_swap { "_swap" } else { "" };
-        format!("tile_gemm_{}x{}_k{}{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, db, sk, mg, wgp, tr, sw)
+        let epi = if self.epilogue.is_empty() {
+            String::new()
+        } else {
+            let ops: Vec<&str> = self.epilogue.iter().map(|op| match op {
+                EpilogueOp::BiasAdd => "bias",
+                EpilogueOp::Scale => "scale",
+                EpilogueOp::ReLU => "relu",
+                EpilogueOp::SiLU => "silu",
+                EpilogueOp::GELU => "gelu",
+                EpilogueOp::Abs => "abs",
+                EpilogueOp::Neg => "neg",
+                EpilogueOp::Clamp => "clamp",
+            }).collect();
+            format!("_{}", ops.join("_"))
+        };
+        format!("tile_gemm_{}x{}_k{}{}{}{}{}{}{}{}", self.tile_m, self.tile_n, self.tile_k, db, sk, mg, wgp, tr, sw, epi)
+    }
+
+    /// Add an epilogue operation to the fusion chain.
+    pub fn add_epilogue(&mut self, op: EpilogueOp) {
+        self.epilogue.push(op);
+    }
+
+    /// Builder pattern: return self with epilogue added.
+    pub fn with_epilogue(mut self, ops: Vec<EpilogueOp>) -> Self {
+        self.epilogue = ops;
+        self
+    }
+
+    /// Check if the epilogue requires a bias pointer kernel argument.
+    pub fn has_epilogue_bias(&self) -> bool {
+        self.epilogue.contains(&EpilogueOp::BiasAdd)
+    }
+
+    /// Check if the epilogue requires a scale kernel argument.
+    pub fn has_epilogue_scale(&self) -> bool {
+        self.epilogue.contains(&EpilogueOp::Scale)
+    }
+
+    /// Check if the epilogue requires clamp kernel arguments.
+    pub fn has_epilogue_clamp(&self) -> bool {
+        self.epilogue.contains(&EpilogueOp::Clamp)
     }
 }
 
 /// Auto-select optimal tile configuration based on matrix dimensions.
 ///
-/// Data-driven tile config selection based on actual benchmark results (2026-03-30).
+/// Data-driven tile config selection based on full-spectrum autotuner (2026-03-31).
 ///
-/// Selection principles:
-///   - Large square (M,N ≥ 2048): 128×128 k64 (87.1 TF at 4096³ = 94% rocBLAS)
-///   - Medium square (M,N ≥ 512):  128×128 k32 (71.3 TF at 4096³ in k32 mode)
-///   - Small square:                64×64 k16  (better CU saturation)
-///   - Non-square (M < 128):        32×64 k16  (fits small M dimension)
-///   - Non-square (M ≥ 128):        128×64 k32 (compromise for rectangular)
+/// Selection principles (split_k=1 baseline, then split_k applied post-hoc):
+///   - Small (M,N ≤ 512):           64×64 k64/k32  (best CU saturation)
+///   - Medium (M,N ~1024):          64×64 k32      (24.8 TF @ 1024³)
+///   - Large (M,N ~2048):           256×64 k32 WGP (49.1 TF = +18% vs 64×64)
+///   - Very large (M,N ≥ 4096):     128×128 k32    (84.7 TF @ 4096³)
+///   - Huge K (K ≥ 4096, N ≥ 4096): 128×128 k64    (81.7 TF @ 1024×4096×4096)
 pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> TileGemm {
-    // Data-driven tile selection based on full-spectrum autotuner results (2026-03-31).
+    // Full-spectrum autotuner results (2026-03-31, split_k=1):
     //
-    // Benchmark data (square matrices, BF16 GEMM on RX 7900 XTX):
-    //   256³:   2.6 TF → 64x64_k64
-    //   512³:  15.0 TF → 64x64_k64
-    //  1024³:  51.9 TF → 64x64_k64
-    //  2048³:  94.2 TF → 64x64_k64
-    //  4096³: 103.7 TF → 64x128_k32
-    //  8192³: 116.8 TF → 128x128_k64
+    //   256³:               2.0 TF → 64×64 k32
+    //   512³:              10.1 TF → 64×64 k64
+    //  1024³:              24.8 TF → 64×64 k32
+    //  2048³:              49.1 TF → 256×64 k32 WGP  ★ NEW
+    //  4096³:              84.7 TF → 128×128 k32
     //
-    // Non-square (M×K×N):
-    //  128×4096×1024:  24.2 TF → 64x64_k64
-    //  256×4096×1024:  47.2 TF → 64x64_k64
-    //  512×4096×1024:  67.4 TF → 64x64_k64
-    // 1024×4096×1024:  76.9 TF → 64x64_k32
+    // Non-square:
+    //  256×4096×1024:      32.0 TF → 64×64 k64
+    //  512×4096×1024:      50.7 TF → 64×64 k64
+    // 1024×4096×4096:      81.7 TF → 128×128 k64
 
     let min_dim = m.min(n);
     let max_dim = m.max(n);
 
     let mut spec = if min_dim >= 128 && max_dim >= 4096 {
-        // Very large: 128x128_k64 dominates (8192³ = 116.8 TF)
+        // Very large (4096³ class): 128×128 dominates
         if k >= 64 && k % 64 == 0 {
             TileGemm::tile_128x128_k64()
         } else if k >= 32 && k % 32 == 0 {
@@ -392,15 +494,17 @@ pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> Til
         } else {
             TileGemm::tile_128x128_k16()
         }
-    } else if min_dim >= 128 && max_dim >= 2048 {
-        // Large (4096³ class): 64x128_k32 wins (103.7 TF)
-        if k >= 32 && k % 32 == 0 {
-            TileGemm::tile_64x128_k32()
+    } else if min_dim >= 64 && max_dim >= 2048 {
+        // Large (2048³ class): 256×64 WGP wins (+18% vs 64×64)
+        if m >= 256 && k >= 32 && k % 32 == 0 {
+            TileGemm::tile_256x64_k32_wgp()
+        } else if k >= 32 && k % 32 == 0 {
+            TileGemm::tile_64x64_k32()
         } else {
-            TileGemm::tile_64x128_k16()
+            TileGemm::tile_64x64_k16()
         }
     } else if min_dim >= 64 {
-        // Medium (≤2048³): 64x64_k64 consistently best (2.6-94.2 TF)
+        // Medium (512³-1024³): 64×64 consistently best
         if k >= 64 && k % 64 == 0 {
             TileGemm::tile_64x64_k64()
         } else if k >= 32 && k % 32 == 0 {
@@ -433,8 +537,12 @@ pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> Til
     let total_tiles = n_tiles_m * n_tiles_n;
     
     // Heuristic: target ~4-8 K-loop iterations per workgroup for best pipeline utilization
+    // Exception: WGP tiles (256 threads, high arithmetic intensity) don't benefit from
+    // split_k when CU occupancy is already good — autotuner shows 20% penalty from sk=8.
     let k_iters = k / spec.tile_k;
-    let desired_sk = if total_tiles < 12 {
+    let desired_sk = if spec.wgp_mode && total_tiles >= 96 {
+        1  // WGP: sufficient occupancy, no split needed
+    } else if total_tiles < 12 {
         8  // very few tiles → max parallelism
     } else if total_tiles < 48 {
         4  // moderate tiles → moderate split
@@ -558,6 +666,21 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     let _sk_shift = k.arg_u32("split_k_shift");
     let y_split_stride = k.arg_u32("y_split_stride");
     let m_dim = k.arg_u32("M");      // actual M (may not be tile-aligned)
+
+    // ── Epilogue kernel arguments (declared after standard GEMM args) ──
+    let epi_bias_ptr = if spec.has_epilogue_bias() {
+        Some(k.arg_ptr("bias"))       // [N] f32 bias vector
+    } else { None };
+    let epi_scale = if spec.has_epilogue_scale() {
+        Some(k.arg_f32("epi_scale"))
+    } else { None };
+    let epi_clamp_min = if spec.has_epilogue_clamp() {
+        Some(k.arg_f32("clamp_min"))
+    } else { None };
+    let epi_clamp_max = if spec.has_epilogue_clamp() {
+        Some(k.arg_f32("clamp_max"))
+    } else { None };
+
     k.emit_arg_loads();
 
     // ══════════════════════════════════════════════════════════════
@@ -923,8 +1046,12 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     // Dual pointers for A fragments: _0 = base^swizzle, _16 = (base+16)^swizzle
     // The +16 offset for the second ds_load_b128 of each fragment MUST be
     // applied BEFORE XOR to avoid carry corruption (DeepThink's "Carry Problem").
-    let mut x_lds_reads_0 = Vec::new();
-    let mut x_lds_reads_16 = Vec::new();
+    // ── X LDS read addresses: raw (pre-XOR) for per-ksub recomputation ──
+    // CRITICAL: k_byte_within MUST be added BEFORE XOR to avoid carry corruption.
+    // For k>16 (k_sub_steps > 1), `(a XOR b) + c ≠ (a + c) XOR b` when c overlaps
+    // with the swizzle bits (bits 4-6). Pre-computing XOR'd addresses and adding
+    // k_byte_within as ds_load immediate is WRONG for k>16.
+    let mut x_lds_reads_raw = Vec::new();
     for r in 0..n_row_blocks {
         let xr = k.alloc_vreg();
         k.v_mov_from_sgpr(xr, s_wave_x_off);
@@ -935,21 +1062,26 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
                 src1: Operand::InlineInt((r as i32) * 16 * (x_row_stride as i32)),
             });
         }
-        // ptr_0 = base ^ lane_swizzle
+        x_lds_reads_raw.push(xr);
+    }
+    // Pre-XOR'd addresses for ksub=0 (backward compat: zero k_byte_within = no shift)
+    let mut x_lds_reads_0 = Vec::new();
+    let mut x_lds_reads_16 = Vec::new();
+    for r in 0..n_row_blocks {
         let xr_0 = k.alloc_vreg();
-        k.v_xor_b32(xr_0, Operand::VReg(xr), Operand::VReg(lane_swizzle));
+        k.v_xor_b32(xr_0, Operand::VReg(x_lds_reads_raw[r]), Operand::VReg(lane_swizzle));
         x_lds_reads_0.push(xr_0);
-        // ptr_16 = (base + 16) ^ lane_swizzle (add 16 BEFORE XOR!)
         let xr_16_base = k.alloc_vreg();
-        k.push(Op::VAddU32 { dst: xr_16_base, src0: Operand::VReg(xr), src1: Operand::InlineInt(16) });
+        k.push(Op::VAddU32 { dst: xr_16_base, src0: Operand::VReg(x_lds_reads_raw[r]), src1: Operand::InlineInt(16) });
         let xr_16 = k.alloc_vreg();
         k.v_xor_b32(xr_16, Operand::VReg(xr_16_base), Operand::VReg(lane_swizzle));
         x_lds_reads_16.push(xr_16);
     }
 
-    // Dual pointers for B fragments:
+    // ── WT LDS read addresses: save raw for per-ksub recomputation ──
     let wt_lds_read_raw = k.alloc_vreg();
     k.v_lshlrev_b32(wt_lds_read_raw, wrs_shift, lane_row);
+    // Pre-XOR'd for ksub=0
     let wt_lds_read_base_0 = k.alloc_vreg();
     k.v_xor_b32(wt_lds_read_base_0, Operand::VReg(wt_lds_read_raw), Operand::VReg(lane_swizzle));
     let wt_lds_16_base = k.alloc_vreg();
@@ -1138,8 +1270,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
         // WMMA compute from buf0 (full compute - all batches load during this)
         emit_lds_read_and_wmma(
             &mut k, &frag_a, &frag_b, &acc,
-            &x_lds_reads_0, &x_lds_reads_16,
-            wt_lds_read_base_0, wt_lds_read_base_16,
+            &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+            wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+            lane_swizzle,
             n_row_blocks, n_col_tiles,
             x_row_stride, wt_row_stride, lds_x,
             spec, buf0_off_const,
@@ -1183,8 +1316,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
             };
             emit_lds_read_and_wmma(
                 &mut k, &frag_a, &frag_b, &acc,
-                &x_lds_reads_0, &x_lds_reads_16,
-                wt_lds_read_base_0, wt_lds_read_base_16,
+                &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+                wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+                lane_swizzle,
                 n_row_blocks, n_col_tiles,
                 x_row_stride, wt_row_stride, lds_x,
                 spec, buf0_off_const,
@@ -1213,8 +1347,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
                 let total_loads = x_batch_loads + wt_batch_loads;
                 emit_lds_read_and_wmma(
                     &mut k, &frag_a, &frag_b, &acc,
-                    &x_lds_reads_0, &x_lds_reads_16,
-                    wt_lds_read_base_0, wt_lds_read_base_16,
+                    &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+                    wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+                    lane_swizzle,
                     n_row_blocks, n_col_tiles,
                     x_row_stride, wt_row_stride, lds_x,
                     spec, buf0_off_const,
@@ -1245,8 +1380,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
 
         emit_lds_read_and_wmma(
             &mut k, &frag_a, &frag_b, &acc,
-            &x_lds_reads_0, &x_lds_reads_16,
-            wt_lds_read_base_0, wt_lds_read_base_16,
+            &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+            wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+            lane_swizzle,
             n_row_blocks, n_col_tiles,
             x_row_stride, wt_row_stride, lds_x,
             spec, buf1_off_const,
@@ -1286,8 +1422,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
             };
             emit_lds_read_and_wmma(
                 &mut k, &frag_a, &frag_b, &acc,
-                &x_lds_reads_0, &x_lds_reads_16,
-                wt_lds_read_base_0, wt_lds_read_base_16,
+                &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+                wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+                lane_swizzle,
                 n_row_blocks, n_col_tiles,
                 x_row_stride, wt_row_stride, lds_x,
                 spec, buf1_off_const,
@@ -1315,8 +1452,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
             } else {
                 emit_lds_read_and_wmma(
                     &mut k, &frag_a, &frag_b, &acc,
-                    &x_lds_reads_0, &x_lds_reads_16,
-                    wt_lds_read_base_0, wt_lds_read_base_16,
+                    &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+                    wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+                    lane_swizzle,
                     n_row_blocks, n_col_tiles,
                     x_row_stride, wt_row_stride, lds_x,
                     spec, buf1_off_const,
@@ -1353,8 +1491,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     } else {
         emit_lds_read_and_wmma(
             &mut k, &frag_a, &frag_b, &acc,
-            &x_lds_reads_0, &x_lds_reads_16,
-            wt_lds_read_base_0, wt_lds_read_base_16,
+            &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+            wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+            lane_swizzle,
             n_row_blocks, n_col_tiles,
             x_row_stride, wt_row_stride, lds_x,
             spec, buf0_off_const,
@@ -1381,8 +1520,9 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
     } else {
         emit_lds_read_and_wmma(
             &mut k, &frag_a, &frag_b, &acc,
-            &x_lds_reads_0, &x_lds_reads_16,
-            wt_lds_read_base_0, wt_lds_read_base_16,
+            &x_lds_reads_raw, &x_lds_reads_0, &x_lds_reads_16,
+            wt_lds_read_raw, wt_lds_read_base_0, wt_lds_read_base_16,
+            lane_swizzle,
             n_row_blocks, n_col_tiles,
             x_row_stride, wt_row_stride, lds_x,
             spec, buf1_off_const,
@@ -1397,18 +1537,29 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
 
     k.label(&store_label);
 
+    // Build epilogue context from spec + declared kernargs
+    let epi_ctx = EpilogueCtx {
+        ops: spec.epilogue.clone(),
+        bias_ptr: epi_bias_ptr,
+        scale_sreg: epi_scale,
+        clamp_min_sreg: epi_clamp_min,
+        clamp_max_sreg: epi_clamp_max,
+    };
+
     if spec.acc_swap {
         // ACC swap store: loop over row_blocks, swapping acc from LDS
         emit_store_phase_swap(
             &mut k, &acc, &s_row_bases, base_n_s, y_ptr, n_dim, y_offset_s,
             n_row_blocks, n_col_tiles, lane_row, lane_id,
             acc_swap_addr.unwrap(), acc_swap_temp.unwrap(),
+            &epi_ctx,
         );
     } else {
         // Standard store: all acc are live in VGPRs
         emit_store_phase(
             &mut k, &acc, &s_row_bases, base_n_s, y_ptr, n_dim, y_offset_s,
             n_row_blocks, n_col_tiles, lane_row, lane_id,
+            &epi_ctx,
         );
     }
 
@@ -1704,8 +1855,12 @@ fn emit_lds_store_graduated(
 fn emit_lds_read_and_wmma(
     k: &mut T0Kernel,
     frag_a: &[VReg], frag_b: &[VReg], acc: &[VReg],
+    // Raw (pre-XOR) addresses for per-ksub recomputation:
+    x_lds_reads_raw: &[VReg],
+    // Pre-XOR'd addresses for ksub=0 (also used as scratch for ksub>0):
     x_lds_reads_0: &[VReg], x_lds_reads_16: &[VReg],
-    wt_base_0: VReg, wt_base_16: VReg,
+    wt_raw: VReg, wt_base_0: VReg, wt_base_16: VReg,
+    lane_swizzle: VReg,
     n_row_blocks: usize, n_col_tiles: usize,
     _x_row_stride: u32, wt_row_stride: u32, lds_x: u32,
     spec: &TileGemm, buf_off: u16,
@@ -1723,8 +1878,75 @@ fn emit_lds_read_and_wmma(
     let mut current_wmma: u32 = 0;
     let mut store_idx: u32 = 0;
 
+    // Scratch VGPRs for per-ksub XOR recomputation (allocated once, reused).
+    // Only needed for k>16 (k_sub > 1) where k_byte_within > 0.
+    let (xr_0_tmp, xr_16_tmp, wt_0_tmp, wt_16_tmp) = if k_sub > 1 {
+        (
+            (0..n_row_blocks).map(|_| k.alloc_vreg()).collect::<Vec<_>>(),
+            (0..n_row_blocks).map(|_| k.alloc_vreg()).collect::<Vec<_>>(),
+            k.alloc_vreg(),
+            k.alloc_vreg(),
+        )
+    } else {
+        (vec![], vec![], VReg(0), VReg(0)) // unused
+    };
+    // Note: we reuse xr_0_tmp / xr_16_tmp / wt_0_tmp / wt_16_tmp as both
+    // the v_add destination and l the subsequent v_xor input. The v_add writes
+    // (raw + k_byte_within) into e.g. xr_0_tmp[r], then v_xor reads it back
+    // and writes the XOR'd result into the same register. This is valid because
+    // SSA lowering treats each write as a new definition.
+    // This saves ~10 VGPRs vs having separate add_tmp + xor_result registers.
+
     for ksub in 0..k_sub {
         let k_byte_within = (ksub * 32) as u16;
+
+        // ── Per-ksub XOR address recomputation ──
+        // CRITICAL FIX: For k>16, k_byte_within must be added BEFORE XOR!
+        // (a XOR b) + c ≠ (a + c) XOR b when c overlaps with swizzle bits.
+        // For ksub=0: use pre-computed addresses (k_byte_within=0, no carry issue).
+        // For ksub>0: recompute (raw + k_byte_within) XOR swizzle.
+        let (cur_x_reads_0, cur_x_reads_16): (&[VReg], &[VReg]);
+        let (cur_wt_0, cur_wt_16): (VReg, VReg);
+        if ksub == 0 {
+            cur_x_reads_0 = x_lds_reads_0;
+            cur_x_reads_16 = x_lds_reads_16;
+            cur_wt_0 = wt_base_0;
+            cur_wt_16 = wt_base_16;
+        } else {
+            // Recompute X read addresses: (raw + k_byte_within) XOR swizzle
+            // Two-step in-place: v_add → xr_0_tmp[r], then v_xor xr_0_tmp[r] ← xr_0_tmp[r] ^ swizzle
+            for r in 0..n_row_blocks {
+                k.push(Op::VAddU32 {
+                    dst: xr_0_tmp[r], src0: Operand::VReg(x_lds_reads_raw[r]),
+                    src1: Operand::InlineInt(k_byte_within as i32),
+                });
+                k.v_xor_b32(xr_0_tmp[r], Operand::VReg(xr_0_tmp[r]), Operand::VReg(lane_swizzle));
+                k.push(Op::VAddU32 {
+                    dst: xr_16_tmp[r], src0: Operand::VReg(x_lds_reads_raw[r]),
+                    src1: Operand::InlineInt(k_byte_within as i32 + 16),
+                });
+                k.v_xor_b32(xr_16_tmp[r], Operand::VReg(xr_16_tmp[r]), Operand::VReg(lane_swizzle));
+            }
+            // Recompute WT read addresses
+            {
+                k.push(Op::VAddU32 {
+                    dst: wt_0_tmp, src0: Operand::VReg(wt_raw),
+                    src1: Operand::InlineInt(k_byte_within as i32),
+                });
+                k.v_xor_b32(wt_0_tmp, Operand::VReg(wt_0_tmp), Operand::VReg(lane_swizzle));
+                k.push(Op::VAddU32 {
+                    dst: wt_16_tmp, src0: Operand::VReg(wt_raw),
+                    src1: Operand::InlineInt(k_byte_within as i32 + 16),
+                });
+                k.v_xor_b32(wt_16_tmp, Operand::VReg(wt_16_tmp), Operand::VReg(lane_swizzle));
+            }
+            cur_x_reads_0 = &xr_0_tmp;
+            cur_x_reads_16 = &xr_16_tmp;
+            cur_wt_0 = wt_0_tmp;
+            cur_wt_16 = wt_16_tmp;
+        }
+        // ds_load immediate offset no longer includes k_byte_within (it's pre-XOR'd now)
+        let ds_off = buf_off;
 
         // ── Load ALL A fragments (skip if preloaded by previous ksub) ──
         // Optimization: in streaming mode, the previous ksub's last column
@@ -1734,8 +1956,8 @@ fn emit_lds_read_and_wmma(
         let frag_a_preloaded = use_streaming && ksub > 0 && !row_major;
         if !frag_a_preloaded && !row_major {
             for r in 0..frag_a.len() {
-                k.ds_load_b128(frag_a[r], x_lds_reads_0[r], buf_off + k_byte_within);
-                k.ds_load_b128(VReg(frag_a[r].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+                k.ds_load_b128(frag_a[r], cur_x_reads_0[r], ds_off);
+                k.ds_load_b128(VReg(frag_a[r].0 + 4), cur_x_reads_16[r], ds_off);
             }
         }
 
@@ -1755,19 +1977,19 @@ fn emit_lds_read_and_wmma(
 
                 for r in 0..n_row_blocks {
                     // Load frag_a for this row block
-                    k.ds_load_b128(frag_a[0], x_lds_reads_0[r], buf_off + k_byte_within);
-                    k.ds_load_b128(VReg(frag_a[0].0 + 4), x_lds_reads_16[r], buf_off + k_byte_within);
+                    k.ds_load_b128(frag_a[0], cur_x_reads_0[r], ds_off);
+                    k.ds_load_b128(VReg(frag_a[0].0 + 4), cur_x_reads_16[r], ds_off);
 
                     // Prefetch first TWO B columns
                     {
                         let base_0: u16 = lds_x as u16;
-                        k.ds_load_b128(fb_ping, wt_base_0, base_0 + buf_off + k_byte_within);
-                        k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, base_0 + buf_off + k_byte_within);
+                        k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
+                        k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
                     }
                     if n_col_tiles > 1 {
                         let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
-                        k.ds_load_b128(fb_pong, wt_base_0, base_1 + buf_off + k_byte_within);
-                        k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, base_1 + buf_off + k_byte_within);
+                        k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
+                        k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
                     }
 
                     // Wait: 2 frag_a + 2 frag_b_col1 in flight, need frag_a + col0 ready
@@ -1792,8 +2014,8 @@ fn emit_lds_read_and_wmma(
                         // Prefetch column c+2
                         if c + 2 < n_col_tiles {
                             let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
-                            k.ds_load_b128(cur_fb, wt_base_0, next2_base + buf_off + k_byte_within);
-                            k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, next2_base + buf_off + k_byte_within);
+                            k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
+                            k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
                         }
 
                         // Wait for next column's B data
@@ -1811,13 +2033,13 @@ fn emit_lds_read_and_wmma(
                 // Prefetch first TWO B columns
                 {
                     let base_0: u16 = lds_x as u16;
-                    k.ds_load_b128(fb_ping, wt_base_0, base_0 + buf_off + k_byte_within);
-                    k.ds_load_b128(VReg(fb_ping.0 + 4), wt_base_16, base_0 + buf_off + k_byte_within);
+                    k.ds_load_b128(fb_ping, cur_wt_0, base_0 + ds_off);
+                    k.ds_load_b128(VReg(fb_ping.0 + 4), cur_wt_16, base_0 + ds_off);
                 }
                 if n_col_tiles > 1 {
                     let base_1: u16 = (lds_x + 16 * wt_row_stride) as u16;
-                    k.ds_load_b128(fb_pong, wt_base_0, base_1 + buf_off + k_byte_within);
-                    k.ds_load_b128(VReg(fb_pong.0 + 4), wt_base_16, base_1 + buf_off + k_byte_within);
+                    k.ds_load_b128(fb_pong, cur_wt_0, base_1 + ds_off);
+                    k.ds_load_b128(VReg(fb_pong.0 + 4), cur_wt_16, base_1 + ds_off);
                 }
 
                 // When frag_a was preloaded, it has a head start — account for
@@ -1836,10 +2058,30 @@ fn emit_lds_read_and_wmma(
                         current_wmma += 1;
 
                         // ★ PREFETCH: at last column, preload next ksub's frag_a ★
+                        // Must use next ksub's XOR'd addresses (not current ksub's)
                         if c == n_col_tiles - 1 && ksub + 1 < k_sub {
-                            let next_k_byte = ((ksub + 1) * 32) as u16;
-                            k.ds_load_b128(frag_a[r], x_lds_reads_0[r], buf_off + next_k_byte);
-                            k.ds_load_b128(VReg(frag_a[r].0 + 4), x_lds_reads_16[r], buf_off + next_k_byte);
+                            let next_k_byte = ((ksub + 1) * 32) as i32;
+                            // Compute next ksub's X addresses: (raw + next_k_byte) XOR swizzle
+                            for r2 in 0..n_row_blocks {
+                                let ntmp = k.alloc_vreg();
+                                k.push(Op::VAddU32 {
+                                    dst: ntmp, src0: Operand::VReg(x_lds_reads_raw[r2]),
+                                    src1: Operand::InlineInt(next_k_byte),
+                                });
+                                let nxr_0 = k.alloc_vreg();
+                                k.v_xor_b32(nxr_0, Operand::VReg(ntmp), Operand::VReg(lane_swizzle));
+                                let ntmp16 = k.alloc_vreg();
+                                k.push(Op::VAddU32 {
+                                    dst: ntmp16, src0: Operand::VReg(x_lds_reads_raw[r2]),
+                                    src1: Operand::InlineInt(next_k_byte + 16),
+                                });
+                                let nxr_16 = k.alloc_vreg();
+                                k.v_xor_b32(nxr_16, Operand::VReg(ntmp16), Operand::VReg(lane_swizzle));
+                                // Note: these regs are used by next ksub's cur_x_reads
+                                // but since prefetch uses frag_a[r] as dest, they're temporary
+                                k.ds_load_b128(frag_a[r2], nxr_0, buf_off);
+                                k.ds_load_b128(VReg(frag_a[r2].0 + 4), nxr_16, buf_off);
+                            }
                         }
 
                         // ★ Interleaved GMEM→LDS store ★
@@ -1855,8 +2097,8 @@ fn emit_lds_read_and_wmma(
                     // ── Prefetch column c+2 into the buffer we just consumed ──
                     if c + 2 < n_col_tiles {
                         let next2_base: u16 = (lds_x + ((c + 2) as u32) * 16 * wt_row_stride) as u16;
-                        k.ds_load_b128(cur_fb, wt_base_0, next2_base + buf_off + k_byte_within);
-                        k.ds_load_b128(VReg(cur_fb.0 + 4), wt_base_16, next2_base + buf_off + k_byte_within);
+                        k.ds_load_b128(cur_fb, cur_wt_0, next2_base + ds_off);
+                        k.ds_load_b128(VReg(cur_fb.0 + 4), cur_wt_16, next2_base + ds_off);
                     }
 
                     // Wait for next column's B data
@@ -1892,8 +2134,8 @@ fn emit_lds_read_and_wmma(
             //   wait correctly drains reads before stores.
             for c in 0..n_col_tiles {
                 let base_off: u16 = (lds_x + (c as u32) * 16 * wt_row_stride) as u16;
-                k.ds_load_b128(frag_b[c], wt_base_0, base_off + buf_off + k_byte_within);
-                k.ds_load_b128(VReg(frag_b[c].0 + 4), wt_base_16, base_off + buf_off + k_byte_within);
+                k.ds_load_b128(frag_b[c], cur_wt_0, base_off + ds_off);
+                k.ds_load_b128(VReg(frag_b[c].0 + 4), cur_wt_16, base_off + ds_off);
             }
 
             let total_loads = (2 * n_row_blocks + 2 * n_col_tiles) as u8;
@@ -1940,13 +2182,182 @@ fn emit_lds_read_and_wmma(
 //   Row stride between consecutive registers = 2 rows = N*8 bytes
 // ────────────────────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────────────────────
+// Epilogue context — carries SGPRs for fused post-GEMM operations
+// ────────────────────────────────────────────────────────────────
+
+/// Runtime state for epilogue operations, pre-loaded from kernel arguments.
+struct EpilogueCtx {
+    ops: Vec<EpilogueOp>,
+    /// bias_ptr SReg pair (valid when EpilogueOp::BiasAdd is present)
+    bias_ptr: Option<SRegPair>,
+    /// scale SReg (valid when EpilogueOp::Scale is present)
+    scale_sreg: Option<SReg>,
+    /// clamp_min SReg (valid when EpilogueOp::Clamp is present)
+    clamp_min_sreg: Option<SReg>,
+    /// clamp_max SReg (valid when EpilogueOp::Clamp is present)
+    clamp_max_sreg: Option<SReg>,
+}
+
+/// Apply the full epilogue chain to a single f32 value in a VReg (in-place).
+///
+/// `val` — the accumulator VReg to transform
+/// `col_elem_index` — the column element index for BiasAdd (VReg)
+///
+/// Uses up to 2 temp VREGs internally. All operations are pure VALU.
+fn emit_epilogue_on_vreg(
+    k: &mut T0Kernel,
+    val: VReg,
+    col_elem_index: Option<VReg>,
+    ctx: &EpilogueCtx,
+) {
+    for op in &ctx.ops {
+        match op {
+            EpilogueOp::BiasAdd => {
+                // bias[col] — load bias value and add to acc
+                if let (Some(bias_ptr), Some(col_idx)) = (ctx.bias_ptr, col_elem_index) {
+                    let bias_addr = k.alloc_vreg_array(2, Alignment::Align2);
+                    k.v_mov_from_sgpr(bias_addr, SReg(bias_ptr.0));
+                    k.v_mov_from_sgpr(VReg(bias_addr.0 + 1), SReg(bias_ptr.0 + 1));
+                    // byte_off = col_idx * 4
+                    let byte_off = k.alloc_vreg();
+                    k.v_lshlrev_b32(byte_off, 2, col_idx);
+                    k.clear_vcc();
+                    k.v_add_co(bias_addr, bias_addr, byte_off);
+                    k.v_add_co_ci(VReg(bias_addr.0 + 1), VReg(bias_addr.0 + 1));
+                    let bias_val = k.alloc_vreg();
+                    k.global_load(bias_val, bias_addr, Width::B32, 0);
+                    k.wait_vmcnt(0);
+                    k.v_add_f32(val, val, bias_val);
+                }
+            }
+            EpilogueOp::Scale => {
+                if let Some(scale_s) = ctx.scale_sreg {
+                    let scale_v = k.alloc_vreg();
+                    k.v_mov_from_sgpr(scale_v, scale_s);
+                    k.v_mul_f32(val, val, scale_v);
+                }
+            }
+            EpilogueOp::ReLU => {
+                // max(val, 0.0) — inline constant 0x80 = 0.0
+                k.push(Op::VMaxF32 {
+                    dst: val,
+                    src0: Operand::VReg(val),
+                    src1: Operand::InlineFloat(0.0),
+                });
+            }
+            EpilogueOp::SiLU => {
+                // silu(x) = x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+                // step 1: neg_x = -x (xor with sign bit)
+                let neg_x = k.alloc_vreg();
+                k.v_xor_b32(neg_x, Operand::VReg(val), Operand::Literal(0x80000000));
+                // step 2: scale by log2(e) for v_exp_f32 (which computes 2^x)
+                let scaled = k.alloc_vreg();
+                // v_mul_f32 scaled, neg_x, log2e
+                k.push(Op::VMulF32 {
+                    dst: scaled,
+                    src0: Operand::VReg(neg_x),
+                    src1: Operand::InlineFloat(1.4426950),  // log2(e)
+                });
+                // step 3: exp2(scaled) = exp(-x)
+                let exp_neg = k.alloc_vreg();
+                k.v_exp_f32(exp_neg, scaled);
+                // step 4: 1 + exp(-x)
+                let one_plus = k.alloc_vreg();
+                k.push(Op::VAddF32 {
+                    dst: one_plus,
+                    src0: Operand::VReg(exp_neg),
+                    src1: Operand::InlineFloat(1.0),
+                });
+                // step 5: sigmoid = rcp(1 + exp(-x))
+                let sigmoid = k.alloc_vreg();
+                k.v_rcp_f32(sigmoid, one_plus);
+                // step 6: silu = x * sigmoid
+                k.v_mul_f32(val, val, sigmoid);
+            }
+            EpilogueOp::GELU => {
+                // gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                // Fast approx: use tanh(x) ≈ 1 - 2/(1+exp(2x))
+                // For now, use the simpler sigmoid approximation:
+                // gelu(x) ≈ x * sigmoid(1.702 * x)
+                let scaled_x = k.alloc_vreg();
+                k.push(Op::VMulF32 {
+                    dst: scaled_x,
+                    src0: Operand::VReg(val),
+                    src1: Operand::InlineFloat(1.702),
+                });
+                // neg(1.702*x) for sigmoid
+                let neg_sx = k.alloc_vreg();
+                k.v_xor_b32(neg_sx, Operand::VReg(scaled_x), Operand::Literal(0x80000000));
+                // log2(e) * neg_sx
+                let log2e_sx = k.alloc_vreg();
+                k.push(Op::VMulF32 {
+                    dst: log2e_sx,
+                    src0: Operand::VReg(neg_sx),
+                    src1: Operand::InlineFloat(1.4426950),
+                });
+                let exp_neg = k.alloc_vreg();
+                k.v_exp_f32(exp_neg, log2e_sx);
+                let one_plus = k.alloc_vreg();
+                k.push(Op::VAddF32 {
+                    dst: one_plus,
+                    src0: Operand::VReg(exp_neg),
+                    src1: Operand::InlineFloat(1.0),
+                });
+                let sig = k.alloc_vreg();
+                k.v_rcp_f32(sig, one_plus);
+                k.v_mul_f32(val, val, sig);
+            }
+            EpilogueOp::Abs => {
+                // |x| = x & 0x7FFFFFFF (clear sign bit)
+                k.push(Op::VAndB32 {
+                    dst: val,
+                    src0: Operand::VReg(val),
+                    src1: Operand::Literal(0x7FFFFFFF),
+                });
+            }
+            EpilogueOp::Neg => {
+                k.v_xor_b32(val, Operand::VReg(val), Operand::Literal(0x80000000));
+            }
+            EpilogueOp::Clamp => {
+                if let (Some(min_s), Some(max_s)) = (ctx.clamp_min_sreg, ctx.clamp_max_sreg) {
+                    let min_v = k.alloc_vreg();
+                    k.v_mov_from_sgpr(min_v, min_s);
+                    let max_v = k.alloc_vreg();
+                    k.v_mov_from_sgpr(max_v, max_s);
+                    k.v_max_f32(val, val, min_v);
+                    k.v_min_f32(val, val, max_v);
+                }
+            }
+        }
+    }
+}
+
 fn emit_store_phase(
     k: &mut T0Kernel,
     acc: &[VReg], s_row_bases: &[SReg], base_n_s: SReg,
     y_ptr: SRegPair, n_dim: SReg, y_offset_s: SReg,
     n_row_blocks: usize, n_col_tiles: usize,
     lane_row: VReg, lane_id: VReg,
+    epilogue: &EpilogueCtx,
 ) {
+    // ── Build Y buffer resource descriptor (4 SGPRs) ──
+    // SRD = {ptr_lo + y_offset, ptr_hi, num_records=0x7FFFFFFE, flags=0x31027000}
+    // By absorbing y_offset into the SRD base, all per-element offsets are
+    // simple 32-bit values → no 64-bit carry chains in the inner loop.
+    //
+    // Performance: buffer_store matches global_store throughput.
+    // Current best: 96.4 TF @ 4096³ with 128×128 k32 (2026-03-31, post-LDS-fix).
+    // Saves 2 VGPRs per address pair vs global_store.
+    let y_srd = k.alloc_sreg_quad();
+    // srd[0:1] = y_ptr + y_offset (u64 add in SGPRs)
+    k.push(Op::SAddU32 { dst: y_srd, src0: SReg(y_ptr.0), src1: SOperand::SReg(y_offset_s) });
+    k.push(Op::SAddcU32 { dst: SReg(y_srd.0 + 1), src0: SReg(y_ptr.0 + 1), src1: SOperand::InlineInt(0) });
+    // srd[2] = num_records (max buffer size)
+    k.push(Op::SMov { dst: SReg(y_srd.0 + 2), src: SOperand::Literal(0x7FFFFFFE) });
+    // srd[3] = buffer flags (OOB suppressed, stride=0, swizzle=none)
+    k.push(Op::SMov { dst: SReg(y_srd.0 + 3), src: SOperand::Literal(0x31027000) });
+
     // lane_half = lane_id >> 4 (0 for lanes 0-15, 1 for lanes 16-31)
     let lane_half = k.alloc_vreg();
     k.v_lshrrev_b32(lane_half, 4, lane_id);
@@ -1972,54 +2383,58 @@ fn emit_store_phase(
         k.v_mov_from_sgpr(base_row_v, s_row_bases[r]);
         k.v_add_u32(base_row_v, base_row_v, lane_half);
 
-        // y_base = Y_ptr + y_offset (compute first, BEFORE row_bytes)
-        let y_base = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_base, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_base.0 + 1), SReg(y_ptr.0 + 1));
-        {
-            let v_yoff = k.alloc_vreg();
-            k.v_mov_from_sgpr(v_yoff, y_offset_s);
-            k.clear_vcc();
-            k.v_add_co(y_base, y_base, v_yoff);
-            k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
-        }
-
-        // row_bytes = base_row * N * 4
-        // CRITICAL: compute AFTER y_base alloc to avoid regalloc overlap.
-        // Previously row_bytes was computed 15 instructions before v_add_co,
-        // causing regalloc to treat it as dead and reuse its physical register
-        // for y_base.0 → v_add_co(v94, v94, v94) = self-add → wrong address → all zeros!
+        // row_bytes = base_row * N * 4 (byte offset from matrix start)
         let row_bytes = k.alloc_vreg();
         k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
         k.v_lshlrev_b32(row_bytes, 2, row_bytes);
 
-        // y_base += row_bytes + col_bytes
-        k.clear_vcc();
-        k.v_add_co(y_base, y_base, row_bytes);
-        k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
-        k.v_add_u32(y_base, y_base, col_bytes);
+        // voffset_base = row_bytes + col_bytes (single 32-bit VGPR!)
+        let voffset_base = k.alloc_vreg();
+        k.v_add_u32(voffset_base, row_bytes, col_bytes);
 
         for c in 0..n_col_tiles {
-            // y_addr = y_base + c*64 (16 cols × 4 bytes per col tile)
-            let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-            k.v_mov(y_addr, y_base);
-            k.v_mov(VReg(y_addr.0 + 1), VReg(y_base.0 + 1));
+            // voff = voffset_base + c*64 (16 cols × 4 bytes per col tile)
+            let voff = k.alloc_vreg();
+            k.v_mov(voff, voffset_base);
             if c > 0 {
                 k.push(Op::VAddU32 {
-                    dst: y_addr, src0: Operand::VReg(y_addr),
+                    dst: voff, src0: Operand::VReg(voff),
                     src1: Operand::InlineInt((c * 64) as i32),
                 });
             }
 
+            // Compute column element index for BiasAdd:
+            // col_elem = base_n + lane_row + c*16
+            let col_elem_idx = if !epilogue.ops.is_empty() {
+                let col_idx = k.alloc_vreg();
+                k.v_mov(col_idx, col_base_v);
+                if c > 0 {
+                    k.push(Op::VAddU32 {
+                        dst: col_idx, src0: Operand::VReg(col_idx),
+                        src1: Operand::InlineInt((c * 16) as i32),
+                    });
+                }
+                Some(col_idx)
+            } else {
+                None
+            };
+
             let a_idx = r * n_col_tiles + c;
             // Store 8 registers: each acc[v] → row offset v*2 from base
             for v in 0..8u32 {
-                k.global_store(y_addr, VReg(acc[a_idx].0 + v), Width::B32, 0);
+                let acc_vreg = VReg(acc[a_idx].0 + v);
+
+                // Apply epilogue chain before store (zero extra GMEM bandwidth)
+                if !epilogue.ops.is_empty() {
+                    emit_epilogue_on_vreg(k, acc_vreg, col_elem_idx, epilogue);
+                }
+
+                // buffer_store_b32: SRD base already includes y_offset
+                k.buffer_store(voff, acc_vreg, y_srd, Width::B32, 0);
                 if v < 7 {
                     // Advance by row_stride = N * 8 bytes (2 rows)
-                    k.clear_vcc();
-                    k.v_add_co(y_addr, y_addr, row_stride);
-                    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+                    // Just v_add_u32 — no 64-bit carry chain needed!
+                    k.v_add_u32(voff, voff, row_stride);
                 }
             }
         }
@@ -2302,7 +2717,15 @@ fn emit_store_phase_swap(
     lane_row: VReg, lane_id: VReg,
     swap_addr: VReg,
     swap_temp: VReg,        // 8-VGPR temp for acc swap
+    epilogue: &EpilogueCtx,
 ) {
+    // ── Build Y buffer resource descriptor (same as emit_store_phase) ──
+    let y_srd = k.alloc_sreg_quad();
+    k.push(Op::SAddU32 { dst: y_srd, src0: SReg(y_ptr.0), src1: SOperand::SReg(y_offset_s) });
+    k.push(Op::SAddcU32 { dst: SReg(y_srd.0 + 1), src0: SReg(y_ptr.0 + 1), src1: SOperand::InlineInt(0) });
+    k.push(Op::SMov { dst: SReg(y_srd.0 + 2), src: SOperand::Literal(0x7FFFFFFE) });
+    k.push(Op::SMov { dst: SReg(y_srd.0 + 3), src: SOperand::Literal(0x31027000) });
+
     // lane_half = lane_id >> 4 (0 for lanes 0-15, 1 for lanes 16-31)
     let lane_half = k.alloc_vreg();
     k.v_lshrrev_b32(lane_half, 4, lane_id);
@@ -2332,47 +2755,55 @@ fn emit_store_phase_swap(
         k.v_mov_from_sgpr(base_row_v, s_row_bases[r]);
         k.v_add_u32(base_row_v, base_row_v, lane_half);
 
-        // y_base = Y_ptr + y_offset
-        let y_base = k.alloc_vreg_array(2, Alignment::Align2);
-        k.v_mov_from_sgpr(y_base, SReg(y_ptr.0));
-        k.v_mov_from_sgpr(VReg(y_base.0 + 1), SReg(y_ptr.0 + 1));
-        {
-            let v_yoff = k.alloc_vreg();
-            k.v_mov_from_sgpr(v_yoff, y_offset_s);
-            k.clear_vcc();
-            k.v_add_co(y_base, y_base, v_yoff);
-            k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
-        }
-
-        // row_bytes = base_row * N * 4
+        // row_bytes = base_row * N * 4 (byte offset from matrix start)
         let row_bytes = k.alloc_vreg();
         k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
         k.v_lshlrev_b32(row_bytes, 2, row_bytes);
 
-        // y_base += row_bytes + col_bytes
-        k.clear_vcc();
-        k.v_add_co(y_base, y_base, row_bytes);
-        k.v_add_co_ci(VReg(y_base.0 + 1), VReg(y_base.0 + 1));
-        k.v_add_u32(y_base, y_base, col_bytes);
+        // voffset_base = row_bytes + col_bytes (single 32-bit VGPR!)
+        let voffset_base = k.alloc_vreg();
+        k.v_add_u32(voffset_base, row_bytes, col_bytes);
 
         for c in 0..n_col_tiles {
-            let y_addr = k.alloc_vreg_array(2, Alignment::Align2);
-            k.v_mov(y_addr, y_base);
-            k.v_mov(VReg(y_addr.0 + 1), VReg(y_base.0 + 1));
+            // voff = voffset_base + c*64 (16 cols × 4 bytes per col tile)
+            let voff = k.alloc_vreg();
+            k.v_mov(voff, voffset_base);
             if c > 0 {
                 k.push(Op::VAddU32 {
-                    dst: y_addr, src0: Operand::VReg(y_addr),
+                    dst: voff, src0: Operand::VReg(voff),
                     src1: Operand::InlineInt((c * 64) as i32),
                 });
             }
 
+            // Compute column element index for epilogue (BiasAdd, etc.)
+            let col_elem_idx = if !epilogue.ops.is_empty() {
+                let col_idx = k.alloc_vreg();
+                k.v_mov(col_idx, col_base_v);
+                if c > 0 {
+                    k.push(Op::VAddU32 {
+                        dst: col_idx, src0: Operand::VReg(col_idx),
+                        src1: Operand::InlineInt((c * 16) as i32),
+                    });
+                }
+                Some(col_idx)
+            } else {
+                None
+            };
+
             // acc index: single row_block, so just 'c'
             for v in 0..8u32 {
-                k.global_store(y_addr, VReg(acc[c].0 + v), Width::B32, 0);
+                let acc_vreg = VReg(acc[c].0 + v);
+
+                // Apply epilogue chain before store (zero extra GMEM bandwidth)
+                if !epilogue.ops.is_empty() {
+                    emit_epilogue_on_vreg(k, acc_vreg, col_elem_idx, epilogue);
+                }
+
+                // buffer_store_b32: SRD base includes y_offset
+                k.buffer_store(voff, acc_vreg, y_srd, Width::B32, 0);
                 if v < 7 {
-                    k.clear_vcc();
-                    k.v_add_co(y_addr, y_addr, row_stride);
-                    k.v_add_co_ci(VReg(y_addr.0 + 1), VReg(y_addr.0 + 1));
+                    // Advance by row_stride = N * 8 bytes (2 rows)
+                    k.v_add_u32(voff, voff, row_stride);
                 }
             }
         }
@@ -3613,6 +4044,107 @@ mod gpu_tests {
         });
     }
 
+    /// Full-spectrum autotuner: benchmark ALL tile configs at multiple sizes.
+    /// Produces the data needed to update tile_auto_select().
+    /// Run: cargo test --release --lib --features rocm -- test_full_spectrum_autotuner --nocapture --ignored --test-threads=1
+    #[test]
+    #[ignore]
+    fn test_full_spectrum_autotuner() {
+        use std::time::Instant;
+
+        with_rt(|rt| {
+            let sizes: Vec<(u32, u32, u32)> = vec![
+                (256, 256, 256),
+                (512, 512, 512),
+                (1024, 1024, 1024),
+                (2048, 2048, 2048),
+                (4096, 4096, 4096),
+                // Non-square
+                (256, 4096, 1024),
+                (512, 4096, 1024),
+                (1024, 4096, 4096),
+            ];
+            let warmup = 5u32;
+            let iters = 20u32;
+
+            eprintln!("\n╔══════════════════════════════════════════════════════════════════════════╗");
+            eprintln!("║  Full-Spectrum Autotuner — RX 7900 XTX (GFX1100)                       ║");
+            eprintln!("║  All tile configs × all sizes, BF16 WMMA GEMM                          ║");
+            eprintln!("╚══════════════════════════════════════════════════════════════════════════╝\n");
+
+            // All tile configs to test (split_k=1 for fair comparison)
+            let make_configs = || -> Vec<(&str, TileGemm)> {
+                vec![
+                    ("64×64 k16",        TileGemm::tile_64x64_k16()),
+                    ("64×64 k32",        TileGemm::tile_64x64_k32()),
+                    ("64×64 k64",        TileGemm::tile_64x64_k64()),
+                    ("128×64 k16",       TileGemm::tile_128x64_k16()),
+                    ("64×128 k16",       TileGemm::tile_64x128_k16()),
+                    ("64×128 k32",       TileGemm::tile_64x128_k32()),
+                    ("128×128 k16",      TileGemm::tile_128x128_k16()),
+                    ("128×128 k32",      TileGemm::tile_128x128_k32()),
+                    ("128×128 k64",      TileGemm::tile_128x128_k64()),
+                    ("128×128 k16 swap", TileGemm::tile_128x128_k16_swap()),
+                    ("128×128 k32 swap", TileGemm::tile_128x128_k32_swap()),
+                    ("256×64 k32 WGP",   TileGemm::tile_256x64_k32_wgp()),
+                ]
+            };
+
+            for &(m, k, n) in &sizes {
+                let flops = 2.0 * m as f64 * k as f64 * n as f64;
+                eprintln!("\n── {}×{}×{} ({:.1} GFLOP) ──",
+                    m, k, n, flops / 1e9);
+
+                let x_bf16: Vec<u16> = (0..(m*k) as usize).map(|i| f32_to_bf16(((i % 17) as f32 - 8.0) * 0.01)).collect();
+                let wt_bf16: Vec<u16> = (0..(n*k) as usize).map(|i| f32_to_bf16(((i % 13) as f32 - 6.0) * 0.01)).collect();
+                let x_buf = upload_bf16(rt, &x_bf16);
+                let wt_buf = upload_bf16(rt, &wt_bf16);
+
+                let mut best_tf = 0.0f64;
+                let mut best_name = "";
+
+                for (label, spec) in make_configs() {
+                    // Skip invalid combos
+                    if k % spec.tile_k != 0 { continue; }
+                    if m < spec.tile_m || n < spec.tile_n { continue; }
+
+                    let y_buf = rt.alloc_zero((m * n * 4) as usize).expect("alloc Y");
+                    let kname = format!("autotune_{}_{}", spec.name(), m);
+                    let kernel = match rt.ensure_kernel_t0(
+                        &kname, || lower_gemm(&spec),
+                        [spec.wg_size(), 1, 1], spec.lds_total(),
+                    ) {
+                        Ok(k) => k,
+                        Err(e) => { eprintln!("  {:<22} FAIL: {}", label, e); continue; }
+                    };
+                    let ka = build_kernargs_m(
+                        x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                        k, n, m, &spec,
+                    );
+                    let grid = compute_grid(&spec, m, n);
+
+                    for _ in 0..warmup {
+                        let _ = rt.dispatch(&kernel, grid, &ka);
+                    }
+
+                    let t0 = Instant::now();
+                    for _ in 0..iters {
+                        rt.dispatch_async(&kernel, grid, &ka);
+                    }
+                    rt.wait_idle();
+                    let us = t0.elapsed().as_micros() as f64 / iters as f64;
+                    let tf = if us > 0.0 { flops / (us * 1e6) } else { 0.0 };
+
+                    let marker = if tf > best_tf { best_tf = tf; best_name = label; " ★" } else { "" };
+                    eprintln!("  {:<22} {:>8.1} μs  {:>6.1} TF  grid=({},{},{}){}",
+                        label, us, tf, grid[0], grid[1], grid[2], marker);
+                    rt.recycle(y_buf);
+                }
+                eprintln!("  → BEST: {:<22} {:.1} TFLOPS", best_name, best_tf);
+            }
+        });
+    }
+
     /// Multi-dispatch stress test: same kernel dispatched 5 times
     #[test]
     fn test_tile_ir_multi_dispatch() {
@@ -4357,4 +4889,378 @@ mod gpu_tests {
             }
         });
     }
+
+    // ── Epilogue Fusion Tests ──
+
+    #[test]
+    fn test_epilogue_relu_compiles() {
+        let spec = TileGemm::tile_64x64_k16()
+            .with_epilogue(vec![EpilogueOp::ReLU]);
+        assert!(spec.name().contains("_relu"));
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ GEMM+ReLU: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_epilogue_silu_compiles() {
+        let spec = TileGemm::tile_64x64_k16()
+            .with_epilogue(vec![EpilogueOp::SiLU]);
+        assert!(spec.name().contains("_silu"));
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ GEMM+SiLU: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_epilogue_gelu_compiles() {
+        let spec = TileGemm::tile_64x64_k16()
+            .with_epilogue(vec![EpilogueOp::GELU]);
+        assert!(spec.name().contains("_gelu"));
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ GEMM+GELU: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_epilogue_bias_relu_chain_compiles() {
+        let spec = TileGemm::tile_64x64_k16()
+            .with_epilogue(vec![EpilogueOp::BiasAdd, EpilogueOp::ReLU]);
+        assert!(spec.name().contains("_bias_relu"));
+        assert!(spec.has_epilogue_bias());
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        // kernel should have extra bias_ptr argument
+        let args = kernel.args();
+        let has_bias_arg = args.iter().any(|a| a.name == "bias");
+        assert!(has_bias_arg, "kernel should have 'bias' argument");
+        eprintln!("✓ GEMM+Bias+ReLU: {} bytes ELF, {} args", elf.len(), args.len());
+    }
+
+    #[test]
+    fn test_epilogue_scale_compiles() {
+        let spec = TileGemm::tile_64x64_k16()
+            .with_epilogue(vec![EpilogueOp::Scale]);
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        let args = kernel.args();
+        let has_scale_arg = args.iter().any(|a| a.name == "epi_scale");
+        assert!(has_scale_arg, "kernel should have 'epi_scale' argument");
+        eprintln!("✓ GEMM+Scale: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_epilogue_no_regression_plain_gemm() {
+        // Ensure plain GEMM (empty epilogue) still works
+        let spec = TileGemm::tile_64x64_k16();
+        assert!(spec.epilogue.is_empty());
+        assert!(!spec.name().contains("_relu"));
+        let kernel = lower_gemm(&spec);
+        let elf = kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ Plain GEMM (no epilogue): {} bytes ELF", elf.len());
+    }
+
+    // ── Epilogue Fusion GPU E2E Tests ──
+
+    #[test]
+    fn test_epilogue_relu_gpu_e2e() {
+        with_rt(|rt| {
+            let m = 64usize;
+            let k = 64usize;
+            let n = 64usize;
+            let spec = TileGemm::tile_64x64_k16()
+                .with_epilogue(vec![EpilogueOp::ReLU]);
+
+            // Test data: mix of positive and negative values
+            // After GEMM, some outputs will be negative → ReLU should zero them
+            let x_f32: Vec<f32> = (0..m*k).map(|i| ((i % 17) as f32 - 8.0) * 0.02).collect();
+            let wt_f32: Vec<f32> = (0..n*k).map(|i| ((i % 13) as f32 - 6.0) * 0.02).collect();
+            let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+            let wt_bf16: Vec<u16> = wt_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            // CPU reference: GEMM + ReLU
+            let gemm_out = cpu_gemm_nt_bf16(&x_bf16, &wt_bf16, m, k, n);
+            let expected: Vec<f32> = gemm_out.iter().map(|&v| v.max(0.0)).collect();
+
+            // Count how many negatives are in raw GEMM output (they should be zeroed by ReLU)
+            let n_neg = gemm_out.iter().filter(|&&v| v < 0.0).count();
+            eprintln!("[GEMM+ReLU] {} of {} elements are negative → should be zeroed", n_neg, m*n);
+
+            // Upload
+            let x_buf = upload_bf16(rt, &x_bf16);
+            let wt_buf = upload_bf16(rt, &wt_bf16);
+            let y_buf = rt.alloc_zero(m * n * 4).expect("alloc Y");
+
+            // Compile GEMM+ReLU kernel
+            let kernel = rt.ensure_kernel_t0(
+                &spec.name(),
+                || lower_gemm(&spec),
+                [spec.wg_size(), 1, 1],
+                spec.lds_total(),
+            ).expect("compile GEMM+ReLU");
+
+            // Dispatch (ReLU doesn't need extra kernargs)
+            let ka = build_kernargs_m(
+                x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                k as u32, n as u32, m as u32, &spec,
+            );
+            let grid = compute_grid(&spec, m as u32, n as u32);
+            rt.dispatch(&kernel, grid, &ka).expect("dispatch GEMM+ReLU");
+
+            // Verify
+            let result = rt.read_f32(&y_buf, m * n);
+            let mut max_err = 0.0f32;
+            let mut n_bad = 0;
+            let mut n_correctly_relu = 0;
+            for i in 0..m*n {
+                let err = (result[i] - expected[i]).abs();
+                if err > max_err { max_err = err; }
+                if err > 0.1 { n_bad += 1; }
+                // ReLU check: negative GEMM outputs should become 0 or very close to 0
+                if gemm_out[i] < -0.001 && result[i] < 0.001 { n_correctly_relu += 1; }
+            }
+            // Count significant negatives (not near-zero)
+            let n_significant_neg = gemm_out.iter().filter(|&&v| v < -0.001).count();
+
+            eprintln!("[GEMM+ReLU GPU] max_err={:.6} n_bad={}/{}", max_err, n_bad, m*n);
+            eprintln!("  correctly ReLU'd: {}/{} significant negatives", n_correctly_relu, n_significant_neg);
+            eprintln!("  result[0..8] = {:?}", &result[0..8]);
+            eprintln!("  expected[0..8] = {:?}", &expected[0..8]);
+
+            // All significantly negative GEMM outputs should be zeroed by ReLU
+            assert_eq!(n_correctly_relu, n_significant_neg,
+                "ReLU: {}/{} significant negatives zeroed (expected all)", n_correctly_relu, n_significant_neg);
+            assert!(n_bad == 0,
+                "GEMM+ReLU: {} of {} elements differ >0.1 (max_err={:.6})",
+                n_bad, m*n, max_err);
+            eprintln!("[PASS] GEMM+ReLU GPU E2E: {}x{}x{} verified (max_err={:.6})",
+                m, k, n, max_err);
+        });
+    }
+
+    #[test]
+    fn test_epilogue_silu_gpu_e2e() {
+        with_rt(|rt| {
+            let m = 64usize;
+            let k = 64usize;
+            let n = 64usize;
+            let spec = TileGemm::tile_64x64_k16()
+                .with_epilogue(vec![EpilogueOp::SiLU]);
+
+            let x_f32: Vec<f32> = (0..m*k).map(|i| ((i % 17) as f32 - 8.0) * 0.02).collect();
+            let wt_f32: Vec<f32> = (0..n*k).map(|i| ((i % 13) as f32 - 6.0) * 0.02).collect();
+            let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+            let wt_bf16: Vec<u16> = wt_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            // CPU reference: GEMM + SiLU
+            let gemm_out = cpu_gemm_nt_bf16(&x_bf16, &wt_bf16, m, k, n);
+            let expected: Vec<f32> = gemm_out.iter().map(|&x| {
+                let sigmoid = 1.0 / (1.0 + (-x).exp());
+                x * sigmoid
+            }).collect();
+
+            let x_buf = upload_bf16(rt, &x_bf16);
+            let wt_buf = upload_bf16(rt, &wt_bf16);
+            let y_buf = rt.alloc_zero(m * n * 4).expect("alloc Y");
+
+            let kernel = rt.ensure_kernel_t0(
+                &spec.name(),
+                || lower_gemm(&spec),
+                [spec.wg_size(), 1, 1],
+                spec.lds_total(),
+            ).expect("compile GEMM+SiLU");
+
+            let ka = build_kernargs_m(
+                x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                k as u32, n as u32, m as u32, &spec,
+            );
+            let grid = compute_grid(&spec, m as u32, n as u32);
+            rt.dispatch(&kernel, grid, &ka).expect("dispatch GEMM+SiLU");
+
+            let result = rt.read_f32(&y_buf, m * n);
+            let mut max_err = 0.0f32;
+            let mut max_rel = 0.0f32;
+            let mut n_bad = 0;
+            for i in 0..m*n {
+                let err = (result[i] - expected[i]).abs();
+                let rel = if expected[i].abs() > 1e-6 { err / expected[i].abs() } else { err };
+                if err > max_err { max_err = err; }
+                if rel > max_rel { max_rel = rel; }
+                if err > 0.1 { n_bad += 1; }
+            }
+
+            eprintln!("[GEMM+SiLU GPU] max_abs_err={:.6} max_rel_err={:.6} n_bad={}/{}",
+                max_err, max_rel, n_bad, m*n);
+            eprintln!("  result[0..4]   = {:?}", &result[0..4]);
+            eprintln!("  expected[0..4] = {:?}", &expected[0..4]);
+
+            // SiLU uses v_exp_f32 + v_rcp_f32 which have limited precision
+            // Allow up to 5% relative error for transcendental approximation
+            assert!(n_bad == 0,
+                "GEMM+SiLU: {} of {} elements differ >0.1", n_bad, m*n);
+            eprintln!("[PASS] GEMM+SiLU GPU E2E: {}x{}x{} verified (max_err={:.6})",
+                m, k, n, max_err);
+        });
+    }
+
+    #[test]
+    fn test_epilogue_abs_gpu_e2e() {
+        with_rt(|rt| {
+            let m = 64usize;
+            let k = 64usize;
+            let n = 64usize;
+            let spec = TileGemm::tile_64x64_k16()
+                .with_epilogue(vec![EpilogueOp::Abs]);
+
+            let x_f32: Vec<f32> = (0..m*k).map(|i| ((i % 17) as f32 - 8.0) * 0.02).collect();
+            let wt_f32: Vec<f32> = (0..n*k).map(|i| ((i % 13) as f32 - 6.0) * 0.02).collect();
+            let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+            let wt_bf16: Vec<u16> = wt_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let gemm_out = cpu_gemm_nt_bf16(&x_bf16, &wt_bf16, m, k, n);
+            let expected: Vec<f32> = gemm_out.iter().map(|&v| v.abs()).collect();
+
+            let x_buf = upload_bf16(rt, &x_bf16);
+            let wt_buf = upload_bf16(rt, &wt_bf16);
+            let y_buf = rt.alloc_zero(m * n * 4).expect("alloc Y");
+
+            let kernel = rt.ensure_kernel_t0(
+                &spec.name(),
+                || lower_gemm(&spec),
+                [spec.wg_size(), 1, 1],
+                spec.lds_total(),
+            ).expect("compile GEMM+Abs");
+
+            let ka = build_kernargs_m(
+                x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                k as u32, n as u32, m as u32, &spec,
+            );
+            let grid = compute_grid(&spec, m as u32, n as u32);
+            rt.dispatch(&kernel, grid, &ka).expect("dispatch GEMM+Abs");
+
+            let result = rt.read_f32(&y_buf, m * n);
+            let mut max_err = 0.0f32;
+            for i in 0..m*n {
+                let err = (result[i] - expected[i]).abs();
+                if err > max_err { max_err = err; }
+                // All results should be non-negative
+                assert!(result[i] >= 0.0, "Abs: result[{}]={} is negative!", i, result[i]);
+            }
+
+            eprintln!("[PASS] GEMM+Abs GPU E2E: {}x{}x{} verified (max_err={:.6})",
+                m, k, n, max_err);
+        });
+    }
+
+    /// Benchmark: fused GEMM+ReLU vs separate GEMM then separate ReLU
+    #[test]
+    fn test_epilogue_fusion_benchmark() {
+        with_rt(|rt| {
+            let m = 4096usize;
+            let k = 4096usize;
+            let n = 4096usize;
+
+            // Generate data
+            let x_f32: Vec<f32> = (0..m*k).map(|i| ((i % 37) as f32 - 18.0) * 0.001).collect();
+            let wt_f32: Vec<f32> = (0..n*k).map(|i| ((i % 31) as f32 - 15.0) * 0.001).collect();
+            let x_bf16: Vec<u16> = x_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+            let wt_bf16: Vec<u16> = wt_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let x_buf = upload_bf16(rt, &x_bf16);
+            let wt_buf = upload_bf16(rt, &wt_bf16);
+            // Large Y buffer: split-K configs may need up to 8 planes
+            let y_buf = rt.alloc_zero(m * n * 4 * 8).expect("alloc Y");
+
+            // Use known-best config at 4096³ (128x128_k32 = 96.4 TF, 2026-03-31)
+            // Previous 103.7 TF was based on buggy LDS reads (k>16 carry corruption).
+            // Do NOT use tile_auto_select which may pick split_k=8 — misleading numbers.
+            let mut spec_plain = TileGemm::tile_128x128_k32();
+            spec_plain.split_k = 1; // no split-K for fair comparison
+
+            let mut spec_fused = TileGemm::tile_128x128_k32()
+                .with_epilogue(vec![EpilogueOp::ReLU]);
+            spec_fused.split_k = 1;
+
+            // ── Compile both ──
+            let kernel_plain = rt.ensure_kernel_t0(
+                &spec_plain.name(),
+                || lower_gemm(&spec_plain),
+                [spec_plain.wg_size(), 1, 1],
+                spec_plain.lds_total(),
+            ).expect("compile plain GEMM");
+
+            let kernel_fused = rt.ensure_kernel_t0(
+                &spec_fused.name(),
+                || lower_gemm(&spec_fused),
+                [spec_fused.wg_size(), 1, 1],
+                spec_fused.lds_total(),
+            ).expect("compile fused GEMM+ReLU");
+
+            let ka_plain = build_kernargs_m(
+                x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                k as u32, n as u32, m as u32, &spec_plain,
+            );
+            let ka_fused = build_kernargs_m(
+                x_buf.gpu_addr(), wt_buf.gpu_addr(), y_buf.gpu_addr(),
+                k as u32, n as u32, m as u32, &spec_fused,
+            );
+            let grid_plain = compute_grid(&spec_plain, m as u32, n as u32);
+            let grid_fused = compute_grid(&spec_fused, m as u32, n as u32);
+
+            let n_iters = 20;
+
+            // ── Warmup (10 sync dispatches for GPU clock ramp) ──
+            for _ in 0..10 {
+                rt.dispatch(&kernel_plain, grid_plain, &ka_plain).expect("warmup plain");
+            }
+            for _ in 0..10 {
+                rt.dispatch(&kernel_fused, grid_fused, &ka_fused).expect("warmup fused");
+            }
+
+            // ── Timed: Plain GEMM (async batch matching autotuner methodology) ──
+            let t0 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                rt.dispatch_async(&kernel_plain, grid_plain, &ka_plain);
+            }
+            rt.wait_idle().expect("wait plain");
+            let plain_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+            // ── Timed: Fused GEMM+ReLU ──
+            let t1 = std::time::Instant::now();
+            for _ in 0..n_iters {
+                rt.dispatch_async(&kernel_fused, grid_fused, &ka_fused);
+            }
+            rt.wait_idle().expect("wait fused");
+            let fused_us = t1.elapsed().as_micros() as f64 / n_iters as f64;
+
+            // Compute TFLOPS
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let fused_tflops = flops / (fused_us * 1e6);
+            let plain_tflops = flops / (plain_us * 1e6);
+
+            eprintln!("\n═══════════════════════════════════════════════════════════");
+            eprintln!("  Epilogue Fusion Benchmark: {}×{}×{}", m, k, n);
+            eprintln!("  Config: {} (no split-K)", spec_plain.name());
+            eprintln!("═══════════════════════════════════════════════════════════");
+            eprintln!("  Plain GEMM:       {:.1} µs → {:.1} TFLOPS",
+                plain_us, plain_tflops);
+            eprintln!("  Fused GEMM+ReLU:  {:.1} µs → {:.1} TFLOPS",
+                fused_us, fused_tflops);
+            let overhead_pct = (fused_us / plain_us - 1.0) * 100.0;
+            if overhead_pct > 0.0 {
+                eprintln!("  Overhead:         +{:.1}%", overhead_pct);
+            } else {
+                eprintln!("  Speedup:          {:.1}% faster", -overhead_pct);
+            }
+            eprintln!("  (ReLU fused at zero VRAM bandwidth cost)");
+            eprintln!("═══════════════════════════════════════════════════════════\n");
+        });
+    }
 }
+

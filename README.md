@@ -24,9 +24,9 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 ## 🏆 性能亮点 / Performance Highlights
 
 > 🏆 **超越 rocBLAS / Surpasses rocBLAS** — T0 在大矩阵上**全面超越** AMD 官方 rocBLAS 库：
-> - **4096³: 103.7 TF vs rocBLAS 91.1 TF** (+14%)
-> - **2048³: 94.2 TF vs rocBLAS 71.2 TF** (+32%)
-> - **8192³: 116.8 TF** (rocBLAS 未测)
+> - **4096³: 96.4 TF vs rocBLAS 91.1 TF** (+6%)
+> - **2048³: 83.2 TF vs rocBLAS 71.2 TF** (+17%)
+> - **8192³: 114.1 TF** (rocBLAS 未测)
 >
 > 纯 Rust JIT 编译器，运行时自动生成最优 GEMM 内核。不依赖预编译穷举，不依赖任何外部库。
 > Pure Rust JIT compiler generating optimal GEMM kernels at runtime. No pre-compiled kernel libraries, no external dependencies.
@@ -204,15 +204,15 @@ BF16 GEMM on RX 7900 XTX, same machine, same session:
 
 | 矩阵 M×N×K | rocBLAS (TF) | Triton-AT (TF) | **T0 (TF)** | T0 Config | T0 vs rocBLAS |
 |---|:---:|:---:|:---:|---|:---:|
-| 256³ | 3.4 | 2.3 | 2.6 | 64×64 k64 | 77% |
-| 512³ | 14.3 | 17.3 | 15.0 | 64×64 k64 | 105% ✅ |
-| 1024³ | 51.5 | 55.4 | 51.9 | 64×64 k64 | 101% ✅ |
-| **2048³** | **71.2** | 78.7 | **94.2** | 64×64 k64 | **132%** 🔥 |
-| **4096³** | **91.1** | 88.2 | **103.7** | 64×128 k32 | **114%** 🔥 |
-| **8192³** | — | — | **116.8** | 128×128 k64 | — |
+| 256³ | 3.4 | 2.3 | 2.4 | 64×64 k64 | 71% |
+| 512³ | 14.3 | 17.3 | 14.2 | 64×64 k64 | 99% |
+| 1024³ | 51.5 | 55.4 | 47.1 | 64×64 k64 | 91% |
+| **2048³** | **71.2** | 78.7 | **83.2** | 128×64 k32 | **117%** 🔥 |
+| **4096³** | **91.1** | 88.2 | **96.4** | 128×128 k32 | **106%** 🔥 |
+| **8192³** | — | — | **114.1** | 128×128 k32 | — |
 
-> 🏆 **大矩阵全面超越** — T0 在 2048³ 超越 rocBLAS 32%，4096³ 超越 14%。
-> 🏆 **Surpasses rocBLAS on large matrices** — T0 beats rocBLAS by 32% at 2048³, 14% at 4096³.
+> 🏆 **大矩阵全面超越** — T0 在 2048³ 超越 rocBLAS 17%，4096³ 超越 6%。
+> 🏆 **Surpasses rocBLAS on large matrices** — T0 beats rocBLAS by 17% at 2048³, 6% at 4096³.
 >
 > ⚡ **JIT vs 预编译** — rocBLAS 使用 Tensile 离线穷举 1000+ 预编译变体（耗时数天），T0 在运行时 ~1 秒内自动生成最优内核。
 > ⚡ **JIT vs pre-compiled** — rocBLAS uses Tensile to pre-generate 1000+ kernel variants offline; T0 JIT-compiles optimal kernels in ~1 second at runtime.
@@ -231,6 +231,7 @@ BF16 GEMM on RX 7900 XTX, same machine, same session:
 | 2026-03-30 | TileIR v2 (Phase 3) | 87.1 | Concurrent VMEM overlap |
 | **2026-03-31** | **TileIR v3 (Autotuner)** | **103.7** | **Data-driven auto-select + spill filter + WGP fix** |
 | **2026-03-31** | **TileIR v3 (8192³)** | **116.8** | **128×128 k64, 70.8% of peak** |
+| **2026-03-31** | **TileIR v4 (LDS Fix)** | **96.4** | **LDS XOR swizzle correctness fix (k>16)** |
 
 ### 优化技术 / Optimization Techniques
 
@@ -340,10 +341,10 @@ cargo test --release --features rocm -- test_tune_tile_ir_4096 \
   --nocapture --ignored --test-threads=1
 
 # 输出示例 / Expected output:
-#   [tile_tune]   tile_gemm_128x128_k64_db → 102.1 TF
-#   [tile_tune]   tile_gemm_64x128_k32_db  → 103.4 TF
-#   [tile_tune]   tile_gemm_64x64_k64_db   → 101.2 TF
-#   [tile_tune] ✓ Best: tile_gemm_64x128_k32_db (103.4 TF)
+#   [tile_tune]   tile_gemm_128x128_k32_db → 96.4 TF
+#   [tile_tune]   tile_gemm_64x128_k32_db  → 94.9 TF
+#   [tile_tune]   tile_gemm_64x64_k64_db   → 91.5 TF
+#   [tile_tune] ✓ Best: tile_gemm_128x128_k32_db (96.4 TF)
 ```
 
 ```bash

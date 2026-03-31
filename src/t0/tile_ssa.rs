@@ -1697,6 +1697,570 @@ impl TileFunc {
 }
 
 // ============================================================================
+// ElemChain — Fused Elementwise Chain Builder
+// ============================================================================
+//
+// High-level API for constructing fused multi-op elementwise kernels.
+// Generates a TileFunc SSA program: Load inputs → apply op chain → Store output.
+//
+// Usage:
+//   let func = ElemChain::new("swiglu")
+//       .input("gate")       // slot 0
+//       .input("up")         // slot 1
+//       .output("out")
+//       .silu(0)             // acc = silu(gate[i])
+//       .mul_input(1)        // acc *= up[i]
+//       .build(256);         // wg_size=256 → TileFunc
+//
+//   let lowered = lower_elementwise_1d(&func, 256, 1)?;
+
+/// A step in the elementwise chain.
+/// Each step operates on the accumulator value and optionally reads from input slots.
+#[derive(Clone, Debug)]
+pub enum ElemStep {
+    // ── Unary (operate on accumulator) ──
+    Relu,
+    Silu,
+    Sigmoid,
+    Neg,
+    Abs,
+    Exp,
+    Log,
+    Sqrt,
+    Rcp,
+    Rsqrt,
+    Square,            // acc = acc * acc
+
+    // ── Binary with input slot ──
+    AddInput(usize),   // acc += input[slot]
+    MulInput(usize),   // acc *= input[slot]
+    SubInput(usize),   // acc -= input[slot]
+
+    // ── Binary with scalar ──
+    Scale(String),     // acc *= scalar (by name)
+    AddConst(String),  // acc += scalar (by name)
+
+    // ── FMA ──
+    /// acc = acc * scalar + input[slot]
+    Fma(String, usize),
+
+    // ── Clamp ──
+    /// acc = min(acc, scalar)
+    MinScalar(String),
+    /// acc = max(acc, scalar)
+    MaxScalar(String),
+
+    // ── Load-as-accumulator ──
+    /// Set acc = input[slot] (first op or override acc)
+    LoadInput(usize),
+}
+
+/// Builder for constructing fused elementwise chain kernels.
+///
+/// Generates a single TileFunc that:
+/// 1. Computes per-thread indices with bounds checking
+/// 2. Loads all needed inputs once
+/// 3. Applies the op chain in sequence
+/// 4. Stores the result once
+///
+/// This replaces N separate kernel dispatches with 1 fused dispatch,
+/// eliminating N-1 intermediate VRAM round-trips.
+pub struct ElemChain {
+    name: String,
+    inputs: Vec<String>,
+    output: Option<String>,
+    scalars: Vec<String>,
+    steps: Vec<ElemStep>,
+    /// If true, output overwrites input[0] (no output ptr arg)
+    inplace: bool,
+}
+
+impl ElemChain {
+    /// Create a new elementwise chain builder with the given kernel name.
+    pub fn new(name: &str) -> Self {
+        ElemChain {
+            name: name.to_string(),
+            inputs: Vec::new(),
+            output: None,
+            scalars: Vec::new(),
+            steps: Vec::new(),
+            inplace: false,
+        }
+    }
+
+    /// Declare an input pointer (returns self for chaining).
+    /// Input slots are numbered 0, 1, 2, ... in declaration order.
+    pub fn input(mut self, name: &str) -> Self {
+        self.inputs.push(name.to_string());
+        self
+    }
+
+    /// Declare the output pointer.
+    pub fn output(mut self, name: &str) -> Self {
+        self.output = Some(name.to_string());
+        self
+    }
+
+    /// Declare a scalar parameter (f32).
+    /// Scalars are referenced by name in Scale, AddConst, Fma, etc.
+    pub fn scalar(mut self, name: &str) -> Self {
+        self.scalars.push(name.to_string());
+        self
+    }
+
+    /// Set inplace mode: output writes back to input[0].
+    pub fn inplace(mut self) -> Self {
+        self.inplace = true;
+        self
+    }
+
+    // ── Chain operations ──
+
+    /// acc = input[slot] (first step or override)
+    pub fn load(mut self, slot: usize) -> Self {
+        self.steps.push(ElemStep::LoadInput(slot));
+        self
+    }
+
+    /// acc = relu(acc) = max(0, acc)
+    pub fn relu(mut self) -> Self {
+        self.steps.push(ElemStep::Relu);
+        self
+    }
+
+    /// acc = silu(acc) = acc * sigmoid(acc)
+    pub fn silu_op(mut self) -> Self {
+        self.steps.push(ElemStep::Silu);
+        self
+    }
+
+    /// acc = sigmoid(acc)
+    pub fn sigmoid_op(mut self) -> Self {
+        self.steps.push(ElemStep::Sigmoid);
+        self
+    }
+
+    /// acc = -acc
+    pub fn neg(mut self) -> Self {
+        self.steps.push(ElemStep::Neg);
+        self
+    }
+
+    /// acc = |acc|
+    pub fn abs(mut self) -> Self {
+        self.steps.push(ElemStep::Abs);
+        self
+    }
+
+    /// acc = exp(acc)
+    pub fn exp(mut self) -> Self {
+        self.steps.push(ElemStep::Exp);
+        self
+    }
+
+    /// acc = log(acc)
+    pub fn log(mut self) -> Self {
+        self.steps.push(ElemStep::Log);
+        self
+    }
+
+    /// acc = acc * acc
+    pub fn square(mut self) -> Self {
+        self.steps.push(ElemStep::Square);
+        self
+    }
+
+    /// acc += input[slot]
+    pub fn add_input(mut self, slot: usize) -> Self {
+        self.steps.push(ElemStep::AddInput(slot));
+        self
+    }
+
+    /// acc *= input[slot]
+    pub fn mul_input(mut self, slot: usize) -> Self {
+        self.steps.push(ElemStep::MulInput(slot));
+        self
+    }
+
+    /// acc -= input[slot]
+    pub fn sub_input(mut self, slot: usize) -> Self {
+        self.steps.push(ElemStep::SubInput(slot));
+        self
+    }
+
+    /// acc *= scalar (by name)
+    pub fn scale(mut self, name: &str) -> Self {
+        if !self.scalars.contains(&name.to_string()) {
+            self.scalars.push(name.to_string());
+        }
+        self.steps.push(ElemStep::Scale(name.to_string()));
+        self
+    }
+
+    /// acc += scalar (by name)
+    pub fn add_const(mut self, name: &str) -> Self {
+        if !self.scalars.contains(&name.to_string()) {
+            self.scalars.push(name.to_string());
+        }
+        self.steps.push(ElemStep::AddConst(name.to_string()));
+        self
+    }
+
+    /// acc = acc * scalar + input[slot]
+    pub fn fma_op(mut self, scalar_name: &str, slot: usize) -> Self {
+        if !self.scalars.contains(&scalar_name.to_string()) {
+            self.scalars.push(scalar_name.to_string());
+        }
+        self.steps.push(ElemStep::Fma(scalar_name.to_string(), slot));
+        self
+    }
+
+    /// acc = min(acc, scalar)
+    pub fn min_scalar(mut self, name: &str) -> Self {
+        if !self.scalars.contains(&name.to_string()) {
+            self.scalars.push(name.to_string());
+        }
+        self.steps.push(ElemStep::MinScalar(name.to_string()));
+        self
+    }
+
+    /// acc = max(acc, scalar)
+    pub fn max_scalar(mut self, name: &str) -> Self {
+        if !self.scalars.contains(&name.to_string()) {
+            self.scalars.push(name.to_string());
+        }
+        self.steps.push(ElemStep::MaxScalar(name.to_string()));
+        self
+    }
+
+    /// Number of inputs declared
+    pub fn n_inputs(&self) -> usize { self.inputs.len() }
+
+    /// Number of scalar parameters
+    pub fn n_scalars(&self) -> usize { self.scalars.len() }
+
+    /// Compute kernarg size in bytes
+    pub fn kernarg_size(&self) -> usize {
+        let n_ptrs = self.inputs.len() + if self.inplace { 0 } else { 1 };
+        // ptrs (8B each) + scalars (4B each) + n_elems (4B)
+        n_ptrs * 8 + self.scalars.len() * 4 + 4
+    }
+
+    /// Build the TileFunc SSA program from this chain specification.
+    ///
+    /// The generated program has the structure:
+    /// ```text
+    ///   %pid = program_id(0)
+    ///   %offset = pid * wg_size + arange(0, wg_size)
+    ///   %mask = offset < n_elems          // bounds check
+    ///   %in0 = load_masked(input0, offset, mask, 0.0)
+    ///   %in1 = load_masked(input1, offset, mask, 0.0)  // if needed
+    ///   ... apply ops ...
+    ///   store_masked(output, offset, result, mask)
+    ///   return
+    /// ```
+    pub fn build(self, wg_size: u32) -> TileFunc {
+        assert!(!self.inputs.is_empty(), "ElemChain: at least 1 input required");
+        assert!(!self.steps.is_empty(), "ElemChain: at least 1 step required");
+        if !self.inplace {
+            assert!(self.output.is_some(), "ElemChain: output required (or use .inplace())");
+        }
+
+        let mut f = TileFunc::new(&self.name);
+
+        // ── Declare arguments ──
+        // Input pointers
+        let input_ptrs: Vec<Value> = self.inputs.iter()
+            .map(|name| f.arg_ptr(name))
+            .collect();
+
+        // Output pointer (skip if inplace)
+        let out_ptr = if self.inplace {
+            input_ptrs[0] // write back to input[0]
+        } else {
+            f.arg_ptr(self.output.as_deref().unwrap_or("out"))
+        };
+
+        // Scalar parameters
+        let scalar_vals: Vec<(String, Value)> = self.scalars.iter()
+            .map(|name| (name.clone(), f.arg_f32(name)))
+            .collect();
+
+        // n_elems (last argument)
+        let n_elems = f.arg_u32("n_elems");
+
+        // ── Compute per-lane index with bounds check ──
+        // offset = program_id(0) * wg_size + arange(0, wg_size)
+        let pid = f.program_id(0);
+        let block_sz = f.const_u32(wg_size);
+        let block_off = f.mul(pid, block_sz);
+        let lane_off = f.arange(0, wg_size);
+        let block_off_v = f.splat(block_off, wg_size);
+        let offset = f.add(block_off_v, lane_off);
+
+        // mask = offset < n_elems (bounds check for tail workgroup)
+        let n_elems_v = f.splat(n_elems, wg_size);
+        let mask = f.cmp_lt(offset, n_elems_v);
+
+        // zero for masked-out lanes
+        let zero_s = f.const_f32(0.0);
+        let zero_v = f.splat(zero_s, wg_size);
+
+        // ── Determine which input slots are actually used ──
+        let mut used_slots: Vec<usize> = Vec::new();
+        for step in &self.steps {
+            match step {
+                ElemStep::LoadInput(s) | ElemStep::AddInput(s) |
+                ElemStep::MulInput(s) | ElemStep::SubInput(s) => {
+                    if !used_slots.contains(s) { used_slots.push(*s); }
+                }
+                ElemStep::Fma(_, s) => {
+                    if !used_slots.contains(s) { used_slots.push(*s); }
+                }
+                _ => {}
+            }
+        }
+        // If no explicit LoadInput, slot 0 is loaded as initial accumulator
+        if !self.steps.iter().any(|s| matches!(s, ElemStep::LoadInput(_))) {
+            if !used_slots.contains(&0) { used_slots.insert(0, 0); }
+        }
+        used_slots.sort();
+
+        // ── Load needed inputs ──
+        let mut loaded_inputs: std::collections::HashMap<usize, Value> =
+            std::collections::HashMap::new();
+        for &slot in &used_slots {
+            assert!(slot < input_ptrs.len(),
+                "ElemChain: step references input slot {} but only {} inputs declared",
+                slot, input_ptrs.len());
+            let val = f.load_masked(input_ptrs[slot], offset, mask, zero_v, ScalarDType::F32);
+            loaded_inputs.insert(slot, val);
+        }
+
+        // ── Initialize accumulator ──
+        let first_step_is_load = matches!(self.steps.first(), Some(ElemStep::LoadInput(_)));
+        let mut acc = if first_step_is_load {
+            // Will be set by first LoadInput step
+            zero_v // placeholder, overwritten immediately
+        } else {
+            // Default: acc = input[0]
+            loaded_inputs[&0]
+        };
+
+        // ── Apply chain steps ──
+        let find_scalar = |name: &str| -> Value {
+            scalar_vals.iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("ElemChain: scalar '{}' not found", name))
+                .1
+        };
+
+        for step in &self.steps {
+            match step {
+                ElemStep::LoadInput(slot) => {
+                    acc = loaded_inputs[slot];
+                }
+                ElemStep::Relu => { acc = f.relu(acc); }
+                ElemStep::Silu => { acc = f.silu(acc); }
+                ElemStep::Sigmoid => { acc = f.sigmoid(acc); }
+                ElemStep::Neg => { acc = f.neg(acc); }
+                ElemStep::Abs => { acc = f.abs(acc); }
+                ElemStep::Exp => { acc = f.exp(acc); }
+                ElemStep::Log => { acc = f.log(acc); }
+                ElemStep::Sqrt => { acc = f.sqrt(acc); }
+                ElemStep::Rcp => { acc = f.rcp(acc); }
+                ElemStep::Rsqrt => { acc = f.rsqrt(acc); }
+                ElemStep::Square => { acc = f.mul(acc, acc); }
+
+                ElemStep::AddInput(slot) => {
+                    let inp = loaded_inputs[slot];
+                    acc = f.add(acc, inp);
+                }
+                ElemStep::MulInput(slot) => {
+                    let inp = loaded_inputs[slot];
+                    acc = f.mul(acc, inp);
+                }
+                ElemStep::SubInput(slot) => {
+                    let inp = loaded_inputs[slot];
+                    acc = f.sub(acc, inp);
+                }
+
+                ElemStep::Scale(name) => {
+                    let sv = find_scalar(name);
+                    let sv_v = f.splat(sv, wg_size);
+                    acc = f.mul(acc, sv_v);
+                }
+                ElemStep::AddConst(name) => {
+                    let sv = find_scalar(name);
+                    let sv_v = f.splat(sv, wg_size);
+                    acc = f.add(acc, sv_v);
+                }
+                ElemStep::Fma(scalar_name, slot) => {
+                    let sv = find_scalar(scalar_name);
+                    let sv_v = f.splat(sv, wg_size);
+                    let inp = loaded_inputs[slot];
+                    // acc = acc * scalar + input[slot]
+                    acc = f.fma(acc, sv_v, inp);
+                }
+                ElemStep::MinScalar(name) => {
+                    let sv = find_scalar(name);
+                    let sv_v = f.splat(sv, wg_size);
+                    acc = f.min(acc, sv_v);
+                }
+                ElemStep::MaxScalar(name) => {
+                    let sv = find_scalar(name);
+                    let sv_v = f.splat(sv, wg_size);
+                    acc = f.max(acc, sv_v);
+                }
+            }
+        }
+
+        // ── Store result with mask ──
+        f.store_masked(out_ptr, offset, acc, mask);
+        f.return_();
+
+        f
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // Pre-built Templates for Common Training Patterns
+    // ════════════════════════════════════════════════════════════
+
+    /// SwiGLU: out[i] = silu(gate[i]) * up[i]
+    ///
+    /// Replaces 2 dispatches (silu + mul) with 1 fused dispatch.
+    /// Bandwidth saving: 2R+1W vs 3R+2W = 40% reduction.
+    pub fn swiglu(wg_size: u32) -> TileFunc {
+        ElemChain::new("t0_swiglu")
+            .input("gate")
+            .input("up")
+            .output("out")
+            .silu_op()           // acc = silu(gate[i])
+            .mul_input(1)        // acc *= up[i]
+            .build(wg_size)
+    }
+
+    /// Scale + Add: out[i] = a[i] * alpha + b[i]
+    ///
+    /// Common pattern in weight updates: w = w * (1-lr*wd) + grad * (-lr)
+    /// Replaces 2 dispatches (scale + add) with 1.
+    pub fn scale_add(wg_size: u32) -> TileFunc {
+        ElemChain::new("t0_scale_add")
+            .input("a")
+            .input("b")
+            .output("out")
+            .scalar("alpha")
+            .scale("alpha")      // acc = a[i] * alpha
+            .add_input(1)        // acc += b[i]
+            .build(wg_size)
+    }
+
+    /// Residual Add + Scale: out[i] = (a[i] + b[i]) * scale
+    pub fn residual_add_scale(wg_size: u32) -> TileFunc {
+        ElemChain::new("t0_residual_scale")
+            .input("a")
+            .input("b")
+            .output("out")
+            .scalar("scale")
+            .add_input(1)        // acc = a[i] + b[i]
+            .scale("scale")      // acc *= scale
+            .build(wg_size)
+    }
+
+    /// Weight Decay Update: w_out[i] = w[i] * decay + grad[i] * neg_lr
+    ///
+    /// decay = 1 - lr * weight_decay, neg_lr = -lr
+    /// Replaces 3 dispatches (scale_w + scale_grad + add) with 1.
+    ///
+    /// FMA semantics: acc = acc * scalar + input[slot]
+    /// Step 1: acc = w[i] (loaded as slot 0)
+    /// Step 2: acc = acc * decay (scale)
+    /// FMA would be acc = acc * neg_lr + grad, which is wrong order.
+    /// So we use scale + fma: acc = w*decay, then we need grad*neg_lr + acc.
+    /// But our fma is: acc = acc*scalar + input => acc = (w*decay)*neg_lr + grad.
+    /// That's wrong. Use 2 steps: scale the accumulated value, then add scaled input.
+    ///
+    /// Correct decomposition:
+    ///   acc = w*decay (scale "decay")
+    ///   scaled_grad = load grad, scale by neg_lr → but single accumulator...
+    ///
+    /// Solution: Use AXPY pattern: out = a + alpha*b = w*decay + neg_lr*grad
+    ///   Step 1: Load w (slot 0, auto)
+    ///   Step 2: scale("decay") → acc = w * decay
+    ///   Step 3: We need to add (grad * neg_lr) to acc.
+    ///           FMA(scalar, slot): acc = acc * scalar + input[slot]
+    ///           That gives: acc = (w*decay) * neg_lr + grad ← WRONG
+    ///
+    /// Real solution: add a ScaleAddInput step or just do 2 separate steps.
+    /// For now, expose as `scale + scale_input_add` using custom build:
+    pub fn weight_decay_update(wg_size: u32) -> TileFunc {
+        // Manual construction since FMA semantics don't directly match
+        let mut f = TileFunc::new("t0_weight_decay");
+        let w_ptr = f.arg_ptr("w");
+        let grad_ptr = f.arg_ptr("grad");
+        let out_ptr = f.arg_ptr("w_out");
+        let decay = f.arg_f32("decay");    // 1 - lr*wd
+        let neg_lr = f.arg_f32("neg_lr");  // -lr
+        let n_elems = f.arg_u32("n_elems");
+
+        let pid = f.program_id(0);
+        let block_sz = f.const_u32(wg_size);
+        let block_off = f.mul(pid, block_sz);
+        let lane_off = f.arange(0, wg_size);
+        let block_off_v = f.splat(block_off, wg_size);
+        let offset = f.add(block_off_v, lane_off);
+
+        let n_v = f.splat(n_elems, wg_size);
+        let mask = f.cmp_lt(offset, n_v);
+        let zero_s = f.const_f32(0.0);
+        let zero_v = f.splat(zero_s, wg_size);
+
+        // Load inputs
+        let w = f.load_masked(w_ptr, offset, mask, zero_v, ScalarDType::F32);
+        let grad = f.load_masked(grad_ptr, offset, mask, zero_v, ScalarDType::F32);
+
+        // w_out = w * decay + grad * neg_lr
+        let decay_v = f.splat(decay, wg_size);
+        let w_scaled = f.mul(w, decay_v);
+        let neg_lr_v = f.splat(neg_lr, wg_size);
+        // Use FMA: result = grad * neg_lr + w_scaled
+        let result = f.fma(grad, neg_lr_v, w_scaled);
+
+        f.store_masked(out_ptr, offset, result, mask);
+        f.return_();
+        f
+    }
+
+    /// Abs + Clip: out[i] = min(|x[i]|, threshold)
+    ///
+    /// Used for gradient clipping.
+    pub fn abs_clip(wg_size: u32) -> TileFunc {
+        ElemChain::new("t0_abs_clip")
+            .input("x")
+            .output("out")
+            .scalar("threshold")
+            .abs()
+            .min_scalar("threshold")
+            .build(wg_size)
+    }
+
+    /// AXPY: out[i] = a[i] + alpha * b[i]
+    ///
+    /// Standard BLAS Level-1 operation.
+    pub fn axpy(wg_size: u32) -> TileFunc {
+        ElemChain::new("t0_axpy")
+            .input("a")
+            .input("b")
+            .output("out")
+            .scalar("alpha")
+            .load(1)             // acc = b[i]
+            .scale("alpha")      // acc = b[i] * alpha
+            .add_input(0)        // acc += a[i]
+            .build(wg_size)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

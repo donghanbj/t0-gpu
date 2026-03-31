@@ -555,6 +555,7 @@ impl TileConfig {
             swap_grid: true,  // tile_ir presets always use swap_grid=true (L2 friendly + proven safe)
             transpose: super::tile_ir::TileTranspose::NT,
             acc_swap: false,
+            epilogue: vec![],
         }
     }
 
@@ -1097,6 +1098,7 @@ fn load_tile_ir_cache(path: &std::path::Path) -> Option<TileIrTuneResult> {
         swap_grid: true,
         transpose: super::tile_ir::TileTranspose::NT,
         acc_swap: false,
+        epilogue: vec![],
     };
 
     Some(TileIrTuneResult {

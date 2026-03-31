@@ -1510,6 +1510,7 @@ pub fn lower_tiled_gemm(func: &TileFunc) -> Result<LoweredTiledGemm, String> {
         swap_grid: true,
         transpose: tile_ir::TileTranspose::NT,
         acc_swap: false,
+        epilogue: vec![],
     };
     
     eprintln!("[lower_tiled_gemm] spec: {} (wg={}, lds={}, db={})",
@@ -2313,5 +2314,420 @@ mod tests {
         assert!(max_rel_err < 0.05,
             "tiled GEMM too inaccurate: max_rel_err={:.4e} (threshold 5e-2)", max_rel_err);
         eprintln!("✓ tiled_gemm GPU PASSED ({}×{}×{}, max_rel_err={:.2e})", m, k_dim, n, max_rel_err);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ElemChain Compilation Tests
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_elem_chain_swiglu_compile() {
+        let func = ElemChain::swiglu(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        assert_eq!(&elf[0..4], &[0x7f, b'E', b'L', b'F']);
+        eprintln!("✓ swiglu: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_scale_add_compile() {
+        let func = ElemChain::scale_add(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ scale_add: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_residual_scale_compile() {
+        let func = ElemChain::residual_add_scale(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ residual_scale: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_weight_decay_compile() {
+        let func = ElemChain::weight_decay_update(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ weight_decay: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_abs_clip_compile() {
+        let func = ElemChain::abs_clip(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ abs_clip: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_axpy_compile() {
+        let func = ElemChain::axpy(256);
+        let lowered = lower_elementwise_1d(&func, 256, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ axpy: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_custom_relu_compile() {
+        // Custom chain: acc = relu(x)
+        let func = ElemChain::new("custom_relu")
+            .input("x")
+            .output("y")
+            .relu()
+            .build(128);
+        let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ custom_relu: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_custom_sigmoid_compile() {
+        let func = ElemChain::new("custom_sigmoid")
+            .input("x")
+            .output("y")
+            .sigmoid_op()
+            .build(128);
+        let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ custom_sigmoid: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_inplace_compile() {
+        // inplace mode: output writes back to input[0]
+        let func = ElemChain::new("inplace_relu")
+            .input("x")
+            .inplace()
+            .relu()
+            .build(128);
+        let lowered = lower_elementwise_1d(&func, 128, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+        assert!(elf.len() > 0);
+        eprintln!("✓ inplace_relu: {} bytes ELF", elf.len());
+    }
+
+    #[test]
+    fn test_elem_chain_ssa_dump() {
+        // Verify the generated SSA IR makes sense
+        let func = ElemChain::swiglu(64);
+        let ir = func.dump();
+        eprintln!("=== SwiGLU SSA IR ===\n{}", ir);
+        assert!(ir.contains("program_id"), "should have program_id");
+        assert!(ir.contains("load"), "should have load");
+        assert!(ir.contains("Silu"), "should have Silu");
+        assert!(ir.contains("Mul"), "should have Mul");
+        assert!(ir.contains("store"), "should have store");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ElemChain GPU E2E Correctness Tests
+    // ═══════════════════════════════════════════════════════════
+
+    /// Generic GPU E2E test harness for ElemChain-based kernels.
+    #[cfg(feature = "rocm")]
+    fn run_elem_chain_gpu_test(
+        name: &str,
+        func: &TileFunc,
+        wg_size: u32,
+        inputs: &[&[f32]],
+        scalars: &[f32],
+        expected: &[f32],
+        tol: f32,
+    ) {
+        use crate::kfd::{KfdDevice, GpuKernel, KernelLoadConfig, DispatchPool};
+
+        let n = expected.len() as u32;
+        let lowered = lower_elementwise_1d(func, wg_size, 1).unwrap();
+        let elf = lowered.kernel.compile(Target::GFX1100).unwrap();
+
+        let device = KfdDevice::open().unwrap();
+        let queue = device.create_queue().unwrap();
+        let pool = DispatchPool::new(&device, 4).unwrap();
+
+        // Allocate and upload input buffers
+        let mut gpu_bufs = Vec::new();
+        for &input in inputs {
+            let buf = device.alloc_vram(n as usize * 4).unwrap();
+            buf.write(unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, n as usize * 4) });
+            gpu_bufs.push(buf);
+        }
+
+        // Output buffer
+        let out_buf = device.alloc_vram(n as usize * 4).unwrap();
+        out_buf.write(&vec![0u8; n as usize * 4]);
+
+        // Build kernargs: [in0_ptr, in1_ptr, ..., out_ptr, scalar0, scalar1, ..., n_elems]
+        let n_ptrs = inputs.len() + 1; // inputs + output
+        let n_scalars = scalars.len();
+        let ka_size = n_ptrs * 8 + n_scalars * 4 + 4;
+        let mut ka = vec![0u8; ka_size];
+        let mut off = 0;
+        for buf in &gpu_bufs {
+            ka[off..off+8].copy_from_slice(&buf.gpu_addr().to_le_bytes());
+            off += 8;
+        }
+        ka[off..off+8].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        off += 8;
+        for &s in scalars {
+            ka[off..off+4].copy_from_slice(&s.to_bits().to_le_bytes());
+            off += 4;
+        }
+        ka[off..off+4].copy_from_slice(&n.to_le_bytes());
+
+        let gk = GpuKernel::load(&device, &elf, &KernelLoadConfig {
+            workgroup_size: [wg_size, 1, 1], lds_size: 0,
+        }).unwrap();
+
+        let n_wg = (n + wg_size - 1) / wg_size;
+        let ka_buf = pool.write_kernargs(0, &ka);
+        queue.submit(&gk, [n_wg * wg_size, 1, 1], ka_buf);
+        queue.wait_idle().unwrap();
+
+        // Read back results
+        let mut result = vec![0f32; n as usize];
+        unsafe { out_buf.read(std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, n as usize * 4)); }
+
+        // Compare
+        let mut max_err: f32 = 0.0;
+        for i in 0..n as usize {
+            let err = (result[i] - expected[i]).abs();
+            let rel = if expected[i].abs() > 1e-6 { err / expected[i].abs() } else { err };
+            max_err = max_err.max(rel);
+            if rel > tol {
+                panic!("{} [{}]: gpu={:.6} cpu={:.6} rel_err={:.2e}", name, i, result[i], expected[i], rel);
+            }
+        }
+        eprintln!("✓ {} GPU PASSED (max_rel_err={:.2e}, {} elems)", name, max_err, n);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_relu() {
+        let n = 256;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.1).collect();
+        let expected: Vec<f32> = input.iter().map(|&x| if x > 0.0 { x } else { 0.0 }).collect();
+
+        let func = ElemChain::new("relu")
+            .input("x").output("y")
+            .relu()
+            .build(256);
+        run_elem_chain_gpu_test("relu", &func, 256, &[&input], &[], &expected, 1e-6);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_sigmoid() {
+        let n = 256;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.05).collect();
+        let expected: Vec<f32> = input.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+
+        let func = ElemChain::new("sigmoid")
+            .input("x").output("y")
+            .sigmoid_op()
+            .build(256);
+        run_elem_chain_gpu_test("sigmoid", &func, 256, &[&input], &[], &expected, 1e-3);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_scale_add() {
+        let n = 256;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.05).collect();
+        let alpha = 0.7f32;
+        let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(&ai, &bi)| ai * alpha + bi).collect();
+
+        let func = ElemChain::scale_add(256);
+        run_elem_chain_gpu_test("scale_add", &func, 256, &[&a, &b], &[alpha], &expected, 1e-5);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_swiglu() {
+        let n = 256;
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.05).collect();
+        let up: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1).collect();
+        let expected: Vec<f32> = gate.iter().zip(up.iter())
+            .map(|(&g, &u)| {
+                let silu_g = g / (1.0 + (-g).exp());
+                silu_g * u
+            })
+            .collect();
+
+        let func = ElemChain::swiglu(256);
+        run_elem_chain_gpu_test("swiglu", &func, 256, &[&gate, &up], &[], &expected, 1e-3);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_abs_clip() {
+        let n = 256;
+        let input: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.5).collect();
+        let threshold = 10.0f32;
+        let expected: Vec<f32> = input.iter().map(|&x| x.abs().min(threshold)).collect();
+
+        let func = ElemChain::abs_clip(256);
+        run_elem_chain_gpu_test("abs_clip", &func, 256, &[&input], &[threshold], &expected, 1e-6);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_weight_decay() {
+        let n = 256;
+        let w: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        let grad: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.001).collect();
+        let decay = 0.999f32;   // 1 - lr*wd
+        let neg_lr = -0.001f32; // -lr
+        let expected: Vec<f32> = w.iter().zip(grad.iter())
+            .map(|(&wi, &gi)| wi * decay + gi * neg_lr)
+            .collect();
+
+        let func = ElemChain::weight_decay_update(256);
+        run_elem_chain_gpu_test("weight_decay", &func, 256, &[&w, &grad], &[decay, neg_lr], &expected, 1e-5);
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn test_elem_chain_gpu_axpy() {
+        let n = 256;
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32 * 0.05).collect();
+        let alpha = 2.5f32;
+        let expected: Vec<f32> = a.iter().zip(b.iter())
+            .map(|(&ai, &bi)| ai + alpha * bi)
+            .collect();
+
+        let func = ElemChain::axpy(256);
+        run_elem_chain_gpu_test("axpy", &func, 256, &[&a, &b], &[alpha], &expected, 1e-5);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ElemChain Performance Benchmark
+    // ═══════════════════════════════════════════════════════════
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    #[ignore] // Run: cargo test --release --features rocm -- test_elem_chain_benchmark --ignored --nocapture
+    fn test_elem_chain_benchmark() {
+        use crate::ignis::gpu_context::GpuRuntime;
+
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let n = 4 * 1024 * 1024u32; // 4M elements = 16 MB
+        let wg_size = 256u32;
+
+        eprintln!("═══════════════════════════════════════════════════════════");
+        eprintln!("  ElemChain Fusion Benchmark: {} elements ({:.1} MB)", n, n as f64 * 4.0 / 1e6);
+        eprintln!("═══════════════════════════════════════════════════════════");
+
+        // Allocate buffers
+        let a_buf = rt.alloc(n as usize * 4).unwrap();
+        let b_buf = rt.alloc(n as usize * 4).unwrap();
+        let out_buf = rt.alloc(n as usize * 4).unwrap();
+        a_buf.zero(); b_buf.zero(); out_buf.zero();
+
+        // ── Scale + Add: Fused vs Separate ──
+
+        // Fused kernel: out = a * alpha + b (1 dispatch)
+        let fused_func = ElemChain::scale_add(wg_size);
+        let fused_lowered = lower_elementwise_1d(&fused_func, wg_size, 1).unwrap();
+        let fused_elf = fused_lowered.kernel.compile(Target::GFX1100).unwrap();
+
+        // Separate kernels: scale + add (2 dispatches)
+        let scale_func = ElemChain::new("scale_only")
+            .input("x").output("y").scalar("alpha")
+            .scale("alpha").build(wg_size);
+        let scale_lowered = lower_elementwise_1d(&scale_func, wg_size, 1).unwrap();
+        let scale_elf = scale_lowered.kernel.compile(Target::GFX1100).unwrap();
+
+        let add_func = ElemChain::new("add_only")
+            .input("a").input("b").output("y")
+            .add_input(1).build(wg_size);
+        let add_lowered = lower_elementwise_1d(&add_func, wg_size, 1).unwrap();
+        let add_elf = add_lowered.kernel.compile(Target::GFX1100).unwrap();
+
+        use crate::kfd::{GpuKernel, KernelLoadConfig};
+        let load_cfg = KernelLoadConfig { workgroup_size: [wg_size, 1, 1], lds_size: 0 };
+
+        let fused_kernel = GpuKernel::load(&rt.device, &fused_elf, &load_cfg).unwrap();
+        let scale_kernel = GpuKernel::load(&rt.device, &scale_elf, &load_cfg).unwrap();
+        let add_kernel = GpuKernel::load(&rt.device, &add_elf, &load_cfg).unwrap();
+
+        let n_wg = (n + wg_size - 1) / wg_size;
+        let grid = [n_wg * wg_size, 1, 1];
+        let alpha_bits = 0.7f32.to_bits();
+
+        // Fused kernarg: [a_ptr, b_ptr, out_ptr, alpha, n_elems]
+        let mut fused_ka = vec![0u8; 32];
+        fused_ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
+        fused_ka[8..16].copy_from_slice(&b_buf.gpu_addr().to_le_bytes());
+        fused_ka[16..24].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        fused_ka[24..28].copy_from_slice(&alpha_bits.to_le_bytes());
+        fused_ka[28..32].copy_from_slice(&n.to_le_bytes());
+
+        // Scale kernarg: [x_ptr, y_ptr, alpha, n_elems]
+        let mut scale_ka = vec![0u8; 24];
+        scale_ka[0..8].copy_from_slice(&a_buf.gpu_addr().to_le_bytes());
+        scale_ka[8..16].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        scale_ka[16..20].copy_from_slice(&alpha_bits.to_le_bytes());
+        scale_ka[20..24].copy_from_slice(&n.to_le_bytes());
+
+        // Add kernarg: [a_ptr, b_ptr, out_ptr, n_elems]
+        let mut add_ka = vec![0u8; 28];
+        add_ka[0..8].copy_from_slice(&out_buf.gpu_addr().to_le_bytes()); // scaled a
+        add_ka[8..16].copy_from_slice(&b_buf.gpu_addr().to_le_bytes());
+        add_ka[16..24].copy_from_slice(&out_buf.gpu_addr().to_le_bytes());
+        add_ka[24..28].copy_from_slice(&n.to_le_bytes());
+
+        // Warmup
+        for _ in 0..10 {
+            rt.dispatch(&fused_kernel, grid, &fused_ka).unwrap();
+            rt.dispatch(&scale_kernel, grid, &scale_ka).unwrap();
+            rt.dispatch(&add_kernel, grid, &add_ka).unwrap();
+        }
+
+        let n_iters = 50;
+
+        // Benchmark: Fused
+        let t0 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            rt.dispatch_async(&fused_kernel, grid, &fused_ka);
+        }
+        rt.wait_idle().unwrap();
+        let fused_us = t0.elapsed().as_micros() as f64 / n_iters as f64;
+
+        // Benchmark: Separate (scale + add)
+        let t1 = std::time::Instant::now();
+        for _ in 0..n_iters {
+            rt.dispatch_async(&scale_kernel, grid, &scale_ka);
+            rt.dispatch_async(&add_kernel, grid, &add_ka);
+        }
+        rt.wait_idle().unwrap();
+        let separate_us = t1.elapsed().as_micros() as f64 / n_iters as f64;
+
+        // Bandwidth calculation
+        // Fused: read 2 inputs (2*N*4) + write 1 output (N*4) = 12 bytes/elem
+        // Separate: scale reads 1 input + writes 1 output (8B) + add reads 2 inputs + writes 1 output (12B) = 20 bytes/elem
+        let fused_bytes = n as f64 * 12.0;
+        let separate_bytes = n as f64 * 20.0;
+        let fused_gbps = fused_bytes / (fused_us * 1e3);
+        let separate_gbps = separate_bytes / (separate_us * 1e3);
+        let speedup = separate_us / fused_us;
+
+        eprintln!("  Scale+Add (fused):    {:.1} µs  ({:.1} GB/s)", fused_us, fused_gbps);
+        eprintln!("  Scale+Add (separate): {:.1} µs  ({:.1} GB/s)", separate_us, separate_gbps);
+        eprintln!("  Speedup: {:.2}×  ({:.0}% faster)", speedup, (speedup - 1.0) * 100.0);
+        eprintln!("═══════════════════════════════════════════════════════════");
+
+        rt.recycle(a_buf); rt.recycle(b_buf); rt.recycle(out_buf);
     }
 }
