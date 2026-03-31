@@ -92,6 +92,28 @@ impl TileGemm {
         }
     }
 
+    /// 64×64 k32 CU mode — 2 K sub-steps for WMMA dual-chain ILP
+    pub fn tile_64x64_k32() -> Self {
+        Self {
+            tile_m: 64, tile_n: 64, tile_k: 32,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+        }
+    }
+
+    /// 64×64 k64 CU mode — best for ≤2048³ (2.6-94.2 TF across sizes)
+    pub fn tile_64x64_k64() -> Self {
+        Self {
+            tile_m: 64, tile_n: 64, tile_k: 64,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+        }
+    }
+
     /// 32×64 k16 LDS double-buffered
     pub fn tile_32x64_k16() -> Self {
         Self {
@@ -120,6 +142,17 @@ impl TileGemm {
     pub fn tile_64x128_k32() -> Self {
         Self {
             tile_m: 64, tile_n: 128, tile_k: 32,
+            wgp_mode: false, double_buffer: true,
+            split_k: 1, swap_grid: true,
+            transpose: TileTranspose::NT,
+            acc_swap: false,
+        }
+    }
+
+    /// 64×128 k16 CU mode — fallback for non-aligned K
+    pub fn tile_64x128_k16() -> Self {
+        Self {
+            tile_m: 64, tile_n: 128, tile_k: 16,
             wgp_mode: false, double_buffer: true,
             split_k: 1, swap_grid: true,
             transpose: TileTranspose::NT,
@@ -331,9 +364,27 @@ impl TileGemm {
 ///   - Non-square (M < 128):        32×64 k16  (fits small M dimension)
 ///   - Non-square (M ≥ 128):        128×64 k32 (compromise for rectangular)
 pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> TileGemm {
-    // Choose tile + tile_k based on problem dimensions
-    let mut spec = if m >= 128 && n >= 128 {
-        // Large square: use k64 for maximum throughput (proven best)
+    // Data-driven tile selection based on full-spectrum autotuner results (2026-03-31).
+    //
+    // Benchmark data (square matrices, BF16 GEMM on RX 7900 XTX):
+    //   256³:   2.6 TF → 64x64_k64
+    //   512³:  15.0 TF → 64x64_k64
+    //  1024³:  51.9 TF → 64x64_k64
+    //  2048³:  94.2 TF → 64x64_k64
+    //  4096³: 103.7 TF → 64x128_k32
+    //  8192³: 116.8 TF → 128x128_k64
+    //
+    // Non-square (M×K×N):
+    //  128×4096×1024:  24.2 TF → 64x64_k64
+    //  256×4096×1024:  47.2 TF → 64x64_k64
+    //  512×4096×1024:  67.4 TF → 64x64_k64
+    // 1024×4096×1024:  76.9 TF → 64x64_k32
+
+    let min_dim = m.min(n);
+    let max_dim = m.max(n);
+
+    let mut spec = if min_dim >= 128 && max_dim >= 4096 {
+        // Very large: 128x128_k64 dominates (8192³ = 116.8 TF)
         if k >= 64 && k % 64 == 0 {
             TileGemm::tile_128x128_k64()
         } else if k >= 32 && k % 32 == 0 {
@@ -341,15 +392,28 @@ pub fn tile_auto_select(m: u32, k: u32, n: u32, transpose: TileTranspose) -> Til
         } else {
             TileGemm::tile_128x128_k16()
         }
-    } else if m >= 64 && n >= 64 {
-        // Medium: 64×64 tile for better occupancy on moderate sizes
-        TileGemm::tile_64x64_k16()
-    } else if m >= 128 {
-        // Wide but short N: 128×64
+    } else if min_dim >= 128 && max_dim >= 2048 {
+        // Large (4096³ class): 64x128_k32 wins (103.7 TF)
         if k >= 32 && k % 32 == 0 {
-            TileGemm::tile_128x64_k32()
+            TileGemm::tile_64x128_k32()
         } else {
-            TileGemm::tile_128x64_k16()
+            TileGemm::tile_64x128_k16()
+        }
+    } else if min_dim >= 64 {
+        // Medium (≤2048³): 64x64_k64 consistently best (2.6-94.2 TF)
+        if k >= 64 && k % 64 == 0 {
+            TileGemm::tile_64x64_k64()
+        } else if k >= 32 && k % 32 == 0 {
+            TileGemm::tile_64x64_k32()
+        } else {
+            TileGemm::tile_64x64_k16()
+        }
+    } else if m >= 32 || n >= 128 {
+        // Rectangular: use 32x64 or 64x64
+        if k >= 32 && k % 32 == 0 {
+            TileGemm::tile_64x64_k32()
+        } else {
+            TileGemm::tile_32x64_k16()
         }
     } else {
         // Small M: 32×64 to avoid tile underutilization
