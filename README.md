@@ -333,49 +333,59 @@ cargo build --release --lib --features rocm
 
 ```bash
 # ┌─────────────────────────────────────────────────────────────┐
-# │  主力 Benchmark：4096³ bf16 GEMM (k32 + k64, CU + WGP)    │
-# │  Primary benchmark: 4096³ bf16 GEMM                        │
+# │  ★ 主力 Benchmark：4096³ Autotuner（自动选最优 tile）        │
+# │  ★ Primary: 4096³ Autotuner (auto-select best tile)       │
 # └─────────────────────────────────────────────────────────────┘
-cargo test --release --features rocm -- test_wgp_k64_benchmark \
+cargo test --release --features rocm -- test_tune_tile_ir_4096 \
   --nocapture --ignored --test-threads=1
 
 # 输出示例 / Expected output:
-#   k32 128×128 CU         1580.0 μs    87.0 TFLOPS  grid=(4096,32,1)
-#   k32 128×128 WGP        1550.0 μs    88.7 TFLOPS  grid=(4096,32,1)
-#   k64 128×128 CU         1565.0 μs    87.8 TFLOPS  grid=(4096,32,1)
-#   k64 128×128 WGP        1545.0 μs    89.1 TFLOPS  grid=(4096,32,1)
+#   [tile_tune]   tile_gemm_128x128_k64_db → 102.1 TF
+#   [tile_tune]   tile_gemm_64x128_k32_db  → 103.4 TF
+#   [tile_tune]   tile_gemm_64x64_k64_db   → 101.2 TF
+#   [tile_tune] ✓ Best: tile_gemm_64x128_k32_db (103.4 TF)
 ```
 
 ```bash
 # ┌─────────────────────────────────────────────────────────────┐
-# │  正确性测试：GPU vs CPU 参考实现对比                        │
-# │  Correctness: GPU vs CPU reference comparison               │
+# │  全谱 Benchmark：256³ ~ 8192³ 全尺寸扫描                    │
+# │  Full spectrum: 256³ to 8192³ sweep                        │
 # └─────────────────────────────────────────────────────────────┘
-cargo test --release --features rocm -- test_tile_ir_correctness \
-  --nocapture --test-threads=1
-
-# 输出示例 / Expected output:
-#   ✅ PASS max_err=0.047816
-#   ✅ PASS max_err=0.045146
-#   (BF16 精度范围内 / Within BF16 precision range)
-```
-
-```bash
-# ┌─────────────────────────────────────────────────────────────┐
-# │  多尺寸扫描 Benchmark                                      │
-# │  Multi-size sweep benchmark                                 │
-# └─────────────────────────────────────────────────────────────┘
-cargo test --release --features rocm -- test_tile_ir_k32_benchmark \
+cargo test --release --features rocm -- test_tune_tile_ir_all_sizes \
   --nocapture --ignored --test-threads=1
 
-# 输出包含 256³ ~ 4096³ 全尺寸性能
-# Output includes performance from 256³ to 4096³
+# 输出包含 256³ ~ 8192³ 每个尺寸的最优配置和性能
+# Output includes best config and TFLOPS for each size
 ```
 
 ```bash
 # ┌─────────────────────────────────────────────────────────────┐
-# │  ISA 汇编导出（分析 inner loop 质量）                       │
-# │  ISA dump (analyze inner loop quality)                      │
+# │  正确性测试：GPU vs CPU 参考实现对比                    │
+# │  Correctness: GPU vs CPU reference comparison             │
+# └─────────────────────────────────────────────────────────────┘
+cargo run --release --features rocm --example test_gemm_correctness
+
+# 输出示例 / Expected output:
+#   39 configs tested, 39 PASS, 0 FAIL
+#   ✅ PASS max_err in BF16 precision range (~1e-5)
+```
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  rocBLAS / Triton 对比（需要 PyTorch + Triton）              │
+# │  rocBLAS / Triton comparison (requires PyTorch + Triton)  │
+# └─────────────────────────────────────────────────────────────┘
+python3 benchmarks/bench_triton_rocblas.py
+
+# 输出示例 / Expected output:
+#   4096×4096×4096 | rocBLAS 91.10 TF | Triton 88.16 TF | ★ rocBLAS
+# 用与交叉验证 T0 结果 / Cross-validate T0 results
+```
+
+```bash
+# ┌─────────────────────────────────────────────────────────────┐
+# │  ISA 汇编导出（分析 inner loop 质量）                   │
+# │  ISA dump (analyze inner loop quality)                    │
 # └─────────────────────────────────────────────────────────────┘
 T0_DUMP_ASM=1 cargo test --release --features rocm \
   -- test_lower_gemm_128x128_k32_compiles --nocapture
@@ -386,12 +396,12 @@ T0_DUMP_ASM=1 cargo test --release --features rocm \
 
 ### 性能注意事项 / Performance Notes
 
-- **GPU 频率**：首次运行可能因 GPU 频率爬升而偏低，建议运行 2-3 次取最佳值
-  First run may be slower due to GPU clock ramp-up; run 2-3 times and take the best.
+- **首次运行**：Autotuner 首次运行会编译 13 个候选内核（~5秒），后续运行使用缓存（~0.1秒）
+  First run compiles 13 candidate kernels (~5s); subsequent runs use cache (~0.1s).
+- **GPU 频率**：建议运行 2-3 次取最佳值（首次可能因频率爬升偏低）
+  Run 2-3 times and take the best (first run may be slower due to GPU clock ramp-up).
 - **GPU 温度**：长时间运行后热节流可能导致 1-3% 性能波动
   Thermal throttling may cause 1-3% variance after sustained runs.
-- **WGP vs CU 模式**：WGP 模式通常优于 CU 模式 (每 WGP 的 LDS 利用率更高)
-  WGP mode usually outperforms CU mode (better LDS utilization per WGP).
 - **`--test-threads=1`**：GPU 测试必须单线程，否则竞争 GPU 资源导致结果不准
   GPU tests must run single-threaded to avoid resource contention.
 
@@ -409,8 +419,8 @@ T0_DUMP_ASM=1 cargo test --release --features rocm \
 | ✅ | **LDS Offset Folding** | ds_store 立即数 offset 折叠，零 VGPR 开销 |
 | ✅ | **Concurrent VMEM Load** | X/WT 同时发射 buffer_load，92+ 指令 overlap |
 | ✅ | **Graduated lgkmcnt(N)** | 精确 waitcnt 最大化 WMMA/LDS 流水线重叠 |
-| 🔴 | **buffer_load 优化** | SRD 寻址替代 global_load 节省 VGPR (+5-10%) |
-| 🔴 | **LDS Bank Conflict 优化** | 精确 stride padding 消除 bank conflict (+3-5%) |
+| ✅ | **buffer_load 优化** | SRD 寻址替代 global_load，减少 VGPR 压力 |
+| ✅ | **LDS Bank Conflict 优化** | stride padding + swizzle 消除 bank conflict |
 | 🟡 | **Graph 级算子融合** / Op Fusion | GEMM+Bias+RMSNorm 融合内核 |
 | 🟡 | **Async GPU Dispatch** | `GpuFuture` + `submit_async()` |
 | 🟢 | **多 GPU / Multi-GPU** | 多队列调度、PCIe P2P 传输 |
