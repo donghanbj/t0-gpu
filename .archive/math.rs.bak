@@ -2,6 +2,9 @@
 //!
 //! Contains OCPA attention kernels and row-reduce operations that
 //! require manual ISA control beyond BlockDSL capabilities.
+//!
+//! All elementwise/utility kernels have been migrated to BlockDSL
+//! (see `elementwise_kernels.rs`, `softmax_kernels.rs`, etc.)
 
 use super::ir::*;
 use super::compile::T0Kernel;
@@ -17,6 +20,10 @@ pub enum BinaryOp {
     /// y = a + alpha * b  (axpy)
     Axpy(f32),
 }
+
+// ════════════════════════════════════════════
+// t0_unpad_2d
+// ════════════════════════════════════════════
 
 
 // ============================================================================
@@ -123,6 +130,9 @@ pub fn t0_unpad_2d() -> T0Kernel {
     k
 }
 
+// ════════════════════════════════════════════
+// elementwise_binary
+// ════════════════════════════════════════════
 
 
 /// Generate a binary elementwise kernel: y[i] = op(a[i], b[i])
@@ -202,6 +212,9 @@ pub fn elementwise_binary(sched: &dyn Schedule, op: BinaryOp) -> T0Kernel {
     k
 }
 
+// ════════════════════════════════════════════
+// ocpa_forward_intra
+// ════════════════════════════════════════════
 
 
 
@@ -224,6 +237,9 @@ pub fn ocpa_forward_intra() -> T0Kernel {
     ocpa_forward_intra_with_c(256)
 }
 
+// ════════════════════════════════════════════
+// ocpa_forward_intra_with_c
+// ════════════════════════════════════════════
 
 
 /// Forward Intra, parameterized by chunk size
@@ -637,6 +653,9 @@ pub fn ocpa_forward_intra_with_c(c_chunk: u32) -> T0Kernel {
     k
 }
 
+// ════════════════════════════════════════════
+// ocpa_backward_intra_dq
+// ════════════════════════════════════════════
 
 
 // ============================================================================
@@ -656,6 +675,9 @@ pub fn ocpa_backward_intra_dq() -> T0Kernel {
     build_backward_intra("t0_ocpa_backward_intra_dq", false, 256)
 }
 
+// ════════════════════════════════════════════
+// ocpa_backward_intra_dq_c
+// ════════════════════════════════════════════
 
 
 /// Backward Intra dQ with parameterized c_chunk
@@ -663,6 +685,9 @@ pub fn ocpa_backward_intra_dq_c(c_chunk: u32) -> T0Kernel {
     build_backward_intra("t0_ocpa_backward_intra_dq", false, c_chunk)
 }
 
+// ════════════════════════════════════════════
+// ocpa_backward_intra_dkdv
+// ════════════════════════════════════════════
 
 
 /// Backward Intra dK/dV (upper mask)
@@ -670,6 +695,9 @@ pub fn ocpa_backward_intra_dkdv() -> T0Kernel {
     build_backward_intra("t0_ocpa_backward_intra_dkdv", true, 256)
 }
 
+// ════════════════════════════════════════════
+// ocpa_backward_intra_dkdv_c
+// ════════════════════════════════════════════
 
 
 /// Backward Intra dK/dV with parameterized c_chunk
@@ -677,395 +705,9 @@ pub fn ocpa_backward_intra_dkdv_c(c_chunk: u32) -> T0Kernel {
     build_backward_intra("t0_ocpa_backward_intra_dkdv", true, c_chunk)
 }
 
-
-
-fn build_backward_intra(name: &str, is_upper: bool, c_chunk: u32) -> T0Kernel {
-    let n_tile_rows = c_chunk / 16;
-    let total_tiles = n_tile_rows * (n_tile_rows + 1) / 2;
-    let lds_zclt_size = c_chunk * 132;
-    let lut_base = lds_zclt_size;
-    let lds_total = ((lut_base + total_tiles * 2 + 255) / 256) * 256;
-
-    let mut k = T0Kernel::new(name);
-    k.set_lds_size(lds_total);
-
-    // Kernarg: A_ptr, B_ptr, C_ptr, Out_ptr, seq_len
-    let a_ptr = k.arg_ptr("A");
-    let b_ptr = k.arg_ptr("B");
-    let c_ptr = k.arg_ptr("C");
-    let out_ptr = k.arg_ptr("Out");
-    let seq_len = k.arg_u32("seq_len");
-    k.emit_arg_loads();
-
-    let chunk_id = k.alloc_sreg();
-    k.capture_tgid_x(chunk_id);
-    let head_id = k.alloc_sreg();
-    k.capture_tgid_y(head_id);
-
-    let tid = VReg(0);
-    let wave_id = k.alloc_vreg();
-    k.v_lshrrev_b32(wave_id, 5, tid);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, tid, 31);
-    let lane_row = k.alloc_vreg();
-    k.v_and_b32_imm(lane_row, tid, 15);
-
-    let base_row = k.alloc_sreg();
-    k.s_mul_i32(base_row, head_id, SReg(seq_len.0));
-    let c_off = k.alloc_sreg();
-    let c_shift = match c_chunk { 32=>5, 64=>6, 128=>7, _=>8 };
-    k.s_lshl_b32(c_off, chunk_id, c_shift);
-    k.s_add_u32_ss(base_row, base_row, c_off);
-
-    // ── Phase A₀: Build 1D→2D LUT (same as forward) ──
-    let total_v = k.alloc_vreg();
-    k.v_mov_imm(total_v, total_tiles as i32);
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(tid), src1: Operand::VReg(total_v) });
-    k.branch_vccz("lut_done");
-
-    let k8 = k.alloc_vreg();
-    k.v_lshlrev_b32(k8, 3, tid);
-    let k8p1 = k.alloc_vreg();
-    k.v_mov_imm(k8p1, 1);
-    k.v_add_u32(k8p1, k8, k8p1);
-    let fk = k.alloc_vreg();
-    k.push(Op::VCvtF32U32 { dst: fk, src: k8p1 });
-    k.v_sqrt_f32(fk, fk);
-    k.push(Op::VCvtU32F32 { dst: fk, src: fk });
-    let neg1 = k.alloc_vreg();
-    k.v_mov_imm(neg1, -1i32);
-    k.v_add_u32(fk, fk, neg1);
-    let r_reg = k.alloc_vreg();
-    k.v_lshrrev_b32(r_reg, 1, fk);
-
-    let rp1 = k.alloc_vreg();
-    k.v_mov_imm(rp1, 1);
-    k.v_add_u32(rp1, r_reg, rp1);
-    let tri = k.alloc_vreg();
-    k.v_mul_lo_u32(tri, r_reg, rp1);
-    k.v_lshrrev_b32(tri, 1, tri);
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(tid), src1: Operand::VReg(tri) });
-    k.branch_vccz("r_ok");
-    k.v_add_u32(r_reg, r_reg, neg1);
-    k.v_mov_imm(rp1, 1);
-    k.v_add_u32(rp1, r_reg, rp1);
-    k.v_mul_lo_u32(tri, r_reg, rp1);
-    k.v_lshrrev_b32(tri, 1, tri);
-    k.label("r_ok");
-
-    let neg_tri = k.alloc_vreg();
-    k.push(Op::VXorB32 { dst: neg_tri, src0: Operand::VReg(tri), src1: Operand::VReg(neg1) });
-    let one_v = k.alloc_vreg();
-    k.v_mov_imm(one_v, 1);
-    k.v_add_u32(neg_tri, neg_tri, one_v);
-    let c_reg = k.alloc_vreg();
-    k.v_add_u32(c_reg, tid, neg_tri);
-
-    let packed = k.alloc_vreg();
-    k.v_lshlrev_b32(packed, 8, r_reg);
-    k.v_or_b32(packed, Operand::VReg(packed), Operand::VReg(c_reg));
-
-    let lut_addr = k.alloc_vreg();
-    k.v_lshlrev_b32(lut_addr, 1, tid);
-    let lut_base_v = k.alloc_vreg();
-    k.v_mov_imm(lut_base_v, lut_base as i32);
-    k.v_add_u32(lut_addr, lut_addr, lut_base_v);
-    k.push(Op::DsStoreB16 { vaddr: lut_addr, src: packed, offset: 0 });
-    k.label("lut_done");
-    k.wait_lgkmcnt(0);
-
-    // ── Phase A: ZCLT-load C to LDS (132B stride) ──
-    let v_row = k.alloc_vreg();
-    k.v_lshrrev_b32(v_row, 1, tid);
-    let col_grp = k.alloc_vreg();
-    k.v_and_b32_imm(col_grp, tid, 1);
-    let col_bytes = k.alloc_vreg();
-    k.v_lshlrev_b32(col_bytes, 6, col_grp);
-
-    let lds_row = if c_chunk < 256 {
-        let clamped = k.alloc_vreg();
-        k.v_and_b32_imm(clamped, v_row, c_chunk - 1);
-        clamped
-    } else { v_row };
-
-    let v_off = k.alloc_vreg();
-    k.v_mov_from_sgpr(v_off, base_row);
-    k.v_add_u32(v_off, v_off, lds_row);
-    k.v_lshlrev_b32(v_off, 7, v_off);
-    k.v_add_u32(v_off, v_off, col_bytes);
-
-    let c_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(c_addr, SReg(c_ptr.0));
-    k.v_mov_from_sgpr(VReg(c_addr.0 + 1), SReg(c_ptr.0 + 1));
-    k.v_add_co(c_addr, c_addr, v_off);
-    k.v_add_co_ci(VReg(c_addr.0 + 1), VReg(c_addr.0 + 1));
-
-    let c_data = k.alloc_vreg_array(16, Alignment::Align4);
-    for i in 0..4u32 {
-        k.global_load(VReg(c_data.0 + i * 4), c_addr, Width::B128, (i * 16) as i32);
-    }
-
-    let s132 = k.alloc_sreg();
-    k.s_mov_imm(s132, 132);
-    let stride132 = k.alloc_vreg();
-    k.v_mov_from_sgpr(stride132, s132);
-    let lds_wr = k.alloc_vreg();
-    k.v_mul_lo_u32(lds_wr, lds_row, stride132);
-    k.v_add_u32(lds_wr, lds_wr, col_bytes);
-    k.wait_vmcnt(0);
-    for i in 0..4u32 {
-        k.ds_store_b128(lds_wr, VReg(c_data.0 + i * 4), (i * 16) as u16);
-    }
-    k.wait_lgkmcnt(0);
-    k.s_barrier();
-
-    // ── Prepare Out base ──
-    let wave_id_s = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: wave_id_s, src: wave_id });
-    let o_base_lo = k.alloc_sreg();
-    let o_base_hi = k.alloc_sreg();
-    let tmp_off = k.alloc_sreg();
-    k.s_lshl_b32(tmp_off, base_row, 8);
-    k.s_add_u32_ss(o_base_lo, SReg(out_ptr.0), tmp_off);
-    k.s_addc_u32_imm(o_base_hi, SReg(out_ptr.0 + 1), 0);
-
-    // ── Main loop setup ──
-    let k_task = k.alloc_sreg();
-    k.push(Op::SMov { dst: k_task, src: SOperand::SReg(wave_id_s) });
-    let cur_a = k.alloc_sreg();
-    k.s_mov_imm(cur_a, -1i32);
-    let s_total = k.alloc_sreg();
-    k.s_mov_imm(s_total, total_tiles as i32);
-    k.s_cmp_ge_u32(k_task, s_total);
-    k.branch_scc1("epilogue");
-
-    let a_frag = k.alloc_vreg_array(32, Alignment::Align8);
-    let b_frag = k.alloc_vreg_array(32, Alignment::Align8);
-    let p_acc = k.alloc_vreg_array(8, Alignment::Align8);
-    let o_acc = k.alloc_vreg_array(32, Alignment::Align8);
-    let p_trans = k.alloc_vreg_array(8, Alignment::Align8);
-    let c_tile = k.alloc_vreg_array(8, Alignment::Align8);
-
-    k.label("main_loop");
-
-    // ── LUT lookup ──
-    let lut_off = k.alloc_sreg();
-    k.s_lshl_b32(lut_off, k_task, 1);
-    let lut_base_s = k.alloc_sreg();
-    k.s_mov_imm(lut_base_s, lut_base as i32);
-    k.s_add_u32_ss(lut_off, lut_off, lut_base_s);
-    let lut_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(lut_v, lut_off);
-    let lut_val = k.alloc_vreg();
-    k.push(Op::DsLoadU16 { dst: lut_val, vaddr: lut_v, offset: 0 });
-    k.wait_lgkmcnt(0);
-
-    let lut_r_v = k.alloc_vreg();
-    k.v_lshrrev_b32(lut_r_v, 8, lut_val);
-    let lut_r = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: lut_r, src: lut_r_v });
-    let lut_c_v = k.alloc_vreg();
-    k.v_and_b32_imm(lut_c_v, lut_val, 0xFF);
-    let lut_c = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: lut_c, src: lut_c_v });
-
-    // For upper triangle: A_tile = lut_c, B_tile = lut_r
-    // For lower triangle: A_tile = lut_r, B_tile = lut_c
-    let a_tile = k.alloc_sreg();
-    let b_tile = k.alloc_sreg();
-    if is_upper {
-        k.push(Op::SMov { dst: a_tile, src: SOperand::SReg(lut_c) });
-        k.push(Op::SMov { dst: b_tile, src: SOperand::SReg(lut_r) });
-    } else {
-        k.push(Op::SMov { dst: a_tile, src: SOperand::SReg(lut_r) });
-        k.push(Op::SMov { dst: b_tile, src: SOperand::SReg(lut_c) });
-    }
-
-    // ── Conditional A_slice load ──
-    k.push(Op::SCmpEqU32 { src0: a_tile, src1: SOperand::SReg(cur_a) });
-    k.branch_scc1("skip_a_load");
-    k.push(Op::SMov { dst: cur_a, src: SOperand::SReg(a_tile) });
-
-    let a_row = k.alloc_sreg();
-    k.s_lshl_b32(a_row, a_tile, 4);
-    k.s_add_u32_ss(a_row, a_row, base_row);
-    let a_row_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(a_row_v, a_row);
-    k.v_add_u32(a_row_v, a_row_v, lane_row);
-    k.v_lshlrev_b32(a_row_v, 7, a_row_v);
-    let a_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(a_addr, SReg(a_ptr.0));
-    k.v_mov_from_sgpr(VReg(a_addr.0 + 1), SReg(a_ptr.0 + 1));
-    k.v_add_co(a_addr, a_addr, a_row_v);
-    k.v_add_co_ci(VReg(a_addr.0 + 1), VReg(a_addr.0 + 1));
-    for i in 0..8u32 {
-        k.global_load(VReg(a_frag.0 + i * 4), a_addr, Width::B128, (i * 16) as i32);
-    }
-    for i in 0..32u32 {
-        k.v_mov_imm(VReg(o_acc.0 + i), 0);
-    }
-    k.wait_vmcnt(0);
-    k.label("skip_a_load");
-
-    // ── Load B_tile ──
-    let b_row = k.alloc_sreg();
-    k.s_lshl_b32(b_row, b_tile, 4);
-    k.s_add_u32_ss(b_row, b_row, base_row);
-    let b_off = k.alloc_sreg();
-    k.s_lshl_b32(b_off, b_row, 7);
-    let b_off_v = k.alloc_vreg();
-    k.v_lshlrev_b32(b_off_v, 7, lane_row);
-    let b_off_s_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(b_off_s_v, b_off);
-    k.v_add_u32(b_off_v, b_off_v, b_off_s_v);
-    let b_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(b_addr, SReg(b_ptr.0));
-    k.v_mov_from_sgpr(VReg(b_addr.0 + 1), SReg(b_ptr.0 + 1));
-    k.v_add_co(b_addr, b_addr, b_off_v);
-    k.v_add_co_ci(VReg(b_addr.0 + 1), VReg(b_addr.0 + 1));
-    for i in 0..8u32 {
-        k.global_load(VReg(b_frag.0 + i * 4), b_addr, Width::B128, (i * 16) as i32);
-    }
-    for i in 0..8u32 {
-        k.v_mov_imm(VReg(p_acc.0 + i), 0);
-    }
-    k.wait_vmcnt(0);
-
-    // ── WMMA: P^T = B @ A^T ──
-    for kg in 0..4u32 {
-        k.wmma_bf16_f32(p_acc, VReg(b_frag.0 + kg * 8), VReg(a_frag.0 + kg * 8), p_acc);
-    }
-
-    // ── Causal mask (diagonal only: lut_r == lut_c) ──
-    k.push(Op::SCmpEqU32 { src0: lut_r, src1: SOperand::SReg(lut_c) });
-    k.branch_scc0("mask_done");
-
-    let lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(lane_half, 4, lane_id);
-    let zero_f = k.alloc_vreg();
-    k.v_mov_imm(zero_f, 0);
-    let one_f = k.alloc_vreg();
-    k.v_mov_imm(one_f, 0x3F800000u32 as i32);
-
-    for vk in 0..8u32 {
-        let row_v = k.alloc_vreg();
-        if vk == 0 {
-            k.push(Op::VMov { dst: row_v, src: Operand::VReg(lane_half) });
-        } else {
-            k.v_mov_imm(row_v, (2 * vk) as i32);
-            k.v_add_u32(row_v, lane_half, row_v);
-        }
-        if is_upper {
-            // Upper: keep where col >= row in P^T → row_v >= lane_row
-            k.v_cmp_ge_i32(row_v, lane_row);
-        } else {
-            // Lower: keep where col <= row in P^T → lane_row >= row_v
-            k.v_cmp_ge_i32(lane_row, row_v);
-        }
-        k.push(Op::VCndmaskB32 { dst: row_v, src_false: Operand::VReg(zero_f), src_true: Operand::VReg(one_f) });
-        k.push(Op::VMulF32 { dst: VReg(p_acc.0 + vk), src0: Operand::VReg(VReg(p_acc.0 + vk)), src1: Operand::VReg(row_v) });
-    }
-    k.label("mask_done");
-    k.clear_vcc(); // prevent VCC residual from mask cmp affecting v_add_co_ci
-
-    // ── C-layout → A-operand transpose (pure VALU, no LDS) ──
-    k.reg_transpose_c_to_ab(p_trans, p_acc, c_tile);
-
-    // ── C-tile from LDS and WMMA (4 v-groups) ──
-    let lds_read_base = k.alloc_vreg();
-    k.v_and_b32_imm(lds_read_base, lane_row, 15);
-    k.v_lshlrev_b32(lds_read_base, 1, lds_read_base);
-    let s2112 = k.alloc_sreg();
-    k.s_mov_imm(s2112, 2112);
-    let c_lds_base = k.alloc_sreg();
-    k.s_mul_i32(c_lds_base, b_tile, s2112);
-
-    for vg in 0..4u32 {
-        let col_off = vg * 32;
-        let lds_off = k.alloc_sreg();
-        k.s_mov_imm(lds_off, col_off as i32);
-        k.s_add_u32_ss(lds_off, c_lds_base, lds_off);
-        let lds_addr = k.alloc_vreg();
-        k.v_mov_from_sgpr(lds_addr, lds_off);
-        k.v_add_u32(lds_addr, lds_read_base, lds_addr);
-
-        for vk in 0..8u32 {
-            k.ds_load_u16_d16(VReg(c_tile.0 + vk), lds_addr, (vk * 2 * 132) as u16);
-            k.ds_load_u16_d16_hi(VReg(c_tile.0 + vk), lds_addr, ((vk * 2 + 1) * 132) as u16);
-        }
-        k.wait_lgkmcnt(0);
-        k.wmma_bf16_f32(VReg(o_acc.0 + vg * 8), p_trans, c_tile, VReg(o_acc.0 + vg * 8));
-    }
-
-    // ── Flush check ──
-    let next_k = k.alloc_sreg();
-    k.s_add_u32(next_k, k_task, 16);
-    k.s_cmp_ge_u32(next_k, s_total);
-    k.branch_scc1("flush");
-
-    let next_lut_off = k.alloc_sreg();
-    k.s_lshl_b32(next_lut_off, next_k, 1);
-    k.s_add_u32_ss(next_lut_off, next_lut_off, lut_base_s);
-    let next_lut_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(next_lut_v, next_lut_off);
-    let next_lut_val = k.alloc_vreg();
-    k.push(Op::DsLoadU16 { dst: next_lut_val, vaddr: next_lut_v, offset: 0 });
-    k.wait_lgkmcnt(0);
-
-    // Determine next A_tile
-    let next_a_v = k.alloc_vreg();
-    if is_upper {
-        k.v_and_b32_imm(next_a_v, next_lut_val, 0xFF); // next_lut_c = A_tile for upper
-    } else {
-        k.v_lshrrev_b32(next_a_v, 8, next_lut_val); // next_lut_r = A_tile for lower
-    }
-    let next_a = k.alloc_sreg();
-    k.push(Op::VReadfirstlane { dst: next_a, src: next_a_v });
-    k.push(Op::SCmpEqU32 { src0: next_a, src1: SOperand::SReg(a_tile) });
-    k.branch_scc1("skip_flush");
-
-    // ── Flush ──
-    k.label("flush");
-    let flush_lane_half = k.alloc_vreg();
-    k.v_lshrrev_b32(flush_lane_half, 4, lane_id);
-    let a16 = k.alloc_sreg();
-    k.s_lshl_b32(a16, a_tile, 4);
-    let a16_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(a16_v, a16);
-    k.v_add_u32(a16_v, a16_v, flush_lane_half);
-    let row_off = k.alloc_vreg();
-    k.v_lshlrev_b32(row_off, 8, a16_v);
-    let col_off_v = k.alloc_vreg();
-    k.v_lshlrev_b32(col_off_v, 2, lane_row);
-
-    let o_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(o_addr, o_base_lo);
-    k.v_mov_from_sgpr(VReg(o_addr.0 + 1), o_base_hi);
-    k.v_add_co(o_addr, o_addr, row_off);
-    k.v_add_co_ci(VReg(o_addr.0 + 1), VReg(o_addr.0 + 1));
-    k.v_add_co(o_addr, o_addr, col_off_v);
-    k.v_add_co_ci(VReg(o_addr.0 + 1), VReg(o_addr.0 + 1));
-
-    for vg in 0..4u32 {
-        for vk in 0..8u32 {
-            let off = (vk as i32) * 512 + (vg as i32) * 64;
-            k.global_atomic_add_f32(o_addr, VReg(o_acc.0 + vg * 8 + vk), off);
-        }
-    }
-    k.wait_vmcnt(0);
-    k.label("skip_flush");
-
-    k.s_add_u32(k_task, k_task, 16);
-    k.s_cmp_lt_u32(k_task, s_total);
-    k.branch_scc1("main_loop");
-
-    k.label("epilogue");
-    k.wait_vmcnt(0);
-    k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
+// ════════════════════════════════════════════
+// ocpa_state_update
+// ════════════════════════════════════════════
 
 
 // ============================================================================
@@ -1348,6 +990,9 @@ pub fn ocpa_state_update() -> T0Kernel {
     k
 }
 
+// ════════════════════════════════════════════
+// t0_row_reduce_sum
+// ════════════════════════════════════════════
 
 
 // ══════════════════════════════════════════════════════════════
@@ -1369,6 +1014,9 @@ pub fn t0_row_reduce_sum() -> T0Kernel {
     t0_row_reduce_generic(RowReduceOp::Sum)
 }
 
+// ════════════════════════════════════════════
+// t0_row_reduce_max
+// ════════════════════════════════════════════
 
 
 /// Row-wise max: out[row] = max(in[row, 0..cols])
@@ -1376,6 +1024,9 @@ pub fn t0_row_reduce_max() -> T0Kernel {
     t0_row_reduce_generic(RowReduceOp::Max)
 }
 
+// ════════════════════════════════════════════
+// t0_row_reduce_sum_sq
+// ════════════════════════════════════════════
 
 
 /// Row-wise sum of squares: out[row] = sum(in[row, :]²)
@@ -1384,6 +1035,9 @@ pub fn t0_row_reduce_sum_sq() -> T0Kernel {
     t0_row_reduce_generic(RowReduceOp::SumSq)
 }
 
+// ════════════════════════════════════════════
+// t0_row_broadcast_sub
+// ════════════════════════════════════════════
 
 
 // ══════════════════════════════════════════════════════════════
@@ -1398,6 +1052,9 @@ pub fn t0_row_broadcast_sub() -> T0Kernel {
     t0_row_broadcast_generic(RowBroadcastOp::Sub)
 }
 
+// ════════════════════════════════════════════
+// t0_row_broadcast_div
+// ════════════════════════════════════════════
 
 
 /// Row broadcast div: out[r,c] = x[r,c] / vec[r]
@@ -1406,275 +1063,14 @@ pub fn t0_row_broadcast_div() -> T0Kernel {
     t0_row_broadcast_generic(RowBroadcastOp::Div)
 }
 
+// ════════════════════════════════════════════
+// t0_row_broadcast_exp_sub
+// ════════════════════════════════════════════
 
 
 /// Row broadcast exp(sub): out[r,c] = exp(x[r,c] - vec[r])
 /// Fused shift+exp for Softmax (saves one kernel launch + memory pass)
 pub fn t0_row_broadcast_exp_sub() -> T0Kernel {
     t0_row_broadcast_generic(RowBroadcastOp::ExpSub)
-}
-
-
-enum RowReduceOp { Sum, Max, SumSq }
-
-
-
-fn t0_row_reduce_generic(op: RowReduceOp) -> T0Kernel {
-    use super::ir::*;
-
-    let name = match op {
-        RowReduceOp::Sum   => "t0_row_reduce_sum",
-        RowReduceOp::Max   => "t0_row_reduce_max",
-        RowReduceOp::SumSq => "t0_row_reduce_sum_sq",
-    };
-    let mut k = T0Kernel::new(name);
-    k.set_wg_size(32); // single wave per WG
-
-    // ── Kernarg: [in_ptr(u64), out_ptr(u64), cols(u32)] ──
-    let in_ptr = k.arg_ptr("in");
-    let out_ptr = k.arg_ptr("out");
-    let cols_arg = k.arg_u32("cols");
-    k.emit_arg_loads();
-
-    // wg_id = row index
-    let wg_id = k.alloc_sreg();
-    k.capture_tgid_x(wg_id);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-
-    // row byte offset = wg_id * cols * 4
-    let row_byte_off = k.alloc_sreg();
-    k.s_mul_i32(row_byte_off, wg_id, SReg(cols_arg.0));
-    k.s_lshl_b32(row_byte_off, row_byte_off, 2); // * 4 bytes
-
-    // in_row_ptr = in_ptr + row_byte_off
-    let in_row_lo = k.alloc_sreg();
-    let in_row_hi = k.alloc_sreg();
-    k.s_add_u32_ss(in_row_lo, SReg(in_ptr.0), row_byte_off);
-    k.s_addc_u32_imm(in_row_hi, SReg(in_ptr.0 + 1), 0);
-
-    // ── Initialize accumulator ──
-    let acc = k.alloc_vreg();
-    match op {
-        RowReduceOp::Sum | RowReduceOp::SumSq => k.v_mov_imm(acc, 0), // 0.0
-        RowReduceOp::Max => k.v_mov_imm(acc, 0xFF800000u32 as i32),    // -inf
-    }
-
-    // ── Main loop: stride=32 over columns ──
-    let loop_base = k.alloc_sreg();
-    k.s_mov_imm(loop_base, 0);
-    let loop_label = k.make_label("row_loop");
-    k.label(&loop_label);
-
-    // col = loop_base + lane_id
-    let col = k.alloc_vreg();
-    k.v_mov_from_sgpr(col, loop_base);
-    k.v_add_u32(col, col, lane_id);
-
-    // Bounds check: col < cols (EXEC mask)
-    let cols_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(cols_v, SReg(cols_arg.0));
-    let saved_exec = k.alloc_sreg();
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(col), src1: Operand::VReg(cols_v) });
-    k.push(Op::SaveExec { dst: saved_exec });
-
-    // Load in[row, col]
-    let byte_col = k.alloc_vreg();
-    k.v_lshlrev_b32(byte_col, 2, col); // col * 4
-    let load_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(load_addr, in_row_lo);
-    k.v_mov_from_sgpr(VReg(load_addr.0 + 1), in_row_hi);
-    k.v_add_co(load_addr, load_addr, byte_col);
-    k.v_add_co_ci(VReg(load_addr.0 + 1), VReg(load_addr.0 + 1));
-    let val = k.alloc_vreg();
-    k.global_load(val, load_addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-
-    // Accumulate
-    match op {
-        RowReduceOp::Sum => k.v_add_f32(acc, acc, val),
-        RowReduceOp::Max => k.v_max_f32(acc, acc, val),
-        RowReduceOp::SumSq => {
-            let sq = k.alloc_vreg();
-            k.v_mul_f32(sq, val, val);
-            k.v_add_f32(acc, acc, sq);
-        }
-    }
-
-    // Restore EXEC
-    k.push(Op::RestoreExec { src: saved_exec });
-
-    // loop_base += 32
-    k.s_add_u32(loop_base, loop_base, 32);
-    k.s_cmp_lt_u32(loop_base, SReg(cols_arg.0));
-    k.branch_scc1(&loop_label);
-
-    // ── Wave32 butterfly reduce ──
-    let tmp = k.alloc_vreg();
-    match op {
-        RowReduceOp::Sum | RowReduceOp::SumSq => k.wave_reduce_add_f32(acc, tmp),
-        RowReduceOp::Max => k.wave_reduce_max_f32(acc, tmp),
-    }
-
-    // ── Lane 0 writes out[row] ──
-    // byte_off = wg_id * 4
-    let out_byte = k.alloc_sreg();
-    k.s_lshl_b32(out_byte, wg_id, 2);
-    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(out_addr, SReg(out_ptr.0));
-    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), SReg(out_ptr.0 + 1));
-    let out_off_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(out_off_v, out_byte);
-    k.v_add_co(out_addr, out_addr, out_off_v);
-    k.v_add_co_ci(VReg(out_addr.0 + 1), VReg(out_addr.0 + 1));
-
-    // Only lane 0 writes
-    let exec_save2 = k.alloc_sreg();
-    k.push(Op::VCmpEqU32Imm { src: lane_id, imm: 0 });
-    k.push(Op::SaveExec { dst: exec_save2 });
-    k.global_store(out_addr, acc, Width::B32, 0);
-    k.push(Op::RestoreExec { src: exec_save2 });
-
-    k.wait_vmcnt(0); k.wait_vscnt(0);
-    k.endpgm();
-    k
-}
-
-
-enum RowBroadcastOp { Sub, Div, ExpSub }
-
-
-
-fn t0_row_broadcast_generic(op: RowBroadcastOp) -> T0Kernel {
-    use super::ir::*;
-
-    let name = match op {
-        RowBroadcastOp::Sub    => "t0_row_broadcast_sub",
-        RowBroadcastOp::Div    => "t0_row_broadcast_div",
-        RowBroadcastOp::ExpSub => "t0_row_broadcast_exp_sub",
-    };
-    let mut k = T0Kernel::new(name);
-    k.set_wg_size(32);
-
-    // Kernarg: [x_ptr(u64), vec_ptr(u64), out_ptr(u64), cols(u32)]
-    let x_ptr = k.arg_ptr("x");
-    let vec_ptr = k.arg_ptr("vec");
-    let out_ptr = k.arg_ptr("out");
-    let cols_arg = k.arg_u32("cols");
-    k.emit_arg_loads();
-
-    let wg_id = k.alloc_sreg();
-    k.capture_tgid_x(wg_id);
-    let lane_id = k.alloc_vreg();
-    k.v_and_b32_imm(lane_id, VReg(0), 31);
-
-    // row byte offset = wg_id * cols * 4
-    let row_byte_off = k.alloc_sreg();
-    k.s_mul_i32(row_byte_off, wg_id, SReg(cols_arg.0));
-    k.s_lshl_b32(row_byte_off, row_byte_off, 2);
-
-    // x_row = x_ptr + row_byte_off
-    let x_row_lo = k.alloc_sreg();
-    let x_row_hi = k.alloc_sreg();
-    k.s_add_u32_ss(x_row_lo, SReg(x_ptr.0), row_byte_off);
-    k.s_addc_u32_imm(x_row_hi, SReg(x_ptr.0 + 1), 0);
-
-    // out_row = out_ptr + row_byte_off
-    let out_row_lo = k.alloc_sreg();
-    let out_row_hi = k.alloc_sreg();
-    k.s_add_u32_ss(out_row_lo, SReg(out_ptr.0), row_byte_off);
-    k.s_addc_u32_imm(out_row_hi, SReg(out_ptr.0 + 1), 0);
-
-    // Load vec[row] — scalar, same for all lanes
-    let vec_byte_off = k.alloc_sreg();
-    k.s_lshl_b32(vec_byte_off, wg_id, 2); // wg_id * 4
-    let vec_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(vec_addr, SReg(vec_ptr.0));
-    k.v_mov_from_sgpr(VReg(vec_addr.0 + 1), SReg(vec_ptr.0 + 1));
-    let vec_off_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(vec_off_v, vec_byte_off);
-    k.v_add_co(vec_addr, vec_addr, vec_off_v);
-    k.v_add_co_ci(VReg(vec_addr.0 + 1), VReg(vec_addr.0 + 1));
-    let row_scalar = k.alloc_vreg();
-    k.global_load(row_scalar, vec_addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-
-    // For div: pre-compute rcp(vec[row]) = 1/vec[row]
-    if matches!(op, RowBroadcastOp::Div) {
-        k.v_rcp_f32(row_scalar, row_scalar);
-    }
-
-    // For exp_sub: pre-compute log2(e) constant for v_exp_f32 (which computes 2^x)
-    // IMPORTANT: only allocate this VReg when needed!
-    // An unused VReg has first_use=MAX which triggers incorrect expiry of
-    // row_scalar in the register allocator's liveness analysis.
-    let log2e = if matches!(op, RowBroadcastOp::ExpSub) {
-        let v = k.alloc_vreg();
-        k.v_mov_imm(v, 0x3FB8AA3Bu32 as i32); // log2(e) = 1.4426950..
-        v
-    } else {
-        VReg(0) // dummy, never used
-    };
-
-    // ── Main loop: stride=32 ──
-    let loop_base = k.alloc_sreg();
-    k.s_mov_imm(loop_base, 0);
-    let loop_label = k.make_label("bcast_loop");
-    k.label(&loop_label);
-
-    let col = k.alloc_vreg();
-    k.v_mov_from_sgpr(col, loop_base);
-    k.v_add_u32(col, col, lane_id);
-
-    // Bounds check
-    let cols_v = k.alloc_vreg();
-    k.v_mov_from_sgpr(cols_v, SReg(cols_arg.0));
-    let saved_exec = k.alloc_sreg();
-    k.push(Op::VCmpLtU32 { src0: Operand::VReg(col), src1: Operand::VReg(cols_v) });
-    k.push(Op::SaveExec { dst: saved_exec });
-
-    // Load x[row, col]
-    let byte_col = k.alloc_vreg();
-    k.v_lshlrev_b32(byte_col, 2, col);
-    let x_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(x_addr, x_row_lo);
-    k.v_mov_from_sgpr(VReg(x_addr.0 + 1), x_row_hi);
-    k.v_add_co(x_addr, x_addr, byte_col);
-    k.v_add_co_ci(VReg(x_addr.0 + 1), VReg(x_addr.0 + 1));
-    let x_val = k.alloc_vreg();
-    k.global_load(x_val, x_addr, Width::B32, 0);
-    k.wait_vmcnt(0);
-
-    // Apply operation
-    let result = k.alloc_vreg();
-    match op {
-        RowBroadcastOp::Sub => k.v_sub_f32(result, x_val, row_scalar),
-        RowBroadcastOp::Div => k.v_mul_f32(result, x_val, row_scalar), // x * rcp(vec)
-        RowBroadcastOp::ExpSub => {
-            k.v_sub_f32(result, x_val, row_scalar);     // x - max
-            k.v_mul_f32(result, result, log2e);          // (x - max) * log2(e)
-            k.v_exp_f32(result, result);                 // 2^((x-max)*log2(e)) = e^(x-max)
-        }
-    }
-
-    // Store out[row, col]
-    let out_addr = k.alloc_vreg_array(2, Alignment::Align2);
-    k.v_mov_from_sgpr(out_addr, out_row_lo);
-    k.v_mov_from_sgpr(VReg(out_addr.0 + 1), out_row_hi);
-    k.v_add_co(out_addr, out_addr, byte_col);
-    k.v_add_co_ci(VReg(out_addr.0 + 1), VReg(out_addr.0 + 1));
-    k.global_store(out_addr, result, Width::B32, 0);
-
-    // Restore EXEC
-    k.push(Op::RestoreExec { src: saved_exec });
-
-    // loop_base += 32
-    k.s_add_u32(loop_base, loop_base, 32);
-    k.s_cmp_lt_u32(loop_base, SReg(cols_arg.0));
-    k.branch_scc1(&loop_label);
-
-    k.wait_vmcnt(0); k.wait_vscnt(0);
-    k.endpgm();
-    k
 }
 

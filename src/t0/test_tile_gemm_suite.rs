@@ -163,143 +163,14 @@ mod tests {
             wgp_mode: false, split_k: 1, swap_grid: true }
     }
 
-    // ════════ Square GEMM tests ════════
-    // NOTE: Individual tests are #[ignore] because sequential execution causes
-    // KFD VA-reuse race (each test creates/destroys GpuRuntime → buffer Drop → UNMAP/FREE).
-    // Use test_tg_combo_sequential as the primary test entry point.
-    // Run individual tests with: cargo test -- test_tg_128 --ignored
 
-    #[test] #[ignore] fn test_tg_128() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 128, 128, 128, c128()).unwrap();
-        let tf = 2.0*128f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 128³: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 0.1); assert_eq!(b, 0);
-    }
 
-    #[test] #[ignore] fn test_tg_256() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 256, 256, 256, c128()).unwrap();
-        let tf = 2.0*256f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 256³: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 0.5); assert_eq!(b, 0);
-    }
 
-    #[test] #[ignore] fn test_tg_512() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 512, 512, 512, c128()).unwrap();
-        let tf = 2.0*512f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 512³: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 1.0); assert_eq!(b, 0);
-    }
 
-    #[test] #[ignore] fn test_tg_1024() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 1024, 1024, 1024, c128()).unwrap();
-        let tf = 2.0*1024f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 1024³: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 5.0); assert_eq!(b, 0);
-    }
-
-    // ════════ Rectangular tests ════════
-
-    #[test] #[ignore] fn test_tg_128x1024x512() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 128, 1024, 512, c128()).unwrap();
-        let tf = 2.0*128.0*1024.0*512.0/(us*1e6);
-        eprintln!("[tile_gemm] 128×1024×512: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 5.0); assert_eq!(b, 0);
-    }
-
-    #[test] #[ignore] fn test_tg_256x512x128() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 256, 512, 128, c128()).unwrap();
-        let tf = 2.0*256.0*512.0*128.0/(us*1e6);
-        eprintln!("[tile_gemm] 256×512×128: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 1.0); assert_eq!(b, 0);
-    }
-
-    // ════════ Different tile configs ════════
-
-    #[test] #[ignore] fn test_tg_64x64_tile() {
-        let rt = setup();
-        let cfg = TileGemmConfig { tile_m: 64, tile_n: 64, tile_k: 16,
-            wgp_mode: false, split_k: 1, swap_grid: true };
-        let (e,b,us) = run(&rt, 256, 256, 256, cfg).unwrap();
-        let tf = 2.0*256f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 256³@64x64: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 0.5); assert_eq!(b, 0);
-    }
-
-    #[test] #[ignore] fn test_tg_32x64_tile() {
-        let rt = setup();
-        let cfg = TileGemmConfig { tile_m: 32, tile_n: 64, tile_k: 16,
-            wgp_mode: false, split_k: 1, swap_grid: true };
-        let (e,b,us) = run(&rt, 128, 128, 128, cfg).unwrap();
-        let tf = 2.0*128f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 128³@32x64: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 0.1); assert_eq!(b, 0);
-    }
-
-    // ════════ Determinism ════════
-
-    #[test] #[ignore] fn test_tg_deterministic() {
-        let rt = setup();
-        let mut errs = Vec::new();
-        for _ in 0..5 {
-            let (e,_,_) = run(&rt, 128, 128, 128, c128()).unwrap();
-            errs.push(e);
-        }
-        for i in 1..5 {
-            assert!((errs[i]-errs[0]).abs() < 1e-7, "non-det run{}: {}!={}", i, errs[i], errs[0]);
-        }
-        eprintln!("[tile_gemm] deterministic ✓ (5 runs, err={:.2e})", errs[0]);
-    }
-
-    // ════════ Stress (large) ════════
-
-    #[test] #[ignore] fn test_tg_2048() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 2048, 2048, 2048, c128()).unwrap();
-        let tf = 2.0*2048f64.powi(3)/(us*1e6);
-        eprintln!("[tile_gemm] 2048³: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 20.0); assert_eq!(b, 0);
-    }
-
-    // ════════ Non-aligned dimension tests (boundary masking) ════════
 
     fn c32() -> TileGemmConfig {
         TileGemmConfig { tile_m: 32, tile_n: 64, tile_k: 16,
             wgp_mode: false, split_k: 1, swap_grid: true }
-    }
-
-    #[test] #[ignore] fn test_tg_100x300x200() {
-        let rt = setup();
-        let (e,b,_) = run(&rt, 100, 300, 200, c32()).unwrap();
-        eprintln!("[tile_gemm] 100×300×200: err={:.2e} bad={}", e, b);
-        assert!(e < 5.0, "err={}", e); assert_eq!(b, 0);
-    }
-
-    #[test] #[ignore] fn test_tg_129x65x17() {
-        let rt = setup();
-        let (e,b,_) = run(&rt, 129, 65, 17, c128()).unwrap();
-        eprintln!("[tile_gemm] 129×65×17: err={:.2e} bad={}", e, b);
-        assert!(e < 0.5, "err={}", e); assert_eq!(b, 0);
-    }
-
-    #[test] #[ignore] fn test_tg_1000x768x512() {
-        let rt = setup();
-        let (e,b,us) = run(&rt, 1000, 768, 512, c128()).unwrap();
-        let tf = 2.0*1000.0*768.0*512.0/(us*1e6);
-        eprintln!("[tile_gemm] 1000×768×512: err={:.2e} bad={} {:.0}μs {:.2}TF", e, b, us, tf);
-        assert!(e < 5.0, "err={}", e); assert_eq!(b, 0);
-    }
-
-    #[test] #[ignore] fn test_tg_33x100x50() {
-        let rt = setup();
-        let (e,b,_) = run(&rt, 33, 100, 50, c32()).unwrap();
-        eprintln!("[tile_gemm] 33×100×50: err={:.2e} bad={}", e, b);
-        assert!(e < 1.0, "err={}", e); assert_eq!(b, 0);
     }
 
     /// Sequential combo: runs multiple GEMM dimensions within ONE test function.

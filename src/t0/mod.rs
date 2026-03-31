@@ -30,25 +30,33 @@ pub mod tile_ir;
 pub mod tile_ssa;
 pub mod tile_ssa_lower;
 pub mod block_dsl_to_ssa;
-pub mod hw_probe;
+
 pub mod ssa_ir;
 pub mod ssa_regalloc;
 pub mod domtree;
 pub mod isa_verifier;
-pub mod gpu_printf;
-pub mod profile_guided;
+
+
 pub mod insn_latency;
-pub mod kloop_simulator;
-pub mod autotune_oracle;
+
+
 pub mod auto_gemm;
 pub mod softmax_kernels;
 pub mod ce_loss_kernels;
 pub mod rope_kernels;
 pub mod causal_mask_kernels;
+pub mod rmsnorm_kernels;
+pub mod embedding_kernels;
+pub mod adamw_kernels;
+pub mod elementwise_kernels;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]
 mod test_tile_gemm_suite;
+#[cfg(test)]
+mod precision_vs_torch;
+#[cfg(test)]
+mod tile_boundary_tests;
 
 pub use ir::*;
 pub use compile::T0Kernel;

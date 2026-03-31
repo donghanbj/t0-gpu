@@ -337,7 +337,7 @@ impl Tape {
 
     /// GPU gradient accumulation: existing_buf += new_buf (in-place).
     ///
-    /// Uses t0_residual_add kernel for element-wise y[i] += x[i].
+    /// Uses BlockDSL residual_add kernel for element-wise y[i] += x[i].
     /// This is called during backward when a tensor's gradient is contributed
     /// to by multiple ops (e.g., a parameter used in multiple layers).
     fn gpu_accumulate_grad(
@@ -349,16 +349,12 @@ impl Tape {
         let n_elems = (n_bytes / 4) as u32;
         if n_elems == 0 { return Ok(()); }
 
-        // Use simple elementwise add: epl=4 (4 elements per lane)
-        let epl = 4u32;
-        let kernel = runtime.ensure_kernel_t0(
+        let kernel = runtime.ensure_kernel_blockdsl(
             "grad_accumulate",
-            || crate::t0::math::t0_residual_add(epl),
-            [256, 1, 1],
-            0,
+            || crate::t0::elementwise_kernels::build_residual_add(),
         )?;
 
-        // t0_residual_add kernarg: [x_ptr(u64), y_ptr(u64), n_elems(u32)]
+        // residual_add kernarg: [x_ptr(u64), y_ptr(u64), n(u32)]
         // Semantics: y[i] += x[i]
         let ka = crate::kernargs![
             new_grad.gpu_addr() => u64,   // x = new gradient (source)
@@ -366,10 +362,7 @@ impl Tape {
             n_elems => u32                 // element count
         ];
 
-        // Grid: 1 thread per epl elements, WG=256 → up to 256*epl elements per WG
-        let threads = (n_elems + epl - 1) / epl;
-        let wg = 256u32;
-        let grid_x = ((threads + wg - 1) / wg) * wg;
+        let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n_elems);
         runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)
     }
 

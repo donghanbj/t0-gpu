@@ -1555,11 +1555,16 @@ pub fn lower_gemm(spec: &TileGemm) -> T0Kernel {
             &epi_ctx,
         );
     } else {
-        // Standard store: all acc are live in VGPRs
+        // Unified store path: always mask by M/N boundary.
+        // For interior tiles (M/N aligned to tile), all lanes pass the check — zero
+        // functional overhead, only ~5 scalar instructions/store (negligible vs K-loop).
+        // This avoids emitting two copies of store phase which doubles code size
+        // and causes VGPR overflow on large tiles (128×128 k32 → GPU hang).
         emit_store_phase(
             &mut k, &acc, &s_row_bases, base_n_s, y_ptr, n_dim, y_offset_s,
             n_row_blocks, n_col_tiles, lane_row, lane_id,
             &epi_ctx,
+            Some(SReg(m_dim.0)),  // always mask — no-op for aligned tiles
         );
     }
 
@@ -2340,25 +2345,15 @@ fn emit_store_phase(
     n_row_blocks: usize, n_col_tiles: usize,
     lane_row: VReg, lane_id: VReg,
     epilogue: &EpilogueCtx,
+    boundary: Option<SReg>,  // Some(m_dim) for boundary tiles, None for interior
 ) {
     // ── Build Y buffer resource descriptor (4 SGPRs) ──
-    // SRD = {ptr_lo + y_offset, ptr_hi, num_records=0x7FFFFFFE, flags=0x31027000}
-    // By absorbing y_offset into the SRD base, all per-element offsets are
-    // simple 32-bit values → no 64-bit carry chains in the inner loop.
-    //
-    // Performance: buffer_store matches global_store throughput.
-    // Current best: 96.4 TF @ 4096³ with 128×128 k32 (2026-03-31, post-LDS-fix).
-    // Saves 2 VGPRs per address pair vs global_store.
     let y_srd = k.alloc_sreg_quad();
-    // srd[0:1] = y_ptr + y_offset (u64 add in SGPRs)
     k.push(Op::SAddU32 { dst: y_srd, src0: SReg(y_ptr.0), src1: SOperand::SReg(y_offset_s) });
     k.push(Op::SAddcU32 { dst: SReg(y_srd.0 + 1), src0: SReg(y_ptr.0 + 1), src1: SOperand::InlineInt(0) });
-    // srd[2] = num_records (max buffer size)
     k.push(Op::SMov { dst: SReg(y_srd.0 + 2), src: SOperand::Literal(0x7FFFFFFE) });
-    // srd[3] = buffer flags (OOB suppressed, stride=0, swizzle=none)
     k.push(Op::SMov { dst: SReg(y_srd.0 + 3), src: SOperand::Literal(0x31027000) });
 
-    // lane_half = lane_id >> 4 (0 for lanes 0-15, 1 for lanes 16-31)
     let lane_half = k.alloc_vreg();
     k.v_lshrrev_b32(lane_half, 4, lane_id);
 
@@ -2373,27 +2368,41 @@ fn emit_store_phase(
     let col_base_v = k.alloc_vreg();
     k.v_mov_from_sgpr(col_base_v, base_n_s);
     k.v_add_u32(col_base_v, col_base_v, lane_row);
-    // col_bytes = col_base * 4
     let col_bytes = k.alloc_vreg();
     k.v_lshlrev_b32(col_bytes, 2, col_base_v);
 
+    // Boundary masking setup
+    let (m_vreg_opt, saved_exec) = if let Some(m_s) = boundary {
+        let m_v = k.alloc_vreg();
+        k.v_mov_from_sgpr(m_v, m_s);
+        let se = k.alloc_sreg();
+        (Some(m_v), Some(se))
+    } else {
+        (None, None)
+    };
+
     for r in 0..n_row_blocks {
-        // base_row = s_row_bases[r] + lane_half
         let base_row_v = k.alloc_vreg();
         k.v_mov_from_sgpr(base_row_v, s_row_bases[r]);
         k.v_add_u32(base_row_v, base_row_v, lane_half);
 
-        // row_bytes = base_row * N * 4 (byte offset from matrix start)
         let row_bytes = k.alloc_vreg();
         k.v_mul_lo_u32(row_bytes, base_row_v, n_vreg);
         k.v_lshlrev_b32(row_bytes, 2, row_bytes);
 
-        // voffset_base = row_bytes + col_bytes (single 32-bit VGPR!)
         let voffset_base = k.alloc_vreg();
         k.v_add_u32(voffset_base, row_bytes, col_bytes);
 
+        // Track current logical row for boundary masking
+        let cur_row = if boundary.is_some() {
+            let cr = k.alloc_vreg();
+            k.v_mov(cr, base_row_v);
+            Some(cr)
+        } else {
+            None
+        };
+
         for c in 0..n_col_tiles {
-            // voff = voffset_base + c*64 (16 cols × 4 bytes per col tile)
             let voff = k.alloc_vreg();
             k.v_mov(voff, voffset_base);
             if c > 0 {
@@ -2403,8 +2412,7 @@ fn emit_store_phase(
                 });
             }
 
-            // Compute column element index for BiasAdd:
-            // col_elem = base_n + lane_row + c*16
+            // Compute column element index for epilogue
             let col_elem_idx = if !epilogue.ops.is_empty() {
                 let col_idx = k.alloc_vreg();
                 k.v_mov(col_idx, col_base_v);
@@ -2419,22 +2427,67 @@ fn emit_store_phase(
                 None
             };
 
+            // Boundary: compute col mask once per col_tile
+            let col_mask_active = if let Some(ref _m_v) = m_vreg_opt {
+                // actual_col = col_base + c*16
+                let actual_col = k.alloc_vreg();
+                if c > 0 {
+                    k.push(Op::VAddU32 {
+                        dst: actual_col, src0: Operand::VReg(col_base_v),
+                        src1: Operand::InlineInt((c * 16) as i32),
+                    });
+                } else {
+                    k.v_mov(actual_col, col_base_v);
+                }
+                Some(actual_col)
+            } else {
+                None
+            };
+
             let a_idx = r * n_col_tiles + c;
-            // Store 8 registers: each acc[v] → row offset v*2 from base
+
+            // Reset cur_row for each col_tile loop (it gets modified by row advance)
+            if let Some(cr) = cur_row {
+                k.v_mov(cr, base_row_v);
+            }
+
             for v in 0..8u32 {
                 let acc_vreg = VReg(acc[a_idx].0 + v);
 
-                // Apply epilogue chain before store (zero extra GMEM bandwidth)
+                // Apply epilogue chain before store
                 if !epilogue.ops.is_empty() {
                     emit_epilogue_on_vreg(k, acc_vreg, col_elem_idx, epilogue);
                 }
 
-                // buffer_store_b32: SRD base already includes y_offset
+                // Boundary masking: SaveExec, then mask with row < M && col < N
+                if let (Some(m_v), Some(se), Some(cr), Some(ref actual_col)) =
+                    (m_vreg_opt, saved_exec, cur_row, &col_mask_active) {
+                    // VCC = (cur_row < M)
+                    k.v_cmp_lt_u32(Operand::VReg(cr), Operand::VReg(m_v));
+                    // EXEC &= VCC (save old EXEC)
+                    k.push(Op::SaveExec { dst: se });
+                    // Now also mask by col: VCC = (actual_col < N)
+                    k.v_cmp_lt_u32(Operand::VReg(*actual_col), Operand::VReg(n_vreg));
+                    k.raw_asm("s_and_b32 exec_lo, exec_lo, vcc_lo");
+                }
+
+                // buffer_store_b32: same SRD-based addressing for both paths
                 k.buffer_store(voff, acc_vreg, y_srd, Width::B32, 0);
+
+                // Restore EXEC after boundary-masked store
+                if let Some(se) = saved_exec {
+                    k.push(Op::RestoreExec { src: se });
+                }
+
                 if v < 7 {
-                    // Advance by row_stride = N * 8 bytes (2 rows)
-                    // Just v_add_u32 — no 64-bit carry chain needed!
                     k.v_add_u32(voff, voff, row_stride);
+                    // Advance logical row by 2 for boundary check
+                    if let Some(cr) = cur_row {
+                        k.push(Op::VAddU32 {
+                            dst: cr, src0: Operand::VReg(cr),
+                            src1: Operand::InlineInt(2),
+                        });
+                    }
                 }
             }
         }

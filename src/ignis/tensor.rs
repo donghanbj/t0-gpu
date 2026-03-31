@@ -246,43 +246,33 @@ impl Tensor {
         let n = self.numel();
         match grad_ref.as_ref() {
             None => {
-                // First gradient — GPU copy via t0_memcpy kernel
-                let epl = 4u32;
+                // First gradient — GPU copy via BlockDSL memcpy kernel
                 let new_buf = self.runtime.alloc_f32(n)?;
-                let kernel = self.runtime.ensure_kernel_t0(
+                let kernel = self.runtime.ensure_kernel_blockdsl(
                     "grad_memcpy",
-                    || crate::t0::math::t0_memcpy(epl),
-                    [32, 1, 1],
-                    0,
+                    || crate::t0::elementwise_kernels::build_memcpy(),
                 )?;
                 let ka = crate::kernargs![
                     incoming.gpu_addr() => u64,
                     new_buf.gpu_addr() => u64,
                     n as u32 => u32
                 ];
-                let wg = 32u32;
-                let elems_per_wg = wg * epl;
-                let grid_x = ((n as u32 + elems_per_wg - 1) / elems_per_wg) * wg;
+                let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n as u32);
                 self.runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
                 *grad_ref = Some(Arc::new(new_buf));
             }
             Some(existing) => {
-                // GPU in-place add: existing += incoming via t0_residual_add
-                let epl = 4u32;
-                let kernel = self.runtime.ensure_kernel_t0(
+                // GPU in-place add: existing += incoming via BlockDSL residual_add
+                let kernel = self.runtime.ensure_kernel_blockdsl(
                     "grad_accumulate",
-                    || crate::t0::math::t0_residual_add(epl),
-                    [32, 1, 1],
-                    0,
+                    || crate::t0::elementwise_kernels::build_residual_add(),
                 )?;
                 let ka = crate::kernargs![
                     incoming.gpu_addr() => u64,
                     existing.gpu_addr() => u64,
                     n as u32 => u32
                 ];
-                let wg = 32u32;
-                let elems_per_wg = wg * epl;
-                let grid_x = ((n as u32 + elems_per_wg - 1) / elems_per_wg) * wg;
+                let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n as u32);
                 self.runtime.dispatch(&kernel, [grid_x, 1, 1], &ka)?;
             }
         }

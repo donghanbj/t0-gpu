@@ -523,16 +523,20 @@ fn dispatch_backward_intra_dkdv(
 
 #[cfg(feature = "rocm")]
 fn add_buffers(
-    rt: &Arc<GpuRuntime>, a_addr: u64, b_addr: u64, out_addr: u64, n: usize,
+    rt: &Arc<GpuRuntime>, a_addr: u64, b_addr: u64, _out_addr: u64, n: usize,
 ) -> Result<(), String> {
-    // In-place add using residual_add kernel
-    let epl = ((n + 255) / 256) as u32;
-    let kernel = rt.ensure_kernel_t0(
-        &format!("residual_add_{}", epl),
-        || crate::t0::math::t0_residual_add(epl),
-        [256, 1, 1], 0)?;
-    let ka = crate::kernargs![a_addr => u64, b_addr => u64, out_addr => u64];
-    rt.dispatch(&kernel, [256, 1, 1], &ka)
+    // In-place add using BlockDSL residual_add kernel: b[i] += a[i]
+    let kernel = rt.ensure_kernel_blockdsl(
+        "residual_add",
+        || crate::t0::elementwise_kernels::build_residual_add(),
+    )?;
+    let ka = crate::kernargs![
+        a_addr => u64,
+        b_addr => u64,
+        n as u32 => u32
+    ];
+    let grid_x = crate::t0::elementwise_kernels::elementwise_grid(n as u32);
+    rt.dispatch(&kernel, [grid_x, 1, 1], &ka)
 }
 
 // ── GPU memory access helpers (raw address) ──

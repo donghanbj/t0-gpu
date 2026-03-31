@@ -307,6 +307,30 @@ fn translate_node(
             return Err("AtomicAddU32Rtn not yet supported in block_dsl lowering (use T0Kernel directly)".into());
         }
 
+        // ── BF16 memory ops ──
+        BNode::LoadBf16 { ptr, offsets, mask } => {
+            let p = get(ptr)?;
+            let idx = get(offsets)?;
+            let m = get(mask)?;
+            let zero = f.const_u32(0);
+            // Load as BF16 (16-bit), result is BF16-typed vector
+            let bf16_val = f.load_masked(p, idx, m, zero, ScalarDType::BF16);
+            // Convert BF16→F32: shift left 16 bits
+            let sixteen = f.const_u32(16);
+            Ok(Some(f.binop_raw(BinOpKind::Shl, bf16_val, sixteen)))
+        }
+        BNode::StoreBf16 { ptr, offsets, val, mask } => {
+            let p = get(ptr)?;
+            let idx = get(offsets)?;
+            let v = get(val)?;
+            let m = get(mask)?;
+            // Convert F32→BF16 via SSA cast (truncation: upper 16 bits of f32)
+            let bf16_val = f.cast(v, ScalarDType::BF16);
+            // Store with BF16 dtype — tile_ssa_lower selects Width::B16 automatically
+            f.store_masked(p, idx, bf16_val, m);
+            Ok(None)
+        }
+
         // ── Type conversions ──
         BNode::CvtF32U32(a) => Ok(Some(f.cast(get(a)?, ScalarDType::F32))),
         BNode::CvtU32F32(a) => Ok(Some(f.cast(get(a)?, ScalarDType::U32))),

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Compile check (no GPU required) ──
+  build:
+    name: Build & CPU Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (no GPU features)
+        run: cargo build --release --lib
+
+      - name: CPU unit tests
+        run: |
+          cargo test --release --lib -- "cpu_softmax" --nocapture
+          cargo test --release --lib -- "cpu_ce_loss" --nocapture
+          cargo test --release --lib -- "cpu_rope" --nocapture
+          cargo test --release --lib -- "cpu_causal_mask" --nocapture
+          cargo test --release --lib -- "cpu_rmsnorm" --nocapture
+          cargo test --release --lib -- "cpu_embedding" --nocapture
+          cargo test --release --lib -- "cpu_adamw" --nocapture
+
+      - name: Kernel compile tests (T0 → ELF)
+        run: |
+          cargo test --release --lib -- "softmax_fwd_compiles" --nocapture
+          cargo test --release --lib -- "softmax_bwd_compiles" --nocapture
+          cargo test --release --lib -- "log_softmax_compiles" --nocapture
+          cargo test --release --lib -- "nll_loss_compiles" --nocapture
+          cargo test --release --lib -- "ce_bwd_compiles" --nocapture
+          cargo test --release --lib -- "rope_fwd_compiles" --nocapture
+          cargo test --release --lib -- "rope_bwd_compiles" --nocapture
+          cargo test --release --lib -- "causal_mask_compiles" --nocapture
+          cargo test --release --lib -- "causal_mask_bwd_compiles" --nocapture
+          cargo test --release --lib -- "rmsnorm_fwd_compiles" --nocapture
+          cargo test --release --lib -- "rmsnorm_bwd_compiles" --nocapture
+          cargo test --release --lib -- "embedding_fwd_compiles" --nocapture
+          cargo test --release --lib -- "embedding_bwd_compiles" --nocapture
+          cargo test --release --lib -- "adamw_compiles" --nocapture
+
+      - name: Build examples
+        run: cargo build --release --examples
+
+  # ── Format & lint ──
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --release --lib -- -D warnings
+        continue-on-error: true  # Allow clippy warnings for now

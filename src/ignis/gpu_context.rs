@@ -217,6 +217,36 @@ impl GpuRuntime {
         Ok(kernel_arc)
     }
 
+    /// Ensure a kernel is compiled from a BlockDSL BlockKernel, with SSA compilation.
+    ///
+    /// Bridges T0 BlockDSL pipeline → Ignis dispatch:
+    ///   BlockKernel → compile_via_ssa(GFX1100) → ELF → GpuKernel::load → cache
+    ///
+    /// This is the preferred path for new kernels (replaces ensure_kernel_t0 for non-legacy ops).
+    pub fn ensure_kernel_blockdsl(
+        &self,
+        name: &str,
+        builder: impl FnOnce() -> crate::t0::block_dsl::BlockKernel,
+    ) -> Result<Arc<GpuKernel>, String> {
+        let mut cache = self.kernel_cache.lock().unwrap();
+        if let Some(k) = cache.get(name) {
+            return Ok(k.clone());
+        }
+
+        let kb = builder();
+        let ck = kb.compile_via_ssa(crate::t0::ir::Target::GFX1100)
+            .map_err(|e| format!("BlockDSL compile '{}': {}", name, e))?;
+
+        let config = KernelLoadConfig {
+            workgroup_size: ck.workgroup_size,
+            lds_size: ck.lds_size,
+        };
+        let kernel = GpuKernel::load(&self.device, &ck.elf, &config)?;
+        let kernel_arc = Arc::new(kernel);
+        cache.insert(name.to_string(), kernel_arc.clone());
+        Ok(kernel_arc)
+    }
+
     // ── Dispatch helpers ──
 
     /// Allocate a kernarg slot and return its index.

@@ -600,60 +600,7 @@ pub fn predict_best(m: u32, k: u32, n: u32) -> super::gemm_gen::GemmConfig {
     }
 }
 
-/// Override cost model scoring with actual measured data from PGO.
-///
-/// Takes a `TuneResult` from `ProfileTuner` and replaces the theoretical
-/// cost model's scoring with the measured wall-clock nanoseconds.
-/// Returns the best config based on actual hardware measurements.
-///
-/// # Integration Pattern
-/// ```rust,ignore
-/// // 1. First run: use theoretical model for initial candidate set
-/// let candidates = auto_schedule_gemm(m, n, k, DataFormat::BF16);
-///
-/// // 2. Profile top candidates on actual hardware
-/// let tune_result = tuner.tune_workgroup_size("gemm_1024", &rt, &builder, &[64, 128, 256], n);
-///
-/// // 3. Override: select best based on measured cycles
-/// let best = with_measured_override(&candidates, &tune_result);
-/// ```
-pub fn with_measured_override(
-    costs: &[TileCost],
-    measured: &super::profile_guided::TuneResult,
-) -> Option<TileCost> {
-    // Build a map from wg_size → measured_cycles
-    let mut measured_map: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    for &(wg, cycles) in &measured.measurements {
-        measured_map.insert(wg, cycles);
-    }
 
-    // Find the cost with matching WG size that has the lowest measured cycles
-    let mut best: Option<(TileCost, u64)> = None;
-
-    for cost in costs {
-        let wg = cost.config.wg_threads();
-        if let Some(&cycles) = measured_map.get(&wg) {
-            match &best {
-                None => best = Some((cost.clone(), cycles)),
-                Some((_, best_cycles)) => {
-                    if cycles < *best_cycles {
-                        best = Some((cost.clone(), cycles));
-                    }
-                }
-            }
-        }
-    }
-
-    best.map(|(mut cost, cycles)| {
-        // Override score with measured performance
-        let time_sec = cycles as f64 / 1e9; // ns → sec
-        let m = 1024.0; // placeholder — actual dims would be passed in practice
-        let total_flops = 2.0 * m * m * m;
-        cost.score = total_flops / time_sec / 1e12;
-        cost.bottleneck = "measured";
-        cost
-    })
-}
 
 // ============================================================================
 // Instruction-level K-loop Analysis (insn_latency integration)

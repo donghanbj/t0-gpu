@@ -192,6 +192,10 @@ pub enum BNode {
     AtomicAddF32 { ptr: BVal, offsets: BVal, val: BVal, mask: BVal },
     /// global_atomic_add_u32 with return: old_val = atomicAdd(ptr, val)
     AtomicAddU32Rtn { ptr: BVal, val: BVal },
+    /// global_load bf16 with mask: load bf16 from base+offset*2, convert to f32
+    LoadBf16 { ptr: BVal, offsets: BVal, mask: BVal },
+    /// global_store bf16 with mask: truncate f32 to bf16, store to base+offset*2
+    StoreBf16 { ptr: BVal, offsets: BVal, val: BVal, mask: BVal },
 
     // ── 类型转换 ──
     CvtF32U32(BVal),          // u32 → f32
@@ -291,6 +295,8 @@ impl BNode {
             BNode::Store { .. } => BType::U32, // void, but need a type
             BNode::AtomicAddF32 { .. } => BType::U32, // void
             BNode::AtomicAddU32Rtn { .. } => BType::U32, // returns old value
+            BNode::LoadBf16 { .. } => BType::F32,  // loads BF16, returns F32
+            BNode::StoreBf16 { .. } => BType::U32,  // void
             BNode::CvtF32U32(_) => BType::F32,
             BNode::CvtU32F32(_) => BType::U32,
             BNode::CvtF32BF16(_) => BType::F32,
@@ -781,6 +787,43 @@ impl BlockKernel {
     pub fn store_checked(&mut self, ptr: BVal, offsets: BVal, val: BVal, n: BVal) {
         let mask = offsets.lt(self, n);
         self.store(ptr, offsets, val, mask);
+    }
+
+    /// Load BF16 from global memory and convert to F32.
+    ///
+    /// Reads a 16-bit BF16 value from `ptr + offsets * 2`, zero-extends to u32,
+    /// then shifts left 16 to produce the F32 bit pattern.
+    /// Result type is F32.
+    pub fn load_bf16(&mut self, ptr: BVal, offsets: BVal, mask: BVal) -> BVal {
+        assert_eq!(self.types[ptr.0], BType::Ptr, "load_bf16: ptr must be Ptr type");
+        assert_eq!(self.types[offsets.0], BType::U32, "load_bf16: offsets must be U32");
+        assert_eq!(self.types[mask.0], BType::Mask, "load_bf16: mask must be Mask type");
+        self.push(BNode::LoadBf16 { ptr, offsets, mask })
+    }
+
+    /// Load BF16 with automatic bounds checking: mask = offsets < n
+    pub fn load_bf16_checked(&mut self, ptr: BVal, offsets: BVal, n: BVal) -> BVal {
+        let mask = offsets.lt(self, n);
+        self.load_bf16(ptr, offsets, mask)
+    }
+
+    /// Store F32 value as BF16 to global memory.
+    ///
+    /// Truncates F32 to BF16 (takes upper 16 bits of f32 bit pattern),
+    /// then stores the 16-bit value to `ptr + offsets * 2`.
+    pub fn store_bf16(&mut self, ptr: BVal, offsets: BVal, val: BVal, mask: BVal) {
+        assert_eq!(self.types[ptr.0], BType::Ptr, "store_bf16: ptr must be Ptr type");
+        assert_eq!(self.types[offsets.0], BType::U32, "store_bf16: offsets must be U32");
+        assert_eq!(self.types[val.0], BType::F32, "store_bf16: val must be F32");
+        assert_eq!(self.types[mask.0], BType::Mask, "store_bf16: mask must be Mask type");
+        let sv = self.push(BNode::StoreBf16 { ptr, offsets, val, mask });
+        self.stores.push(sv);
+    }
+
+    /// Store F32 as BF16 with automatic bounds checking: mask = offsets < n
+    pub fn store_bf16_checked(&mut self, ptr: BVal, offsets: BVal, val: BVal, n: BVal) {
+        let mask = offsets.lt(self, n);
+        self.store_bf16(ptr, offsets, val, mask);
     }
 
     // ── 归约操作 ──

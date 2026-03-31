@@ -58,12 +58,60 @@ pub fn build_causal_mask() -> BlockKernel {
     kb
 }
 
-/// CPU reference: causal mask
+/// Build causal mask backward kernel.
+///
+/// Kernarg layout: [dy:u64, dx:u64, seq_len:u32]
+/// Grid: (seq_len * WG_SIZE, 1, 1)
+///
+/// dx[row, col] = dy[row, col] if col <= row, else 0.0
+///
+/// Same structure as forward, but uses 0.0 instead of -inf for masked positions
+/// (gradient of -inf masking is zero — those positions don't contribute).
+pub fn build_causal_mask_backward() -> BlockKernel {
+    let mut kb = BlockKernel::new("causal_mask_bwd", WG_SIZE);
+
+    let dy_ptr = kb.arg_ptr("dy");
+    let dx_ptr = kb.arg_ptr("dx");
+    let seq_len = kb.arg_u32("seq_len");
+
+    let tid = kb.thread_id();
+    let pid = kb.program_id(0);
+
+    let row_base = pid.mul(&mut kb, seq_len);
+    let offset = row_base.add(&mut kb, tid);
+    let in_bounds = tid.lt(&mut kb, seq_len);
+
+    let dy = kb.load(dy_ptr, offset, in_bounds);
+
+    // Causal check: col <= row → tid < pid + 1
+    let one_u = kb.const_u32(1);
+    let pid_plus_one = pid.add(&mut kb, one_u);
+    let is_causal = tid.lt(&mut kb, pid_plus_one);
+
+    // dx = is_causal ? dy : 0.0
+    let zero_f = kb.const_f32(0.0);
+    let dx = is_causal.select(&mut kb, dy, zero_f);
+    kb.store(dx_ptr, offset, dx, in_bounds);
+
+    kb
+}
+
+/// CPU reference: causal mask forward
 pub fn cpu_causal_mask(scores: &[f32], output: &mut [f32], seq_len: usize) {
     for row in 0..seq_len {
         for col in 0..seq_len {
             let idx = row * seq_len + col;
             output[idx] = if col <= row { scores[idx] } else { f32::NEG_INFINITY };
+        }
+    }
+}
+
+/// CPU reference: causal mask backward
+pub fn cpu_causal_mask_backward(dy: &[f32], dx: &mut [f32], seq_len: usize) {
+    for row in 0..seq_len {
+        for col in 0..seq_len {
+            let idx = row * seq_len + col;
+            dx[idx] = if col <= row { dy[idx] } else { 0.0 };
         }
     }
 }
@@ -99,6 +147,32 @@ mod tests {
         let ck = kb.compile_via_ssa(Target::GFX1100).expect("causal mask compile");
         assert!(!ck.elf.is_empty());
         eprintln!("✓ causal_mask: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
+    }
+
+    #[test]
+    fn test_cpu_causal_mask_backward() {
+        let n = 4;
+        let dy: Vec<f32> = (0..n*n).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let mut dx = vec![0.0f32; n * n];
+        cpu_causal_mask_backward(&dy, &mut dx, n);
+
+        // Row 0: [dy[0], 0, 0, 0]
+        assert_eq!(dx[0], dy[0]);
+        assert_eq!(dx[1], 0.0);
+        // Row 1: [dy[4], dy[5], 0, 0]
+        assert_eq!(dx[4], dy[4]);
+        assert_eq!(dx[5], dy[5]);
+        assert_eq!(dx[6], 0.0);
+        // Row 3: all pass through
+        assert_eq!(dx[15], dy[15]);
+    }
+
+    #[test]
+    fn test_causal_mask_bwd_compiles() {
+        let kb = build_causal_mask_backward();
+        let ck = kb.compile_via_ssa(Target::GFX1100).expect("causal mask bwd compile");
+        assert!(!ck.elf.is_empty());
+        eprintln!("✓ causal_mask_bwd: {} bytes ELF, wg={:?}", ck.elf.len(), ck.workgroup_size);
     }
 
     #[cfg(feature = "rocm")]

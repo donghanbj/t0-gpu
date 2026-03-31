@@ -1,0 +1,8 @@
+M=64
+K=256
+N=512
+seed=42
+torch_version=2.9.1+rocm6.4
+gemm1_max_err=1.938939e-03
+swiglu_max_err=5.807802e-04
+gemm2_max_err=4.826449e-04

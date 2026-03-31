@@ -3,14 +3,7 @@
 //! Forward: loss = -sum(one_hot(targets) * log(softmax(logits))) / batch
 //! Backward: d_logits = (softmax(logits) - one_hot(targets)) / batch
 //!
-//! Uses build_softmax_ce_loss() ISA kernel when available.
-//! Kernarg (40 bytes):
-//!   [0:8]   logits_ptr
-//!   [8:16]  targets_ptr
-//!   [16:24] loss_ptr  
-//!   [24:28] vocab_size
-//!   [28:32] batch_size (= rows)
-//!   [32:40] grad_ptr
+//! Uses T0 BlockDSL softmax_forward kernel (single fused WG-reduce dispatch).
 
 #[cfg(feature = "rocm")]
 use std::sync::Arc;
@@ -26,14 +19,14 @@ use super::super::gpu_context::GpuRuntime;
 /// Softmax Cross-Entropy Loss (fused forward + backward gradient pre-computation)
 ///
 /// Computes:
-///   probs = softmax(logits)    per row
-///   loss  = -mean(log(probs[target]))
-///   grad  = (probs - one_hot(target)) / batch_size   (saved for backward)
+///   probs = softmax(logits)    per row  (single BlockDSL kernel)
+///   loss  = -mean(log(probs[target]))   (CPU, tiny)
+///   grad  = (probs - one_hot(target)) / batch_size  (CPU, saved for backward)
 ///
 /// # Arguments
 /// - logits: [batch, vocab_size] f32
-/// - targets: [batch] u32 (token indices, stored as f32-cast or raw u32)
-/// - vocab_size: vocabulary dimension
+/// - targets: [batch] u32 (token indices, stored as raw u32 bits)
+/// - vocab_size: vocabulary dimension (must be ≤ 256 for single-WG softmax)
 ///
 /// # Returns
 /// - Scalar loss tensor [1]
@@ -46,50 +39,25 @@ pub fn cross_entropy(
 ) -> Result<Tensor, String> {
     let batch = logits.numel() / vocab_size;
     let cols = vocab_size;
-    let grid = batch as u32 * 32;
 
-    // ═══ Step 1: GPU Softmax via composed kernels ═══
-    // 1a. row_max
-    let max_buf = runtime.alloc_f32(batch)?;
-    let k_max = runtime.ensure_kernel_t0("ce_row_max",
-        || crate::t0::math::t0_row_reduce_max(), [32, 1, 1], 0)?;
-    let ka1 = crate::kernargs![
-        logits.gpu_addr() => u64, max_buf.gpu_addr() => u64, cols as u32 => u32
-    ];
-    runtime.dispatch(&k_max, [grid, 1, 1], &ka1)?;
-
-    // 1b. exp(logits - max) [fused]
+    // ═══ Step 1: GPU Softmax via single BlockDSL kernel ═══
+    // Replaces 4 separate math.rs kernels (row_max, exp_sub, row_sum, div)
+    // with a single fused wg_reduce softmax dispatch.
     let probs_buf = runtime.alloc_f32(batch * cols)?;
-    let k_exp = runtime.ensure_kernel_t0("ce_exp_sub",
-        || crate::t0::math::t0_row_broadcast_exp_sub(), [32, 1, 1], 0)?;
-    let ka2 = crate::kernargs![
-        logits.gpu_addr() => u64, max_buf.gpu_addr() => u64,
-        probs_buf.gpu_addr() => u64, cols as u32 => u32
-    ];
-    runtime.dispatch(&k_exp, [grid, 1, 1], &ka2)?;
+    let k_softmax = runtime.ensure_kernel_blockdsl("softmax_fwd",
+        || crate::t0::softmax_kernels::build_softmax_forward())?;
 
-    // 1c. row_sum(exp)
-    let sum_buf = runtime.alloc_f32(batch)?;
-    let k_sum = runtime.ensure_kernel_t0("ce_row_sum",
-        || crate::t0::math::t0_row_reduce_sum(), [32, 1, 1], 0)?;
-    let ka3 = crate::kernargs![
-        probs_buf.gpu_addr() => u64, sum_buf.gpu_addr() => u64, cols as u32 => u32
+    let (grid_x, _) = crate::t0::softmax_kernels::softmax_grid(batch as u32);
+    let ka = crate::kernargs![
+        logits.gpu_addr() => u64,
+        probs_buf.gpu_addr() => u64,
+        cols as u32 => u32
     ];
-    runtime.dispatch(&k_sum, [grid, 1, 1], &ka3)?;
-
-    // 1d. probs = exp / sum [broadcast div, in-place on probs_buf]
-    let k_div = runtime.ensure_kernel_t0("ce_bcast_div",
-        || crate::t0::math::t0_row_broadcast_div(), [32, 1, 1], 0)?;
-    let probs_out = runtime.alloc_f32(batch * cols)?;
-    let ka4 = crate::kernargs![
-        probs_buf.gpu_addr() => u64, sum_buf.gpu_addr() => u64,
-        probs_out.gpu_addr() => u64, cols as u32 => u32
-    ];
-    runtime.dispatch(&k_div, [grid, 1, 1], &ka4)?;
+    runtime.dispatch(&k_softmax, [grid_x, 1, 1], &ka)?;
 
     // ═══ Step 2: CPU loss + grad (batch-level, tiny) ═══
     runtime.wait_idle()?;
-    let probs = read_f32_vec(&probs_out, batch * cols);
+    let probs = read_f32_vec(&probs_buf, batch * cols);
 
     let mut targets_bytes = vec![0u8; batch * 4];
     targets_buf.read(&mut targets_bytes);
