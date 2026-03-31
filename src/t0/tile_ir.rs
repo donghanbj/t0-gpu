@@ -3263,6 +3263,11 @@ mod gpu_tests {
                 (1024, 1024, 1024),
                 (2048, 2048, 2048),
                 (4096, 4096, 4096),
+                // Non-square sizes (matching README / rocBLAS benchmark)
+                (128,  1024, 4096),
+                (256,  1024, 4096),
+                (512,  1024, 4096),
+                (1024, 1024, 4096),
             ];
             let warmup = 5u32;
             let iters = 20u32;

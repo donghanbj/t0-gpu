@@ -23,11 +23,11 @@ T0-GPU is a pure-Rust GPU programming framework targeting AMD RDNA3 (GFX1100) ha
 
 ## 🏆 性能亮点 / Performance Highlights
 
-> **GEMM 89.1 TFLOPS** — 128×128 k64 WGP 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**达到 rocBLAS 的 98%**。
-> **89.1 TFLOPS** on 128×128 k64 WGP config, 4096³ bf16 GEMM on RX 7900 XTX — **98% of rocBLAS performance**.
-
-> 纯 Rust 手写编译器生成的 GEMM 内核，与 AMD 官方预编译库 rocBLAS (~90.78 TF) 性能持平。
-> Hand-written Rust compiler-generated GEMM kernel, on par with AMD's precompiled rocBLAS (~90.78 TF).
+> **GEMM 87.1 TFLOPS** — 128×128 k64 配置，4096³ bf16 矩阵乘法，RX 7900 XTX 实测，**达到 rocBLAS 的 94%**。
+> **87.1 TFLOPS** on 128×128 k64 config, 4096³ bf16 GEMM on RX 7900 XTX — **94% of rocBLAS**.
+>
+> 纯 Rust 手写编译器生成的通用 GEMM 内核，在大方阵上接近 AMD 官方预编译库 rocBLAS (~93 TF)。小矩阵和非方阵仍有优化空间。
+> Compiler-generated GEMM kernel approaching AMD's rocBLAS (~93 TF) on large square matrices. Small/non-square shapes remain an optimization frontier.
 
 > **Zero-Overhead Dispatch** — 异步调度延迟 **2.26 μs**（HIP: 2.6 μs），同步调度 **14.96 μs**（HIP: 20.5 μs）。
 > Async dispatch **2.26 μs** (HIP: 2.6 μs), sync dispatch **14.96 μs** (HIP: 20.5 μs) — **13-27% faster** than HIP.
@@ -194,20 +194,32 @@ For bf16 WMMA matrix multiplication.
 
 ## 🏆 GEMM 性能实测 / GEMM Performance
 
-### T0 TileIR GEMM (2026-03-30)
+### T0 vs rocBLAS 全尺寸对比 / Full-Size Comparison (2026-03-30)
 
-4096×4096×4096 bf16 矩阵乘法，RX 7900 XTX 实测：
+9 个标准矩阵尺寸，BF16 GEMM，RX 7900 XTX 实测：
 
-4096³ bf16 GEMM on RX 7900 XTX:
+9 standard matrix sizes, BF16 GEMM on RX 7900 XTX:
 
-| 配置 / Config | VGPRs | Waves/SIMD | 4096³ TFLOPS | vs rocBLAS |
-|---|:---:|:---:|:---:|:---:|
-| **128×128 k64 WGP** | **176** | 4 | **89.1** | **🏆 98%** |
-| **128×128 k32 WGP** | **216** | 2 | **88.7** | **🏆 98%** |
-| 128×128 k64 CU | 184 | 4 | 87.6 | 97% |
-| 128×128 k32 CU | 216 | 2 | 87.2 | 96% |
+| 矩阵 M×K×N | rocBLAS (TF) | T0 Best (TF) | T0 Config | T0/rocBLAS |
+|---|:---:|:---:|---|:---:|
+| 256×256×256 | 3.27 | 1.9 | k64 | 58% |
+| 512×512×512 | 12.86 | 9.8 | k64 | 76% |
+| 1024×1024×1024 | 51.41 | 21.9 | k64 | 43% |
+| 2048×2048×2048 | 67.24 | 56.2 | k64 | 84% |
+| **4096×4096×4096** | **93.06** | **87.1** | **k64** | **94%** |
+| 128×1024×4096 | 50.73 | 20.0 | k64 | 39% |
+| 256×1024×4096 | 51.60 | 22.8 | k64 | 44% |
+| 512×1024×4096 | 77.11 | 30.1 | k64 | 39% |
+| 1024×1024×4096 | 73.80 | 38.8 | k64 | 53% |
 
-> rocBLAS 基线 / rocBLAS baseline: ~90.78 TFLOPS (PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16)
+> rocBLAS 基线 / rocBLAS baseline: PyTorch 2.9.1+rocm6.4, `torch.mm()` bf16, 同机同时测量。
+> rocBLAS measured on same machine in same session.
+>
+> 🏆 **大方阵 (4096³) 达到 rocBLAS 的 94%** — 纯 Rust 单人项目 vs AMD 官方多年调优库。
+> 🏆 **94% of rocBLAS on large square (4096³)** — single-person Rust project vs AMD's multi-year tuned library.
+>
+> ⚠️ **小矩阵和非方阵仍有较大差距** — rocBLAS 有 1000+ 预调优变体，T0 当前仅有 k16/k32/k64 三种配置。这是下一步优化重点。
+> ⚠️ **Significant gap on small/non-square** — rocBLAS has 1000+ pre-tuned variants; T0 currently has only 3 configs. This is the next optimization frontier.
 
 ### 性能演化 / Performance Evolution
 
@@ -217,7 +229,7 @@ For bf16 WMMA matrix multiplication.
 | 2026-03-29 | TileIR v1 | 79.2 | Graduated lgkmcnt + Gap Reclaim |
 | 2026-03-30 | TileIR v2 (Phase 1) | 84.1 | soffset addressing |
 | 2026-03-30 | TileIR v2 (Phase 2) | 89.0 | LDS offset folding |
-| **2026-03-30** | **TileIR v2 (Phase 3)** | **89.1** | **Concurrent VMEM overlap** |
+| **2026-03-30** | **TileIR v2 (Phase 3)** | **87.1** | **Concurrent VMEM overlap** |
 
 ### 优化技术 / Optimization Techniques
 
