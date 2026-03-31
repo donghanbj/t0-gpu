@@ -949,20 +949,21 @@ mod t0_gpu_tests {
                 let rsrc1 = u32::from_le_bytes([
                     elf[off + 0x30], elf[off + 0x31], elf[off + 0x32], elf[off + 0x33]
                 ]);
-                let wgp_bit = (rsrc1 >> 27) & 1;
-                let mem_ordered = (rsrc1 >> 25) & 1;
+                let wgp_bit = (rsrc1 >> 29) & 1;  // ENABLE_WGP_MODE (GFX10+)
+                let mem_ordered = (rsrc1 >> 30) & 1;  // MEM_ORDERED
+                let fwd_progress = (rsrc1 >> 31) & 1;  // FWD_PROGRESS
                 let vgpr_gran = rsrc1 & 0x3F;
                 
                 eprintln!("\n[RSRC1] 0x{:08X}", rsrc1);
-                eprintln!("  WGP_MODE (bit 27):  {}", wgp_bit);
-                eprintln!("  MEM_ORDERED (bit 25): {}", mem_ordered);
+                eprintln!("  WGP_MODE (bit 29):    {}", wgp_bit);
+                eprintln!("  MEM_ORDERED (bit 30): {}", mem_ordered);
+                eprintln!("  FWD_PROGRESS (bit 31): {}", fwd_progress);
                 eprintln!("  VGPR granulated: {} → {} VGPRs", vgpr_gran, (vgpr_gran + 1) * 8);
 
                 if wgp_bit == 0 {
-                    eprintln!("\n❌ WGP_MODE NOT SET in RSRC1! This is the root cause of WGP hang.");
-                    eprintln!("   .amdhsa_workgroup_processor_mode 1 is in the ASM but LLVM did not set bit 27.");
+                    eprintln!("\n⚠️ WGP_MODE NOT SET in RSRC1 bit 29.");
                 } else {
-                    eprintln!("\n✅ WGP_MODE correctly set in RSRC1!");
+                    eprintln!("\n✅ WGP_MODE correctly set in RSRC1 bit 29!");
                 }
             }
 
@@ -972,7 +973,7 @@ mod t0_gpu_tests {
                 eprintln!("[KCP] 0x{:04X}", kcp);
                 eprintln!("  bit 3 (ENABLE_SGPR_KERNARG): {}", (kcp >> 3) & 1);
                 eprintln!("  bit 9 (WAVEFRONT_SIZE32): {}", (kcp >> 9) & 1);
-                eprintln!("  bit 10 (ENABLE_WGP_MODE): {}", (kcp >> 10) & 1);
+                eprintln!("  bit 10 (USES_DYNAMIC_STACK): {}", (kcp >> 10) & 1);
             }
         } else {
             eprintln!("[KD] NOT FOUND in ELF! Searching for LDS=81920 pattern failed.");
